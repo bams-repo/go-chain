@@ -16,16 +16,17 @@ internal/      → All library code (not importable externally)
   types/       → Consensus structs, canonical serialization
   crypto/      → Hashing, merkle, target math
   params/      → Chain parameters, genesis config, network definitions
-  consensus/   → Engine interface, structural validation, timestamp rules
+  consensus/   → Engine interface, structural validation, timestamp rules, tx validation
   consensus/pow/ → Baseline PoW engine
-  chain/       → Blockchain state manager
-  store/       → Abstract storage + bbolt implementation
-  mempool/     → Transaction pool
-  miner/       → Block template building, mining loop
+  chain/       → Blockchain state manager (UTXO-aware)
+  store/       → Abstract storage + bbolt implementation (blocks, UTXOs, undo data, peers)
+  utxo/        → UTXO set, entries, connect/disconnect blocks, undo data serialization
+  mempool/     → Transaction pool (UTXO-validated, fee-rate priority, double-spend detection)
+  miner/       → Block template building, mining loop (fee-inclusive coinbase)
   p2p/         → Peer manager, gossip, sync
   p2p/discovery/ → Peer discovery
   protocol/    → Wire message definitions, binary encoding
-  rpc/         → Local HTTP JSON API
+  rpc/         → Local HTTP JSON API (Bitcoin Core-compatible endpoints)
   config/      → Config loading
   logging/     → Structured logging (log/slog wrapper)
   metrics/     → Atomic counters for node activity
@@ -85,8 +86,11 @@ fairchain/
 │   │   ├── messages.go        # Wire message types and encoding
 │   │   ├── checksum.go        # Message checksum helper
 │   │   └── protocol_test.go   # Message encode/decode tests
+│   ├── utxo/
+│   │   ├── utxo.go            # UTXO set, entries, connect/disconnect, undo data
+│   │   └── utxo_test.go       # UTXO serialization, set operations, undo roundtrip tests
 │   ├── rpc/
-│   │   └── server.go          # HTTP JSON API
+│   │   └── server.go          # HTTP JSON API (14 endpoints)
 │   ├── config/
 │   │   └── config.go          # Config struct, loading, defaults
 │   └── util/
@@ -196,18 +200,24 @@ Genesis config structure:
 - Pluggable consensus.Engine interface
 - Baseline PoW consensus engine
 - Chain state manager with orphan pool and reorg
-- bbolt persistent storage
-- Thread-safe mempool
-- Mining loop with template building
+- bbolt persistent storage (blocks, headers, chain state, UTXOs, undo data, peers)
+- **UTXO set** (in-memory with bbolt persistence, connect/disconnect per block)
+- **Transaction input validation**: UTXO existence, value checks, coinbase maturity
+- **Fee calculation**: input sum - output sum, coinbase capped at subsidy + fees
+- **UTXO-aware reorg**: disconnect old chain blocks (restore spent UTXOs), reconnect new chain
+- **Block undo data**: serialized per-block for rollback support
+- Thread-safe mempool with **UTXO validation, double-spend detection, fee-rate priority, eviction**
+- Mining loop with template building, **fee-inclusive coinbase**
 - P2P peer management with handshake
 - Inventory-based gossip protocol
 - Block and transaction propagation
 - Initial block sync
 - Peer address gossip and persistence
-- Local HTTP JSON RPC API (8 endpoints including /metrics)
+- Local HTTP JSON RPC API (14 endpoints including /metrics)
+  - Bitcoin Core-style: gettxout, gettxoutsetinfo, getrawmempool, getmempoolentry
 - CLI query tool
 - Adversarial block generator (8 attack types)
-- 43 passing unit tests + 9 fuzz targets
+- 60+ passing unit tests + 9 fuzz targets
 - 16-phase chaos test (network chaos + adversarial attacks)
 - Structured logging (log/slog) with configurable levels
 - Metrics skeleton: atomic counters for blocks, peers, reorgs, orphans
@@ -215,51 +225,182 @@ Genesis config structure:
 
 ## 9. What Is Stubbed but Planned
 
-- **UTXO validation**: Data structures support full UTXO model, but only coinbase transactions are validated. Regular spend validation is not implemented. The `TxInput.SignatureScript` and `TxOutput.PkScript` fields exist but are not interpreted.
+- **Script validation**: `TxInput.SignatureScript` and `TxOutput.PkScript` fields exist but are not interpreted. UTXO validation checks existence and value but not script execution.
 
 - **Headers-first sync**: Current sync uses `getblocks` to request block hashes, then fetches full blocks. The protocol supports a headers-first approach but it's not implemented.
 
 - **Peer scoring**: The peer struct has infrastructure for tracking behavior but no scoring/banning logic.
 
-- **Advanced mempool policy**: Fee-based prioritization, eviction, and double-spend detection are not implemented.
-
 - **Activation heights**: `ChainParams.ActivationHeights` map exists but no activation logic uses it yet.
 
 ## 10. Known Limitations
 
-1. **No spend validation**: Only coinbase transactions are validated. Any non-coinbase transaction that serializes correctly is accepted into the mempool and blocks.
+1. **No script validation**: Transactions are validated for UTXO existence, value, and maturity, but signature/script verification is not implemented. Any transaction with valid UTXO references is accepted.
 
-2. **No UTXO set**: There is no UTXO set tracking. This means no double-spend detection at the chain level.
+2. **UTXO set rebuilt on startup**: The in-memory UTXO set is rebuilt by replaying all blocks from genesis. For very long chains this could be slow. Persistent UTXO snapshots would improve startup time.
 
-3. **Reorg is basic**: The reorg logic walks the chain but doesn't revert UTXO state (since there is none). It re-indexes heights only.
+3. **Genesis mined at startup**: Each network's genesis is mined on first run. For regtest this is instant; for mainnet/testnet it could be slow. Pre-computed genesis hashes should be hardcoded for production.
 
-4. **Genesis mined at startup**: Each network's genesis is mined on first run. For regtest this is instant; for mainnet/testnet it could be slow. Pre-computed genesis hashes should be hardcoded for production.
+4. **No wallet**: No key generation, address derivation, or transaction signing.
 
-5. **No wallet**: No key generation, address derivation, or transaction signing.
+5. **Single-threaded mining**: The miner uses a single goroutine. No parallel nonce search.
 
-6. **Single-threaded mining**: The miner uses a single goroutine. No parallel nonce search.
+6. **No checkpoints**: No checkpoint validation for fast sync.
 
-7. **No checkpoints**: No checkpoint validation for fast sync.
+7. **Memory-resident chain index**: The height↔hash index is rebuilt from storage on startup. For very long chains this could be slow.
 
-8. **Memory-resident chain index**: The height↔hash index is rebuilt from storage on startup. For very long chains this could be slow.
+## 11. Consensus Audit — Failure Analysis & Fix Tasks
 
-## 11. Exact Next Recommended Tasks
+### 11.1 Audit Summary (2026-03-12)
 
-### Immediate (Phase 4 — COMPLETE)
+A 10-node chaos cluster (2 seeds, 8 miners, testnet params: 5s blocks, retarget/20) revealed 4 critical consensus failures during stress testing. All adversarial and UTXO validation tests passed. The failures are in chain selection, persistence, and peer topology.
+
+### 11.2 Confirmed Root Causes
+
+| ID | Bug | Severity | File | Lines |
+|----|-----|----------|------|-------|
+| RC-1 | `getAncestorUnsafe` returns main-chain blocks when validating side-chain headers at retarget boundaries | CRITICAL | `internal/chain/chain.go` | 703-713 |
+| RC-2 | `seenBlocks` cache in P2P prevents re-evaluation of rejected blocks | CRITICAL | `internal/p2p/manager.go` | 604 |
+| RC-3 | `DiskBlockIndex` written before reorg validation, poisoning `HasBlock` | HIGH | `internal/chain/chain.go` | 383 |
+| RC-4 | No proactive addr gossip; star topology (miners only connect to seeds) | HIGH | `internal/p2p/manager.go` | 215-273 |
+| RC-5 | Block index writes not synced to disk (`nil` write options) | MEDIUM | `internal/store/blockindex.go` | 141 |
+| RC-6 | `workForParentChain` walks entire chain O(n) instead of using stored ChainWork | MEDIUM | `internal/chain/chain.go` | 686-701 |
+| RC-7 | `syncLoop` only syncs from peer's handshake-time height, never updates | MEDIUM | `internal/p2p/manager.go` | 710-734 |
+| RC-8 | Reorg disconnects old chain before validating new chain (no rollback on failure) | MEDIUM | `internal/chain/chain.go` | 477-507 |
+
+### 11.3 Fix Tasks
+
+Each task below is a discrete, testable unit of work. Tasks are ordered by dependency.
+
+#### TASK-01: Side-chain-aware ancestor lookup [CRITICAL]
+- **File**: `internal/chain/chain.go`
+- **What**: Replace `getAncestorUnsafe` with a function that walks the side chain's ancestry via `store.GetBlockIndex` to build a temporary height→hash map for the fork, falling back to main chain below the fork point.
+- **Why**: Without this, blocks at retarget boundaries on side chains are always rejected because `CalcNextBits` uses wrong timestamps.
+- **Interface**: `getAncestorForBlock(prevBlockHash types.Hash) func(uint32) *types.BlockHeader`
+- **Apply at**: `ProcessBlock` lines 314, 318; `processOrphans` lines 607, 613
+- **Test**: Create two chains that diverge before a retarget boundary. Verify the shorter chain's node accepts the longer chain's blocks and reorgs.
+
+#### TASK-02: Fix seenBlocks cache to allow re-evaluation [CRITICAL]
+- **File**: `internal/p2p/manager.go`
+- **What**: Only add to `seenBlocks` after `ProcessBlock` succeeds (including side-chain acceptance). Do not cache blocks that were rejected due to validation failure.
+- **Why**: Currently rejected blocks are cached forever, preventing convergence.
+- **Test**: Submit a block that is initially rejected (e.g., orphan), then submit its parent. Verify the orphan is re-evaluated and accepted.
+
+#### TASK-03: Defer DiskBlockIndex write until after validation [HIGH]
+- **File**: `internal/chain/chain.go`
+- **What**: Move `PutBlockIndex` at line 383 to after the reorg succeeds. For the side-chain-stored-but-not-reorged path (line 394), write the index entry only after confirming the block is structurally valid.
+- **Why**: Writing the index before validation causes `HasBlock` to return true for invalid blocks.
+- **Test**: Submit an invalid side-chain block. Verify `HasBlock` returns false after rejection.
+
+#### TASK-04: Implement addr gossip protocol [HIGH]
+- **File**: `internal/p2p/manager.go`
+- **What**: Add `addrBroadcastLoop` that sends known peer addresses to all connected peers every 30s. Add `getaddr` handler. On new connection, exchange addresses.
+- **Why**: Without this, miners never discover each other, creating a fragile star topology.
+- **Test**: Start 5 nodes where only node0 knows seeds. Verify all 5 nodes discover each other within 60s.
+
+#### TASK-05: Use stored ChainWork instead of recomputing [MEDIUM]
+- **File**: `internal/chain/chain.go`
+- **What**: Replace `workForParentChain` body with a single `GetBlockIndex` call to read `rec.ChainWork`.
+- **Why**: O(1) instead of O(n). Also eliminates potential for inconsistency between stored and computed work.
+- **Test**: Verify chainwork comparison produces same results before and after change.
+
+#### TASK-06: Add sync writes to block index [MEDIUM]
+- **File**: `internal/store/blockindex.go`
+- **What**: Pass `&opt.WriteOptions{Sync: true}` to all `db.Put` calls.
+- **Why**: Without sync, a crash can lose block index entries that were acknowledged as written.
+- **Test**: Kill node during block acceptance. Verify block index is consistent on restart.
+
+#### TASK-07: Validate new chain before disconnecting old chain during reorg [MEDIUM]
+- **File**: `internal/chain/chain.go`
+- **What**: Clone the UTXO set, validate all new-chain blocks against the clone, then proceed with disconnect+connect only if all validations pass.
+- **Why**: Currently a failed reorg leaves the node in a broken state with the old chain disconnected but the new chain not connected.
+- **Test**: Trigger a reorg where the new chain has an invalid transaction. Verify the node remains on the old chain.
+
+#### TASK-08: Update peer heights dynamically [MEDIUM]
+- **File**: `internal/p2p/manager.go`
+- **What**: After accepting a block from a peer, update that peer's known height. In `syncLoop`, use the dynamically updated height instead of the handshake-time `StartHeight`.
+- **Why**: Current sync only works for initial block download. After handshake, the node never learns that peers have grown taller.
+- **Test**: Connect two nodes. Mine 10 blocks on node A. Verify node B syncs all 10 blocks.
+
+#### TASK-09: Add orphan expiry and parent request [LOW]
+- **File**: `internal/chain/chain.go`, `internal/p2p/manager.go`
+- **What**: Add timestamps to orphan entries, evict after 60s. When a block is orphaned, request its parent from the source peer.
+- **Why**: Prevents orphan pool exhaustion and actively resolves orphans.
+- **Test**: Submit an orphan block. Verify the node requests the parent from the peer.
+
+### 11.4 Implementation Order
+
+```
+Phase 1: TASK-04 (addr gossip) — can be done independently
+Phase 2: TASK-01 (ancestor lookup) + TASK-05 (chainwork) — core consensus fix
+Phase 3: TASK-09 (orphan handling) — depends on TASK-01
+Phase 4: TASK-06 (sync writes) + TASK-03 (deferred index write) — persistence fixes
+Phase 5: TASK-07 (safe reorg) + TASK-08 (dynamic peer height) — hardening
+Phase 6: TASK-02 (seenBlocks fix) — depends on TASK-01 and TASK-03
+```
+
+### 11.5 Testing Checklist
+
+- [ ] Two-partition test: partitions mine past retarget boundary, reconnect, verify convergence
+- [ ] Deep reorg test: 20+ block reorg across retarget boundary
+- [ ] Restart persistence: kill all nodes, restart, verify same tip and UTXO set
+- [ ] Peer mesh: verify miners discover each other (>4 peers per miner)
+- [ ] Orphan resolution: submit blocks out of order, verify all accepted
+- [ ] Equal-work fork: submit two blocks at same height with equal work, verify deterministic resolution
+- [ ] Crash recovery: kill node during reorg, verify consistent state on restart
+- [ ] UTXO consistency: verify all nodes at same height have identical UTXO set
+
+### 11.6 Regression Tests
+
+Add the following unit tests to `internal/chain/chain_test.go`:
+
+1. `TestSideChainAncestorLookup` — verify ancestor lookup returns side-chain blocks, not main-chain blocks
+2. `TestReorgAcrossRetargetBoundary` — verify reorg succeeds when fork spans a retarget boundary
+3. `TestReorgFailureRollback` — verify node stays on old chain if new chain has invalid tx
+4. `TestChainworkFromIndex` — verify chainwork lookup matches recomputed chainwork
+5. `TestPersistenceAfterReorg` — verify chain tip and UTXO set survive restart after reorg
+
+Add the following to `internal/p2p/manager_test.go`:
+
+6. `TestAddrGossip` — verify addr messages are sent and received
+7. `TestSeenBlocksEviction` — verify rejected blocks are not permanently cached
+
+### 11.7 Chaos Test Validation Steps
+
+After implementing all fixes, re-run the full chaos test:
+
+```bash
+bash scripts/chaos_test.sh
+```
+
+Expected results:
+- Phase D (deep reorg): spread ≤ 3, all nodes converge
+- Phase F (height index): 0 mismatches
+- Phase H (restart): all nodes preserve chain state
+- All peer counts ≥ 4 for miners
+- Final consensus check: spread ≤ 2
+
+## 12. Previous Task History
+
+### Completed (Phase 4)
 1. ~~Multi-node simulation harness~~ → 16-phase chaos test with 10 nodes + adversarial tool
 2. **Pre-compute genesis hashes**: Run the genesis miner for each network and hardcode the results in `networks.go`.
 3. ~~Structured logging~~ → Migrated to log/slog with --log-level flag
 
-### Short-term (Phase 5)
-4. **UTXO set**: Implement an in-memory UTXO set backed by a bbolt bucket. Track creates/spends per block for reorg rollback.
-5. **Input validation**: Verify that each input references an existing unspent output.
-6. **Coinbase maturity**: Enforce that coinbase outputs cannot be spent until `CoinbaseMaturity` blocks deep.
-7. **Fee calculation**: Compute fees as input_sum - output_sum.
+### Completed (Phase 5)
+4. ~~UTXO set~~ → In-memory set backed by bbolt, connect/disconnect per block, undo data for reorgs.
+5. ~~Input validation~~ → UTXO existence, value checks, coinbase maturity enforcement.
+6. ~~Coinbase maturity~~ → Enforced via `CoinbaseMaturity` param in both block and mempool validation.
+7. ~~Fee calculation~~ → input_sum - output_sum, coinbase capped at subsidy + fees, miner collects fees.
+8. ~~Double-spend detection~~ → Mempool tracks spent outpoints, rejects conflicts.
+9. ~~Fee-rate priority~~ → Mempool orders by fee/byte, eviction removes lowest fee-rate.
+10. ~~Bitcoin Core RPC~~ → gettxout, gettxoutsetinfo, getrawmempool, getmempoolentry.
 
-### Medium-term (Phase 6)
-8. **Identity registration tx type**: Add a new transaction version or type for registering a mining identity (pubkey + collateral deposit).
-9. **Consensus engine swap**: Implement a second `consensus.Engine` that uses identity-based eligibility instead of PoW.
-10. **Epoch seed interface**: Define how epoch seeds are computed from chain history.
+### Next (Phase 6 — Consensus Hardening)
+11. **Fix consensus failures** — See section 11.3 above for the 9 fix tasks.
+12. **Identity registration tx type**: Add a new transaction version or type for registering a mining identity (pubkey + collateral deposit).
+13. **Consensus engine swap**: Implement a second `consensus.Engine` that uses identity-based eligibility instead of PoW.
+14. **Epoch seed interface**: Define how epoch seeds are computed from chain history.
 
 ## 12. Safe Extension Points
 
@@ -289,7 +430,10 @@ These areas are designed for extension and can be modified without breaking exis
 - **`consensus/pow/engine.go` CalcNextBits**: Retarget logic must be identical on all nodes.
 - **`params/params.go` CalcSubsidy**: Subsidy calculation is consensus-critical.
 
-**Rule of thumb**: If a change affects the output of `HashBlockHeader`, `HashTransaction`, `ComputeMerkleRoot`, `CompactToBig`, `CalcSubsidy`, or `CalcNextBits`, it is a consensus-breaking change and requires a hard fork.
+- **`utxo/utxo.go` ConnectBlock/DisconnectBlock**: UTXO state transitions must be deterministic and reversible.
+- **`consensus/txvalidation.go`**: Transaction input validation and fee calculation are consensus-critical.
+
+**Rule of thumb**: If a change affects the output of `HashBlockHeader`, `HashTransaction`, `ComputeMerkleRoot`, `CompactToBig`, `CalcSubsidy`, `CalcNextBits`, or UTXO connect/disconnect behavior, it is a consensus-breaking change and requires a hard fork.
 
 ## 14. Suggested Workflow for Future Agents
 
@@ -331,3 +475,85 @@ bin/fairchain-cli --rpc http://127.0.0.1:19445 getblockcount
 bin/fairchain-cli --rpc http://127.0.0.1:19445 peers
 bin/fairchain-cli --rpc http://127.0.0.1:19445 getblock <hash>
 ```
+
+---
+
+## 12. Pre-Implementation Validation — Chaos Test Findings (Run 4)
+
+### Test Execution Summary
+
+Four chaos test runs were performed after adding RC-1 unit test and RC-2 debug logging.
+
+| Run | Result | Notes |
+|-----|--------|-------|
+| 1 | ALL PASS | No divergence triggered |
+| 2 | ALL PASS | No divergence triggered |
+| 3 | ALL PASS | No divergence triggered |
+| 4 | **6 FAILURES** | UTXO divergence + persistent fork (spread=41) |
+
+The bug is non-deterministic — it depends on whether a 1-deep reorg at the chain tip coincides with a new block arriving whose parent is the pre-reorg tip.
+
+### Run 4 Failure Details
+
+**Final state**: 10 nodes, range=[121..162], spread=41 blocks.
+
+- Node 0 (SEED): stuck at height 121
+- Node 2 (miner): stuck at height 122
+- All other nodes: advanced to 162
+
+**Failed phases**:
+- Phase I UTXO consistency: node0 has 5 UTXOs (25B), all others have 6 (30B)
+- Phase J: DIVERGENCE spread=9
+- Phase K: DIVERGENCE spread=23
+- Phase L: DIVERGENCE spread=31
+- Phase M: DIVERGENCE spread=41
+- FINAL: DIVERGENCE spread=41
+
+### RC-2 Confirmed: Orphan Poisoning via HasBlock + inv Cache
+
+The RC-2 debug logging captured the exact failure mechanism on Node 0:
+
+**Timeline (Node 0)**:
+1. `01:53:10` — Accepted block at height 121 (hash `000000900c...`)
+2. `01:53:13` — Reorged to different block at height 121 (hash `0000004d3a...`, 1-deep reorg)
+3. `01:53:20` — Received block at height 122 (hash `00000011...`) from a peer. Its parent is the OLD height-121 block that was disconnected by the reorg. Block rejected as orphan: "parent unknown".
+4. `01:53:20` — **The orphan block was written to the block index** (`PutBlockIndex` in `ProcessBlock`). Now `HasBlock()` returns true for this hash.
+5. `01:53:20-24` — All 9 other peers announce this same block via inv. Every single inv is rejected with `"inv: block already known, not requesting"` (RC-2 debug tag confirmed). The block is **permanently poisoned** — no peer can deliver it again.
+6. `01:53:24+` — All subsequent blocks arrive as orphans (parent chain broken). Each orphan is also written to the index, poisoning the entire chain of blocks.
+
+**RC-2 stats for stuck nodes**:
+- Node 0: 2,986 inv_skips, 45 block rejections (all orphans), 4 reorgs
+- Node 2: 17,177 inv_skips, 73 block rejections, 4 reorgs
+
+### Root Cause Chain (Confirmed)
+
+The divergence is caused by the interaction of three bugs:
+
+1. **RC-2a (handleInv)**: `HasBlock()` checks the block index, which includes orphaned/rejected blocks. Once a block is written to the index (even as an orphan), `handleInv` refuses to request it from any peer, permanently preventing re-evaluation.
+
+2. **RC-2b (seenBlocks)**: The `seenBlocks` sync.Map stores hashes of all blocks ever received, including rejected ones. If a block is received and rejected, `handleBlock` will skip it on any future delivery from another peer.
+
+3. **RC-5 (orphan writes to block index)**: `ProcessBlock` writes the `DiskBlockIndex` record for side-chain and orphan blocks before determining if they should be accepted. Once written, `HasBlock()` returns true, and the block can never be re-requested.
+
+The trigger is a 1-deep reorg at the tip: Node A reorgs from block X to block Y at the same height. A peer then sends block Z (child of X). Node A rejects Z as an orphan (parent X is no longer on the active chain), writes Z to the index, and then permanently refuses to re-request Z from any peer. All subsequent blocks in that chain become unreachable orphans.
+
+### RC-1 Unit Test Result
+
+The `TestRC1_SideChainAncestorLookupBug` test confirmed that `getAncestorUnsafe` returns the wrong block for side-chain heights at retarget boundaries:
+- Main chain block at height 5: ts=1700000300
+- Side chain block at height 5: ts=1700000420
+- `getAncestorUnsafe(5)` always returns the main chain block regardless of which chain is being validated
+
+In this test's specific scenario, the bits happened to match due to clamping (both timespans clamped to the same bound), so the reorg succeeded. In the chaos test with testnet params (interval=20, 5s blocks), longer chains produce unclamped timespans where the bits actually differ, causing block rejection.
+
+### Recommended Fix Priority (Updated)
+
+Based on the chaos test findings, the fix priority should be:
+
+1. **CRITICAL — RC-2a/RC-5**: Fix `handleInv` to not skip blocks that are only known as orphans. Either: (a) don't write orphan blocks to the block index, or (b) check the block's status in `handleInv` and re-request blocks that are orphaned/rejected.
+
+2. **CRITICAL — RC-2b**: Clear `seenBlocks` entries for rejected blocks so they can be re-delivered by other peers.
+
+3. **HIGH — RC-1**: Replace `getAncestorUnsafe` with a side-chain-aware ancestor lookup that walks the block's actual parent chain rather than using `hashByHeight` (which only tracks the active chain).
+
+4. **MEDIUM — RC-5**: Make block index writes atomic with chain tip updates to prevent inconsistent state on crash.

@@ -1,4 +1,4 @@
-.PHONY: all build test clean node genesis cli adversary
+.PHONY: all build test clean node genesis cli adversary chaos
 
 MODULE := github.com/bams-repo/fairchain
 BINDIR := bin
@@ -18,6 +18,9 @@ cli:
 
 adversary:
 	go build -o $(BINDIR)/fairchain-adversary ./cmd/adversary
+
+chaos: build adversary
+	bash scripts/chaos_test.sh
 
 test:
 	go test ./... -v -count=1

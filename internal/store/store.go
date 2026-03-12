@@ -1,38 +1,46 @@
 package store
 
 import (
+	"math/big"
+
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
-// BlockStore abstracts persistent storage for blocks, headers, and chain state.
+// BlockStore abstracts persistent storage for blocks, headers, chain state, and UTXOs.
 // Implementations must be safe for concurrent read access.
 // Write operations are expected to be serialized by the caller (chain manager).
 type BlockStore interface {
-	// HasBlock returns true if a block with the given hash is stored.
+	// Block data (flat files).
 	HasBlock(hash types.Hash) (bool, error)
+	WriteBlock(hash types.Hash, block *types.Block) (fileNum, offset, size uint32, err error)
+	ReadBlock(fileNum, offset, size uint32) (*types.Block, error)
+	WriteUndo(fileNum uint32, data []byte) (offset, size uint32, err error)
+	ReadUndo(fileNum, offset, size uint32) ([]byte, error)
 
-	// GetBlock retrieves a full block by its header hash.
-	GetBlock(hash types.Hash) (*types.Block, error)
+	// Block index (LevelDB).
+	PutBlockIndex(hash types.Hash, rec *DiskBlockIndex) error
+	GetBlockIndex(hash types.Hash) (*DiskBlockIndex, error)
+	ForEachBlockIndex(fn func(hash types.Hash, rec *DiskBlockIndex) error) error
 
-	// GetHeader retrieves a block header by its hash.
-	GetHeader(hash types.Hash) (*types.BlockHeader, error)
-
-	// PutBlock stores a full block. The header hash is used as the key.
-	PutBlock(hash types.Hash, block *types.Block) error
-
-	// GetBlockByHeight retrieves a block hash at the given height on the main chain.
-	GetBlockByHeight(height uint32) (types.Hash, error)
-
-	// PutBlockIndex stores the hash-to-height and height-to-hash mappings.
-	PutBlockIndex(hash types.Hash, height uint32) error
-
-	// GetChainTip returns the hash and height of the current best chain tip.
+	// Chain tip (stored in block index).
 	GetChainTip() (types.Hash, uint32, error)
-
-	// PutChainTip updates the stored chain tip.
 	PutChainTip(hash types.Hash, height uint32) error
 
-	// Close releases storage resources.
+	// Chainstate / UTXO (LevelDB).
+	PutUtxo(txHash types.Hash, index uint32, data []byte) error
+	GetUtxo(txHash types.Hash, index uint32) ([]byte, error)
+	DeleteUtxo(txHash types.Hash, index uint32) error
+	HasUtxo(txHash types.Hash, index uint32) (bool, error)
+	NewUtxoWriteBatch() *ChainstateWriteBatch
+	FlushUtxoBatch(wb *ChainstateWriteBatch) error
+	GetBestBlock() (types.Hash, error)
+	PutBestBlock(hash types.Hash) error
+	UtxoCount() (int, error)
+
+	// Legacy compatibility: read a full block by hash (uses index + flat file).
+	GetBlock(hash types.Hash) (*types.Block, error)
+	GetHeader(hash types.Hash) (*types.BlockHeader, error)
+
 	Close() error
 }
 
@@ -49,4 +57,28 @@ type PeerStore interface {
 
 	// Close releases storage resources.
 	Close() error
+}
+
+// CalcWork computes the proof-of-work for a given compact target.
+func CalcWork(bits uint32) *big.Int {
+	target := compactToBig(bits)
+	if target.Sign() <= 0 {
+		return big.NewInt(0)
+	}
+	// work = 2^256 / (target + 1)
+	maxVal := new(big.Int).Lsh(big.NewInt(1), 256)
+	denom := new(big.Int).Add(target, big.NewInt(1))
+	return new(big.Int).Div(maxVal, denom)
+}
+
+func compactToBig(compact uint32) *big.Int {
+	exponent := compact >> 24
+	mantissa := compact & 0x007fffff
+	if exponent <= 3 {
+		mantissa >>= 8 * (3 - exponent)
+		return big.NewInt(int64(mantissa))
+	}
+	bn := big.NewInt(int64(mantissa))
+	bn.Lsh(bn, uint(8*(exponent-3)))
+	return bn
 }

@@ -70,16 +70,19 @@ func TestValidateBlockStructureNoCoinbase(t *testing.T) {
 }
 
 func TestValidateBlockStructureExcessiveSubsidy(t *testing.T) {
+	// Coinbase value is now validated in ValidateTransactionInputs (where fees are known).
+	// ValidateBlockStructure only checks for coinbase output value overflow.
+	// This test verifies that a coinbase with value slightly above subsidy passes
+	// structural validation (it would be caught by tx input validation with fee context).
 	p := params.Regtest
 	block := makeTestBlock(1, p)
 	block.Transactions[0].Outputs[0].Value = p.InitialSubsidy + 1
 
-	// Recompute merkle root.
 	merkle, _ := crypto.ComputeMerkleRoot(block.Transactions)
 	block.Header.MerkleRoot = merkle
 
-	if err := ValidateBlockStructure(&block, 1, p); err == nil {
-		t.Fatal("should reject block with excessive subsidy")
+	if err := ValidateBlockStructure(&block, 1, p); err != nil {
+		t.Fatalf("structural validation should pass (coinbase cap enforced in tx validation): %v", err)
 	}
 }
 

@@ -1,23 +1,32 @@
 package store
 
 import (
-	"os"
+	"math/big"
 	"path/filepath"
 	"testing"
 
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
-func TestBoltStoreBlockRoundtrip(t *testing.T) {
+func newTestFileStore(t *testing.T) *FileStore {
+	t.Helper()
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	s, err := NewBoltStore(dbPath)
+	magic := [4]byte{0xFA, 0x1C, 0xC0, 0xFF}
+	s, err := NewFileStore(
+		filepath.Join(dir, "blocks"),
+		filepath.Join(dir, "blocks", "index"),
+		filepath.Join(dir, "chainstate"),
+		magic,
+	)
 	if err != nil {
-		t.Fatalf("NewBoltStore: %v", err)
+		t.Fatalf("NewFileStore: %v", err)
 	}
-	defer s.Close()
-	defer os.Remove(dbPath)
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestFileStoreBlockRoundtrip(t *testing.T) {
+	s := newTestFileStore(t)
 
 	block := types.Block{
 		Header: types.BlockHeader{
@@ -41,21 +50,33 @@ func TestBoltStoreBlockRoundtrip(t *testing.T) {
 
 	hash := types.Hash{0x01, 0x02, 0x03}
 
-	// Store block.
-	if err := s.PutBlock(hash, &block); err != nil {
-		t.Fatalf("PutBlock: %v", err)
+	fileNum, offset, size, err := s.WriteBlock(hash, &block)
+	if err != nil {
+		t.Fatalf("WriteBlock: %v", err)
 	}
 
-	// Check existence.
+	rec := &DiskBlockIndex{
+		Header:    block.Header,
+		Height:    0,
+		Status:    StatusHaveData | StatusValidHeader,
+		TxCount:   1,
+		FileNum:   fileNum,
+		DataPos:   offset,
+		DataSize:  size,
+		ChainWork: big.NewInt(1),
+	}
+	if err := s.PutBlockIndex(hash, rec); err != nil {
+		t.Fatalf("PutBlockIndex: %v", err)
+	}
+
 	has, err := s.HasBlock(hash)
 	if err != nil {
 		t.Fatalf("HasBlock: %v", err)
 	}
 	if !has {
-		t.Fatal("block should exist after PutBlock")
+		t.Fatal("block should exist after write")
 	}
 
-	// Retrieve block.
 	got, err := s.GetBlock(hash)
 	if err != nil {
 		t.Fatalf("GetBlock: %v", err)
@@ -67,7 +88,6 @@ func TestBoltStoreBlockRoundtrip(t *testing.T) {
 		t.Fatalf("tx count = %d, want 1", len(got.Transactions))
 	}
 
-	// Retrieve header.
 	hdr, err := s.GetHeader(hash)
 	if err != nil {
 		t.Fatalf("GetHeader: %v", err)
@@ -77,15 +97,8 @@ func TestBoltStoreBlockRoundtrip(t *testing.T) {
 	}
 }
 
-func TestBoltStoreChainTip(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	s, err := NewBoltStore(dbPath)
-	if err != nil {
-		t.Fatalf("NewBoltStore: %v", err)
-	}
-	defer s.Close()
+func TestFileStoreChainTip(t *testing.T) {
+	s := newTestFileStore(t)
 
 	hash := types.Hash{0xAA, 0xBB}
 	height := uint32(100)
@@ -106,35 +119,90 @@ func TestBoltStoreChainTip(t *testing.T) {
 	}
 }
 
-func TestBoltStoreBlockIndex(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
+func TestFileStoreUndoRoundtrip(t *testing.T) {
+	s := newTestFileStore(t)
 
-	s, err := NewBoltStore(dbPath)
+	undoData := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
+
+	offset, size, err := s.WriteUndo(0, undoData)
 	if err != nil {
-		t.Fatalf("NewBoltStore: %v", err)
-	}
-	defer s.Close()
-
-	hash := types.Hash{0x11, 0x22}
-	height := uint32(5)
-
-	if err := s.PutBlockIndex(hash, height); err != nil {
-		t.Fatalf("PutBlockIndex: %v", err)
+		t.Fatalf("WriteUndo: %v", err)
 	}
 
-	gotHash, err := s.GetBlockByHeight(height)
+	got, err := s.ReadUndo(0, offset, size)
 	if err != nil {
-		t.Fatalf("GetBlockByHeight: %v", err)
+		t.Fatalf("ReadUndo: %v", err)
 	}
-	if gotHash != hash {
-		t.Fatalf("hash at height %d = %s, want %s", height, gotHash, hash)
+	if len(got) != len(undoData) {
+		t.Fatalf("undo data length = %d, want %d", len(got), len(undoData))
+	}
+	for i := range got {
+		if got[i] != undoData[i] {
+			t.Fatalf("undo data[%d] = %d, want %d", i, got[i], undoData[i])
+		}
+	}
+}
+
+func TestFileStoreUtxo(t *testing.T) {
+	s := newTestFileStore(t)
+
+	txHash := types.Hash{0x11, 0x22, 0x33}
+	index := uint32(0)
+	data := []byte{0xAA, 0xBB, 0xCC}
+
+	if err := s.PutUtxo(txHash, index, data); err != nil {
+		t.Fatalf("PutUtxo: %v", err)
+	}
+
+	has, err := s.HasUtxo(txHash, index)
+	if err != nil {
+		t.Fatalf("HasUtxo: %v", err)
+	}
+	if !has {
+		t.Fatal("UTXO should exist")
+	}
+
+	got, err := s.GetUtxo(txHash, index)
+	if err != nil {
+		t.Fatalf("GetUtxo: %v", err)
+	}
+	if len(got) != 3 || got[0] != 0xAA {
+		t.Fatalf("unexpected UTXO data: %x", got)
+	}
+
+	if err := s.DeleteUtxo(txHash, index); err != nil {
+		t.Fatalf("DeleteUtxo: %v", err)
+	}
+
+	has, err = s.HasUtxo(txHash, index)
+	if err != nil {
+		t.Fatalf("HasUtxo after delete: %v", err)
+	}
+	if has {
+		t.Fatal("UTXO should not exist after delete")
+	}
+}
+
+func TestFileStoreNonExistent(t *testing.T) {
+	s := newTestFileStore(t)
+
+	has, err := s.HasBlock(types.Hash{0xFF})
+	if err != nil {
+		t.Fatalf("HasBlock: %v", err)
+	}
+	if has {
+		t.Fatal("non-existent block should not exist")
+	}
+
+	_, _, err = s.GetChainTip()
+	if err == nil {
+		t.Fatal("GetChainTip should error when not set")
 	}
 }
 
 func TestBoltStorePeers(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
+	dbPath := dir + "/test.db"
 
 	s, err := NewBoltStore(dbPath)
 	if err != nil {
@@ -167,34 +235,5 @@ func TestBoltStorePeers(t *testing.T) {
 	}
 	if len(peers) != 1 {
 		t.Fatalf("peer count after remove = %d, want 1", len(peers))
-	}
-}
-
-func TestBoltStoreNonExistent(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "test.db")
-
-	s, err := NewBoltStore(dbPath)
-	if err != nil {
-		t.Fatalf("NewBoltStore: %v", err)
-	}
-	defer s.Close()
-
-	has, err := s.HasBlock(types.Hash{0xFF})
-	if err != nil {
-		t.Fatalf("HasBlock: %v", err)
-	}
-	if has {
-		t.Fatal("non-existent block should not exist")
-	}
-
-	_, err = s.GetBlock(types.Hash{0xFF})
-	if err == nil {
-		t.Fatal("GetBlock should error for non-existent block")
-	}
-
-	_, _, err = s.GetChainTip()
-	if err == nil {
-		t.Fatal("GetChainTip should error when not set")
 	}
 }

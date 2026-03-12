@@ -115,6 +115,32 @@ func ReadVarInt(r io.Reader) (uint64, error) {
 	}
 }
 
+// ReadVarIntFromBytes reads a varint from a byte slice without an io.Reader.
+func ReadVarIntFromBytes(data []byte) (uint64, error) {
+	if len(data) == 0 {
+		return 0, fmt.Errorf("empty data for varint")
+	}
+	switch data[0] {
+	case 0xFD:
+		if len(data) < 3 {
+			return 0, fmt.Errorf("varint 0xFD needs 3 bytes, got %d", len(data))
+		}
+		return uint64(binary.LittleEndian.Uint16(data[1:3])), nil
+	case 0xFE:
+		if len(data) < 5 {
+			return 0, fmt.Errorf("varint 0xFE needs 5 bytes, got %d", len(data))
+		}
+		return uint64(binary.LittleEndian.Uint32(data[1:5])), nil
+	case 0xFF:
+		if len(data) < 9 {
+			return 0, fmt.Errorf("varint 0xFF needs 9 bytes, got %d", len(data))
+		}
+		return binary.LittleEndian.Uint64(data[1:9]), nil
+	default:
+		return uint64(data[0]), nil
+	}
+}
+
 // VarIntSize returns the encoded size of a varint value.
 func VarIntSize(val uint64) int {
 	switch {

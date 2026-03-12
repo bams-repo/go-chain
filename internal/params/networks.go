@@ -7,6 +7,7 @@ import (
 )
 
 // Mainnet is the primary fairchain network.
+// Economic parameters are aligned with Bitcoin mainnet.
 // Genesis block will be mined with the genesis tool before launch.
 var Mainnet = &ChainParams{
 	Name:         "mainnet",
@@ -14,26 +15,26 @@ var Mainnet = &ChainParams{
 	DefaultPort:  19333,
 	AddressPrefix: 0x00,
 
-	TargetBlockSpacing:  2 * time.Minute,
-	RetargetInterval:    720,                      // ~1 day at 2-min blocks
-	TargetTimespan:      720 * 2 * time.Minute,
+	TargetBlockSpacing:  10 * time.Minute,
+	RetargetInterval:    144,                             // Difficulty adjustment every 144 blocks (~24 hours at 10-min blocks).
+	TargetTimespan:      144 * 10 * time.Minute,          // 144 blocks * 10 min = 1,440 min (24 hours).
 	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
 	InitialBits:      0x1d00ffff,
-	MinBits:          0x1d00ffff,
+	MinBits:          0x1e0fffff, // Easier than initial — allows recovery from catastrophic hash rate loss.
 	NoRetarget:       false,
 
 	MaxBlockSize:     1_000_000,
 	MaxBlockTxCount:  10_000,
 
-	InitialSubsidy:          50_0000_0000, // 50 coins * 10^8 smallest units
-	SubsidyHalvingInterval:  210_000,
+	InitialSubsidy:          50_0000_0000, // 50 coins * 10^8 smallest units.
+	SubsidyHalvingInterval:  210_000,      // ~4 years at 10-min blocks (210,000 * 10 min ≈ 3.99 years).
 
 	CoinbaseMaturity: 100,
 
 	MaxMempoolSize: 5000,
-	MinRelayTxFee:  1000,
+	MinRelayTxFee:  1000, // Smallest units per tx — equivalent to Bitcoin's 1000 sat minimum relay fee.
 
 	SeedNodes: []string{},
 

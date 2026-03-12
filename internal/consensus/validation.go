@@ -68,14 +68,14 @@ func ValidateBlockStructure(block *types.Block, height uint32, p *params.ChainPa
 		txIDs[txID] = struct{}{}
 	}
 
-	// Validate coinbase output value.
-	subsidy := p.CalcSubsidy(height)
+	// Coinbase value is validated in ValidateTransactionInputs where fees are known.
+	// Structural validation only checks that coinbase outputs don't overflow.
 	var coinbaseValue uint64
 	for _, out := range block.Transactions[0].Outputs {
+		if coinbaseValue+out.Value < coinbaseValue {
+			return fmt.Errorf("coinbase output value overflow")
+		}
 		coinbaseValue += out.Value
-	}
-	if coinbaseValue > subsidy {
-		return fmt.Errorf("coinbase value %d exceeds subsidy %d at height %d", coinbaseValue, subsidy, height)
 	}
 
 	return nil

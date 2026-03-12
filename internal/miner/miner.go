@@ -82,9 +82,12 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 	newHeight := tipHeight + 1
 	subsidy := m.params.CalcSubsidy(newHeight)
 
-	coinbaseTx := m.buildCoinbase(newHeight, subsidy)
-
 	mempoolTxs := m.mempool.GetAll()
+
+	// Compute total fees from mempool transactions.
+	totalFees := m.mempool.TotalFees()
+
+	coinbaseTx := m.buildCoinbase(newHeight, subsidy+totalFees)
 
 	txs := make([]types.Transaction, 0, 1+len(mempoolTxs))
 	txs = append(txs, coinbaseTx)

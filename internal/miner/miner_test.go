@@ -38,7 +38,12 @@ func setupTestMiner(t *testing.T) (*Miner, *chain.Chain, *fcparams.ChainParams) 
 	fcparams.InitGenesis(p, genesis, genesisHash)
 
 	dir := t.TempDir()
-	s, err := store.NewBoltStore(filepath.Join(dir, "test.db"))
+	s, err := store.NewFileStore(
+		filepath.Join(dir, "blocks"),
+		filepath.Join(dir, "blocks", "index"),
+		filepath.Join(dir, "chainstate"),
+		p.NetworkMagic,
+	)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -50,7 +55,7 @@ func setupTestMiner(t *testing.T) (*Miner, *chain.Chain, *fcparams.ChainParams) 
 		t.Fatalf("init chain: %v", err)
 	}
 
-	mp := mempool.New(p)
+	mp := mempool.New(p, c.UtxoSet())
 	m := New(c, engine, mp, p, []byte{0x00}, nil)
 
 	return m, c, p

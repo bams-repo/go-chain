@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -44,6 +45,10 @@ func New(addr string, c *chain.Chain, mp *mempool.Mempool, pm *p2p.Manager, p *p
 	mux.HandleFunc("/submitblock", s.handleSubmitBlock)
 	mux.HandleFunc("/getmempoolinfo", s.handleGetMempoolInfo)
 	mux.HandleFunc("/getblockchaininfo", s.handleGetBlockchainInfo)
+	mux.HandleFunc("/gettxout", s.handleGetTxOut)
+	mux.HandleFunc("/gettxoutsetinfo", s.handleGetTxOutSetInfo)
+	mux.HandleFunc("/getrawmempool", s.handleGetRawMempool)
+	mux.HandleFunc("/getmempoolentry", s.handleGetMempoolEntry)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	s.server = &http.Server{
@@ -204,6 +209,133 @@ func (s *Server) handleGetBlockchainInfo(w http.ResponseWriter, r *http.Request)
 		"verification_progress":  info.VerificationProg,
 		"peers":                  s.p2p.PeerCount(),
 		"mempool_size":           s.mempool.Count(),
+	}
+	writeJSON(w, resp)
+}
+
+// handleGetTxOut implements Bitcoin Core's gettxout RPC.
+// Returns details about an unspent transaction output.
+// Parameters: txid (hex, display order), n (output index), include_mempool (optional, default true).
+func (s *Server) handleGetTxOut(w http.ResponseWriter, r *http.Request) {
+	txidStr := r.URL.Query().Get("txid")
+	if txidStr == "" {
+		writeError(w, http.StatusBadRequest, "missing txid parameter")
+		return
+	}
+	txHash, err := types.HashFromReverseHex(txidStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid txid: %v", err))
+		return
+	}
+
+	nStr := r.URL.Query().Get("n")
+	if nStr == "" {
+		writeError(w, http.StatusBadRequest, "missing n parameter")
+		return
+	}
+	var n uint32
+	if _, err := fmt.Sscanf(nStr, "%d", &n); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid n: %v", err))
+		return
+	}
+
+	utxoSet := s.chain.UtxoSet()
+	entry := utxoSet.Get(txHash, n)
+	if entry == nil {
+		writeJSON(w, nil)
+		return
+	}
+
+	tipHash, tipHeight := s.chain.Tip()
+	confirmations := uint32(0)
+	if tipHeight >= entry.Height {
+		confirmations = tipHeight - entry.Height + 1
+	}
+
+	resp := map[string]interface{}{
+		"bestblock":     tipHash.ReverseString(),
+		"confirmations": confirmations,
+		"value":         entry.Value,
+		"scriptPubKey": map[string]interface{}{
+			"hex": hex.EncodeToString(entry.PkScript),
+		},
+		"coinbase": entry.IsCoinbase,
+	}
+	writeJSON(w, resp)
+}
+
+// handleGetTxOutSetInfo implements Bitcoin Core's gettxoutsetinfo RPC.
+// Returns statistics about the unspent transaction output set.
+func (s *Server) handleGetTxOutSetInfo(w http.ResponseWriter, r *http.Request) {
+	info := s.chain.TxOutSetInfo()
+
+	resp := map[string]interface{}{
+		"height":       info.Height,
+		"bestblock":    info.BestHash.ReverseString(),
+		"txouts":       info.TxOuts,
+		"total_amount": info.TotalValue,
+	}
+	writeJSON(w, resp)
+}
+
+// handleGetRawMempool implements Bitcoin Core's getrawmempool RPC.
+// Returns all transaction IDs in the memory pool.
+// Parameter: verbose (optional, default false). If true, returns detailed entries.
+func (s *Server) handleGetRawMempool(w http.ResponseWriter, r *http.Request) {
+	verbose := r.URL.Query().Get("verbose") == "true"
+
+	if !verbose {
+		hashes := s.mempool.GetTxHashes()
+		txids := make([]string, len(hashes))
+		for i, h := range hashes {
+			txids[i] = h.ReverseString()
+		}
+		writeJSON(w, txids)
+		return
+	}
+
+	entries := s.mempool.GetAllEntries()
+	result := make(map[string]interface{}, len(entries))
+	for _, e := range entries {
+		result[e.Hash.ReverseString()] = map[string]interface{}{
+			"size": e.Size,
+			"fee":  e.Fee,
+			"fees": map[string]interface{}{
+				"base": e.Fee,
+			},
+			"feerate": e.FeeRate,
+		}
+	}
+	writeJSON(w, result)
+}
+
+// handleGetMempoolEntry implements Bitcoin Core's getmempoolentry RPC.
+// Returns mempool data for a given transaction.
+func (s *Server) handleGetMempoolEntry(w http.ResponseWriter, r *http.Request) {
+	txidStr := r.URL.Query().Get("txid")
+	if txidStr == "" {
+		writeError(w, http.StatusBadRequest, "missing txid parameter")
+		return
+	}
+	txHash, err := types.HashFromReverseHex(txidStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid txid: %v", err))
+		return
+	}
+
+	entry, ok := s.mempool.GetTxEntry(txHash)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("transaction %s not in mempool", txidStr))
+		return
+	}
+
+	resp := map[string]interface{}{
+		"size": entry.Size,
+		"fee":  entry.Fee,
+		"fees": map[string]interface{}{
+			"base": entry.Fee,
+		},
+		"feerate": entry.FeeRate,
 	}
 	writeJSON(w, resp)
 }

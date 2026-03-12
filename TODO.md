@@ -68,16 +68,20 @@
 - [x] Structured logging (log/slog) with --log-level flag (debug/info/warn/error)
 - [x] Metrics collection skeleton: atomic counters for blocks, peers, reorgs, orphans, rejections + /metrics RPC endpoint
 
-## Phase 5: UTXO & Transaction Validation
+## Phase 5: UTXO & Transaction Validation (COMPLETE)
 
-- [ ] UTXO set tracking (in-memory + persistent)
-- [ ] Input validation: referenced UTXO exists and is unspent
-- [ ] Output validation: no negative values, total input ≥ total output
-- [ ] Fee calculation (input sum - output sum)
-- [ ] Coinbase maturity enforcement
-- [ ] Double-spend detection in mempool
-- [ ] Transaction priority by fee rate
-- [ ] Mempool eviction policy
+- [x] UTXO set tracking (in-memory + persistent via bbolt)
+- [x] Input validation: referenced UTXO exists and is unspent
+- [x] Output validation: no negative values, total input ≥ total output
+- [x] Fee calculation (input sum - output sum)
+- [x] Coinbase maturity enforcement
+- [x] Double-spend detection in mempool
+- [x] Transaction priority by fee rate
+- [x] Mempool eviction policy
+- [x] UTXO-aware reorg with disconnect/reconnect and undo data
+- [x] Coinbase value validation: subsidy + fees cap
+- [x] Miner includes fees in coinbase reward
+- [x] Bitcoin Core-style RPC: gettxout, gettxoutsetinfo, getrawmempool, getmempoolentry
 
 ## Phase 6: Future Fair-Consensus Extension Points
 

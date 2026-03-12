@@ -1,6 +1,6 @@
 # Binaries
 bin/
-adversary
+/adversary
 *.exe
 *.dll
 *.so
