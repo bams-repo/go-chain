@@ -350,13 +350,73 @@ fairchain-cli getnetworkinfo
 
 ### getpeerinfo
 
-Returns detailed information about each connected peer.
+Returns detailed information about each connected peer. Response format matches Bitcoin Core's `getpeerinfo`.
 
 ```bash
 fairchain-cli getpeerinfo
 ```
 
-**Response:** array of peer objects with connection details including address, version, latency, and sync state.
+**Response:** array of peer objects:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | number | Unique peer index |
+| `addr` | string | Remote address (ip:port) |
+| `addrlocal` | string | Local address (ip:port) |
+| `network` | string | Network type: `ipv4`, `ipv6` |
+| `services` | string | Services offered (hex) |
+| `relaytxes` | boolean | Whether peer relays transactions |
+| `lastsend` | number | Last send time (unix timestamp) |
+| `lastrecv` | number | Last receive time (unix timestamp) |
+| `last_transaction` | number | Last valid transaction time (unix timestamp) |
+| `last_block` | number | Last valid block time (unix timestamp) |
+| `bytessent` | number | Total bytes sent |
+| `bytesrecv` | number | Total bytes received |
+| `conntime` | number | Connection time (unix timestamp) |
+| `timeoffset` | number | Time offset (seconds) |
+| `pingtime` | number | Last ping time (seconds, float) |
+| `minping` | number | Minimum observed ping (seconds, float) |
+| `version` | number | Peer protocol version |
+| `subver` | string | User agent string |
+| `inbound` | boolean | Whether connection is inbound |
+| `startingheight` | number | Peer's block height at connect time |
+| `synced_headers` | number | Last common header height (-1 if unknown) |
+| `synced_blocks` | number | Last common block height (-1 if unknown) |
+| `banscore` | number | Misbehavior score (banned at 100) |
+| `connection_type` | string | `inbound`, `outbound-full-relay`, or `manual` |
+
+**Example response:**
+
+```json
+[
+  {
+    "id": 1,
+    "addr": "45.32.196.26:19334",
+    "addrlocal": "192.168.1.5:48210",
+    "network": "ipv4",
+    "services": "0000000000000001",
+    "relaytxes": true,
+    "lastsend": 1773534200,
+    "lastrecv": 1773534198,
+    "last_transaction": 1773534150,
+    "last_block": 1773534190,
+    "bytessent": 125430,
+    "bytesrecv": 983201,
+    "conntime": 1773530000,
+    "timeoffset": 0,
+    "pingtime": 0.045,
+    "minping": 0.032,
+    "version": 1,
+    "subver": "/fairchain:0.4.0/",
+    "inbound": false,
+    "startingheight": 1500,
+    "synced_headers": 1542,
+    "synced_blocks": 1542,
+    "banscore": 0,
+    "connection_type": "outbound-full-relay"
+  }
+]
+```
 
 ---
 

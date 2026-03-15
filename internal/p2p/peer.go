@@ -25,18 +25,29 @@ type Peer struct {
 	inbound bool
 	magic   [4]byte
 	reader  *bufio.Reader
+	id      int32  // unique peer ID assigned by the Manager
+	connType string // "inbound", "outbound-full-relay", or "manual"
 
 	mu      sync.Mutex
 	version *protocol.VersionMsg
 
 	// Liveness tracking (Bitcoin Core parity: BIP 31 ping/pong).
-	connectedAt time.Time
-	lastRecv    atomic.Int64 // unix timestamp of last message received
-	lastSend    atomic.Int64 // unix timestamp of last message sent
-	pingNonce   uint64       // nonce of the outstanding ping (0 = none pending)
-	pingSent    time.Time    // when the outstanding ping was sent
-	lastPong    time.Time    // when the last valid pong was received
-	pingLatency time.Duration
+	connectedAt    time.Time
+	lastRecv       atomic.Int64 // unix timestamp of last message received
+	lastSend       atomic.Int64 // unix timestamp of last message sent
+	pingNonce      uint64       // nonce of the outstanding ping (0 = none pending)
+	pingSent       time.Time    // when the outstanding ping was sent
+	lastPong       time.Time    // when the last valid pong was received
+	pingLatency    time.Duration
+	minPingLatency time.Duration // best observed ping
+
+	// Block/tx relay timestamps (Bitcoin Core parity).
+	lastBlockTime atomic.Int64 // unix timestamp of last valid block received from this peer
+	lastTxTime    atomic.Int64 // unix timestamp of last valid tx received from this peer
+
+	// Sync state: last common header/block heights with this peer.
+	syncedHeaders atomic.Int32
+	syncedBlocks  atomic.Int32
 
 	// Misbehavior scoring (Bitcoin Core parity: ban at 100).
 	banScore int32 // atomic-style but guarded by mu for compound ops
@@ -87,12 +98,17 @@ const (
 // NewPeer wraps a connection into a Peer.
 func NewPeer(conn net.Conn, inbound bool, magic [4]byte) *Peer {
 	now := time.Now()
+	connType := "outbound-full-relay"
+	if inbound {
+		connType = "inbound"
+	}
 	p := &Peer{
 		conn:        conn,
 		addr:        conn.RemoteAddr().String(),
 		inbound:     inbound,
 		magic:       magic,
 		reader:      bufio.NewReader(conn),
+		connType:    connType,
 		connectedAt: now,
 		lastPong:    now,
 		windowStart: now,
@@ -102,6 +118,8 @@ func NewPeer(conn net.Conn, inbound bool, magic [4]byte) *Peer {
 	}
 	p.lastRecv.Store(now.Unix())
 	p.lastSend.Store(now.Unix())
+	p.syncedHeaders.Store(-1)
+	p.syncedBlocks.Store(-1)
 	return p
 }
 
@@ -180,6 +198,9 @@ func (p *Peer) HandlePong(nonce uint64) bool {
 		return false
 	}
 	p.pingLatency = time.Since(p.pingSent)
+	if p.minPingLatency == 0 || p.pingLatency < p.minPingLatency {
+		p.minPingLatency = p.pingLatency
+	}
 	p.lastPong = time.Now()
 	p.pingNonce = 0
 	return true
@@ -202,6 +223,25 @@ func (p *Peer) LastPong() time.Time {
 	defer p.mu.Unlock()
 	return p.lastPong
 }
+
+// --- Peer identity ---
+
+func (p *Peer) ID() int32        { return p.id }
+func (p *Peer) SetID(id int32)   { p.id = id }
+func (p *Peer) ConnType() string { return p.connType }
+func (p *Peer) SetConnType(t string) { p.connType = t }
+
+// StampLastBlock records that a valid block was received from this peer.
+func (p *Peer) StampLastBlock() { p.lastBlockTime.Store(time.Now().Unix()) }
+
+// StampLastTx records that a valid transaction was received from this peer.
+func (p *Peer) StampLastTx() { p.lastTxTime.Store(time.Now().Unix()) }
+
+// SetSyncedHeaders records the last common header height with this peer.
+func (p *Peer) SetSyncedHeaders(h int32) { p.syncedHeaders.Store(h) }
+
+// SetSyncedBlocks records the last common block height with this peer.
+func (p *Peer) SetSyncedBlocks(h int32) { p.syncedBlocks.Store(h) }
 
 // --- Misbehavior scoring ---
 
@@ -378,43 +418,94 @@ func (p *Peer) Close() {
 
 func (p *Peer) Done() <-chan struct{} { return p.done }
 
-// --- Info snapshot for RPC ---
+// --- Info snapshot for RPC (Bitcoin Core parity) ---
 
+// PeerInfo mirrors Bitcoin Core's getpeerinfo response fields.
+// JSON keys match Bitcoin Core exactly for tooling compatibility.
 type PeerInfo struct {
-	Addr        string        `json:"addr"`
-	Inbound     bool          `json:"inbound"`
-	Version     uint32        `json:"version"`
-	UserAgent   string        `json:"user_agent"`
-	StartHeight uint32        `json:"start_height"`
-	BanScore    int32         `json:"ban_score"`
-	PingMs      int64         `json:"ping_ms"`
-	ConnectedAt int64         `json:"connected_at"`
-	LastRecv    int64         `json:"last_recv"`
-	LastSend    int64         `json:"last_send"`
-	BytesRecv   int64         `json:"bytes_recv"`
-	BytesSent   int64         `json:"bytes_sent"`
+	ID              int32   `json:"id"`
+	Addr            string  `json:"addr"`
+	AddrLocal       string  `json:"addrlocal,omitempty"`
+	Network         string  `json:"network"`
+	Services        string  `json:"services"`
+	RelayTxes       bool    `json:"relaytxes"`
+	LastSend        int64   `json:"lastsend"`
+	LastRecv        int64   `json:"lastrecv"`
+	LastTransaction int64   `json:"last_transaction"`
+	LastBlock       int64   `json:"last_block"`
+	BytesSent       int64   `json:"bytessent"`
+	BytesRecv       int64   `json:"bytesrecv"`
+	ConnTime        int64   `json:"conntime"`
+	TimeOffset      int64   `json:"timeoffset"`
+	PingTime        float64 `json:"pingtime"`
+	MinPing         float64 `json:"minping"`
+	Version         uint32  `json:"version"`
+	SubVer          string  `json:"subver"`
+	Inbound         bool    `json:"inbound"`
+	BIP152HBCompact bool    `json:"bip152_hb_to"`
+	StartingHeight  int32   `json:"startingheight"`
+	SyncedHeaders   int32   `json:"synced_headers"`
+	SyncedBlocks    int32   `json:"synced_blocks"`
+	BanScore        int32   `json:"banscore"`
+	ConnectionType  string  `json:"connection_type"`
 }
 
 func (p *Peer) Info() PeerInfo {
 	info := PeerInfo{
-		Addr:        p.addr,
-		Inbound:     p.inbound,
-		ConnectedAt: p.connectedAt.Unix(),
-		LastRecv:    p.lastRecv.Load(),
-		LastSend:    p.lastSend.Load(),
-		BytesRecv:   p.bytesRecv.Load(),
-		BytesSent:   p.bytesSent.Load(),
+		ID:              p.id,
+		Addr:            p.addr,
+		Network:         classifyNetwork(p.addr),
+		RelayTxes:       true,
+		LastSend:        p.lastSend.Load(),
+		LastRecv:        p.lastRecv.Load(),
+		LastTransaction: p.lastTxTime.Load(),
+		LastBlock:       p.lastBlockTime.Load(),
+		BytesSent:       p.bytesSent.Load(),
+		BytesRecv:       p.bytesRecv.Load(),
+		ConnTime:        p.connectedAt.Unix(),
+		SyncedHeaders:   p.syncedHeaders.Load(),
+		SyncedBlocks:    p.syncedBlocks.Load(),
+		ConnectionType:  p.connType,
+		Inbound:         p.inbound,
 	}
+
 	p.mu.Lock()
 	info.BanScore = p.banScore
-	info.PingMs = p.pingLatency.Milliseconds()
+	if p.pingLatency > 0 {
+		info.PingTime = p.pingLatency.Seconds()
+	}
+	if p.minPingLatency > 0 {
+		info.MinPing = p.minPingLatency.Seconds()
+	}
 	if p.version != nil {
 		info.Version = p.version.Version
-		info.UserAgent = p.version.UserAgent
-		info.StartHeight = p.version.StartHeight
+		info.SubVer = p.version.UserAgent
+		info.StartingHeight = int32(p.version.StartHeight)
+		info.Services = fmt.Sprintf("%016x", p.version.Services)
 	}
 	p.mu.Unlock()
+
+	if localAddr := p.conn.LocalAddr(); localAddr != nil {
+		info.AddrLocal = localAddr.String()
+	}
+
 	return info
+}
+
+// classifyNetwork returns "ipv4", "ipv6", or "unknown" based on the peer address.
+func classifyNetwork(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "unknown"
+	}
+	if ip.To4() != nil {
+		return "ipv4"
+	}
+	return "ipv6"
 }
 
 // --- Crypto helpers ---

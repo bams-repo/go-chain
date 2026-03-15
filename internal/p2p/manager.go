@@ -58,6 +58,9 @@ type Manager struct {
 	backoff   map[string]time.Time
 	backoffN  map[string]int // consecutive failure count per addr
 
+	nextPeerID int32 // monotonically increasing peer ID counter
+	manualPeers map[string]struct{} // addresses added via AddNode (for connection_type)
+
 	seenBlocks *boundedHashSet
 	seenTxs    *boundedHashSet
 
@@ -168,6 +171,7 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		timeSampler: ts,
 		peers:       make(map[string]*Peer),
 		localNonce:  nonce,
+		manualPeers: make(map[string]struct{}),
 		banned:      make(map[string]time.Time),
 		backoff:     make(map[string]time.Time),
 		backoffN:    make(map[string]int),
@@ -294,6 +298,9 @@ func (m *Manager) AddNode(addr string) error {
 	if exists {
 		return fmt.Errorf("already connected to %s", addr)
 	}
+	m.mu.Lock()
+	m.manualPeers[addr] = struct{}{}
+	m.mu.Unlock()
 	go m.connectPeer(m.ctx, addr)
 	return nil
 }
@@ -787,6 +794,11 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 	m.recordConnectSuccess(peer.Addr())
 
 	m.mu.Lock()
+	m.nextPeerID++
+	peer.SetID(m.nextPeerID)
+	if _, manual := m.manualPeers[peer.Addr()]; manual {
+		peer.SetConnType("manual")
+	}
 	m.peers[peer.Addr()] = peer
 	if peer.Version().StartHeight > m.bestPeerHeight {
 		m.bestPeerHeight = peer.Version().StartHeight
@@ -1314,6 +1326,9 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	m.mempool.SetTipHeight(height)
 
 	peer.SetStartHeightIfGreater(height)
+	peer.StampLastBlock()
+	peer.SetSyncedBlocks(int32(height))
+	peer.SetSyncedHeaders(int32(height))
 	m.mu.Lock()
 	if height > m.bestPeerHeight {
 		m.bestPeerHeight = height
@@ -1349,6 +1364,7 @@ func (m *Manager) handleTx(peer *Peer, tx *types.Transaction) {
 	if _, err := m.mempool.AddTx(tx); err != nil {
 		return
 	}
+	peer.StampLastTx()
 
 	m.BroadcastTx(txHash)
 }

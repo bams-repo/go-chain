@@ -136,8 +136,20 @@ func TestPeerInfo(t *testing.T) {
 	if !info.Inbound {
 		t.Fatal("should be inbound")
 	}
-	if info.ConnectedAt == 0 {
-		t.Fatal("connected_at should be set")
+	if info.ConnTime == 0 {
+		t.Fatal("conntime should be set")
+	}
+	if info.Network != "ipv4" && info.Network != "ipv6" && info.Network != "unknown" {
+		t.Fatalf("unexpected network: %s", info.Network)
+	}
+	if info.ConnectionType != "inbound" {
+		t.Fatalf("expected connection_type inbound, got %s", info.ConnectionType)
+	}
+	if info.SyncedHeaders != -1 {
+		t.Fatalf("expected synced_headers -1, got %d", info.SyncedHeaders)
+	}
+	if info.SyncedBlocks != -1 {
+		t.Fatalf("expected synced_blocks -1, got %d", info.SyncedBlocks)
 	}
 }
 
