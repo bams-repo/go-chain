@@ -47,8 +47,10 @@ type ChainParams struct {
 	MaxReorgDepth uint32 // Maximum number of blocks that can be disconnected in a single reorg. 0 = unlimited.
 
 	// Mempool policy (non-consensus, but parameterized per network)
-	MaxMempoolSize   uint32 // Maximum number of transactions in mempool.
-	MinRelayTxFee    uint64 // Minimum fee for mempool admission (smallest units).
+	MaxMempoolSize      uint32        // Maximum number of transactions in mempool.
+	MinRelayTxFee       uint64        // Minimum absolute fee for mempool admission (smallest units).
+	MinRelayTxFeeRate   uint64        // Minimum fee rate (sat/byte) for mempool admission.
+	MempoolExpiry       time.Duration // Maximum age before a mempool transaction is expired. Bitcoin Core default: 336h (2 weeks).
 
 	// Seed nodes
 	SeedNodes []string // DNS seeds or static IP:port addresses for peer discovery.

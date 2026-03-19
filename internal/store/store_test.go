@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
@@ -48,7 +49,7 @@ func TestFileStoreBlockRoundtrip(t *testing.T) {
 		},
 	}
 
-	hash := types.Hash{0x01, 0x02, 0x03}
+	hash := crypto.HashBlockHeader(&block.Header)
 
 	fileNum, offset, size, err := s.WriteBlock(hash, &block)
 	if err != nil {

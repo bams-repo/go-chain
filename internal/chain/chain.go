@@ -56,6 +56,14 @@ type localClock struct{}
 
 func (localClock) Now() int64 { return time.Now().Unix() }
 
+type reorgRecord struct {
+	height    uint32
+	depth     uint32
+	timestamp time.Time
+}
+
+const ibdFlushInterval = 500
+
 type Chain struct {
 	mu sync.RWMutex
 
@@ -74,6 +82,11 @@ type Chain struct {
 	orphans map[types.Hash]*orphanBlock
 
 	utxoSet *utxo.Set
+
+	reorgHistory []reorgRecord
+
+	ibdMode            bool
+	ibdBlocksSinceSync uint32
 }
 
 func New(p *params.ChainParams, engine consensus.Engine, s store.BlockStore, ts TimeSource) *Chain {
@@ -93,7 +106,47 @@ func New(p *params.ChainParams, engine consensus.Engine, s store.BlockStore, ts 
 	}
 }
 
+// SetIBDMode enables or disables IBD (Initial Block Download) mode.
+// When enabled, ProcessBlock uses deferred-sync disk writes for main-chain
+// extensions, flushing every ibdFlushInterval blocks. When disabled, a final
+// sync flush is performed to ensure all deferred writes are durable.
+func (c *Chain) SetIBDMode(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.ibdMode && !enabled {
+		c.ibdSyncFlush()
+		c.ibdBlocksSinceSync = 0
+	}
+	c.ibdMode = enabled
+}
+
+// ibdSyncFlush performs a full synchronous flush of all deferred IBD writes.
+// Must be called with c.mu held.
+func (c *Chain) ibdSyncFlush() {
+	if err := c.store.SyncBlockFiles(); err != nil {
+		logging.L.Error("IBD sync flush: block files", "component", "chain", "error", err)
+	}
+	if err := c.store.FlushBlockIndex(); err != nil {
+		logging.L.Error("IBD sync flush: block index", "component", "chain", "error", err)
+	}
+	wb := c.store.NewUtxoWriteBatch()
+	wb.PutBestBlock(c.tipHash)
+	if err := c.store.FlushUtxoBatch(wb); err != nil {
+		logging.L.Error("IBD sync flush: chainstate", "component", "chain", "error", err)
+	}
+	if err := c.store.PutChainTip(c.tipHash, c.tipHeight); err != nil {
+		logging.L.Error("IBD sync flush: chain tip", "component", "chain", "error", err)
+	}
+	logging.L.Info("IBD checkpoint flushed", "component", "chain", "height", c.tipHeight)
+}
+
+// UtxoSet returns the chain's UTXO set. The returned pointer remains valid
+// after the chain lock is released because utxo.Set has its own internal
+// sync.RWMutex protecting all concurrent access.
 func (c *Chain) UtxoSet() *utxo.Set {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.utxoSet
 }
 
@@ -131,7 +184,7 @@ func (c *Chain) Init() error {
 		if err != nil {
 			return fmt.Errorf("walk chain at height %d: %w", h, err)
 		}
-		c.tipWork.Add(c.tipWork, store.CalcWork(rec.Header.Bits))
+		c.tipWork.Add(c.tipWork, c.engine.CalcBlockWeight(&rec.Header))
 		if h == 0 {
 			break
 		}
@@ -166,7 +219,7 @@ func (c *Chain) Init() error {
 				if err != nil {
 					return fmt.Errorf("walk chain from chainstate tip at height %d: %w", h, err)
 				}
-				c.tipWork.Add(c.tipWork, store.CalcWork(rec.Header.Bits))
+				c.tipWork.Add(c.tipWork, c.engine.CalcBlockWeight(&rec.Header))
 				if h == 0 {
 					break
 				}
@@ -271,7 +324,7 @@ func (c *Chain) initGenesis() error {
 	}
 
 	// Create block index entry.
-	genesisWork := store.CalcWork(c.params.GenesisBlock.Header.Bits)
+	genesisWork := c.engine.CalcBlockWeight(&c.params.GenesisBlock.Header)
 	rec := &store.DiskBlockIndex{
 		Header:    c.params.GenesisBlock.Header,
 		Height:    0,
@@ -474,19 +527,21 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 	parentHeight, parentKnown := c.heightByHash[block.Header.PrevBlock]
 	if !parentKnown {
 		// Lightweight PoW sanity check before accepting into the orphan pool.
-		// We can't verify the difficulty is correct (unknown parent), but we
-		// can verify the header hash meets its own declared target. This
-		// prevents zero-cost orphan flooding since the attacker must perform
-		// real PoW for every orphan they submit.
-		orphanHash := crypto.HashBlockHeader(&block.Header)
-		if err := crypto.ValidateProofOfWork(orphanHash, block.Header.Bits); err != nil {
+		// Validate against the block's declared target AND enforce a minimum
+		// difficulty floor (MinBits) to prevent trivial orphan flooding.
+		if crypto.CompactToBig(block.Header.Bits).Cmp(crypto.CompactToBig(c.params.MinBits)) > 0 {
+			metrics.Global.BlocksRejected.Add(1)
+			return 0, fmt.Errorf("orphan declared difficulty too low: bits 0x%08x easier than minimum 0x%08x", block.Header.Bits, c.params.MinBits)
+		}
+		orphanPowHash := c.engine.Hasher().PoWHash(block.Header.SerializeToBytes())
+		if err := crypto.ValidateProofOfWork(orphanPowHash, block.Header.Bits); err != nil {
 			metrics.Global.BlocksRejected.Add(1)
 			return 0, fmt.Errorf("orphan PoW check failed: %w", err)
 		}
 
 		c.evictExpiredOrphans()
 		if len(c.orphans) >= MaxOrphanBlocks {
-			c.evictRandomOrphan()
+			c.evictOldestOrphan()
 		}
 		c.orphans[blockHash] = &orphanBlock{block: block, addedAt: time.Now()}
 		metrics.Global.OrphansReceived.Add(1)
@@ -512,47 +567,50 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 	getAncestor := c.buildAncestorLookup(block.Header.PrevBlock, parentHeight)
 
 	nowUnix := uint32(c.timeSource.Now())
-	if err := c.engine.ValidateHeader(&block.Header, parentHeader, newHeight, getAncestor, c.params); err != nil {
+	if err := consensus.FullValidateHeader(c.engine, &block.Header, parentHeader, newHeight, getAncestor, nowUnix, parentHeight, c.params); err != nil {
 		return 0, fmt.Errorf("validate header at height %d: %w", newHeight, err)
-	}
-
-	if err := consensus.ValidateHeaderTimestamp(&block.Header, parentHeader, nowUnix, getAncestor, parentHeight, c.params); err != nil {
-		return 0, fmt.Errorf("validate timestamp: %w", err)
 	}
 
 	if err := c.engine.ValidateBlock(block, newHeight, c.params); err != nil {
 		return 0, fmt.Errorf("validate block at height %d: %w", newHeight, err)
 	}
 
-	blockWork := crypto.CalcWork(block.Header.Bits)
+	blockWork := c.engine.CalcBlockWeight(&block.Header)
 	parentWork, err := c.workForParentChain(block.Header.PrevBlock)
 	if err != nil {
 		return 0, fmt.Errorf("compute parent chain work: %w", err)
 	}
 	newWork := new(big.Int).Add(parentWork, blockWork)
 
-	// Write block to flat files.
-	fileNum, offset, size, err := c.store.WriteBlock(blockHash, block)
-	if err != nil {
-		return 0, fmt.Errorf("store block: %w", err)
-	}
-
-	// Create block index entry.
-	rec := &store.DiskBlockIndex{
-		Header:    block.Header,
-		Height:    newHeight,
-		Status:    store.StatusHaveData | store.StatusValidHeader,
-		TxCount:   uint32(len(block.Transactions)),
-		FileNum:   fileNum,
-		DataPos:   offset,
-		DataSize:  size,
-		ChainWork: newWork,
-	}
-
 	if block.Header.PrevBlock == c.tipHash {
+		// Validate transaction inputs BEFORE writing to disk to prevent
+		// disk pollution from blocks with valid PoW but invalid transactions.
 		if _, err := consensus.ValidateTransactionInputs(block, c.utxoSet, newHeight, c.params); err != nil {
 			metrics.Global.BlocksRejected.Add(1)
 			return 0, fmt.Errorf("validate tx inputs at height %d: %w", newHeight, err)
+		}
+
+		useNoSync := c.ibdMode
+
+		// Write block to disk only after full validation passes.
+		var fileNum, offset, size uint32
+		if useNoSync {
+			fileNum, offset, size, err = c.store.WriteBlockNoSync(blockHash, block)
+		} else {
+			fileNum, offset, size, err = c.store.WriteBlock(blockHash, block)
+		}
+		if err != nil {
+			return 0, fmt.Errorf("store block: %w", err)
+		}
+		rec := &store.DiskBlockIndex{
+			Header:    block.Header,
+			Height:    newHeight,
+			Status:    store.StatusHaveData | store.StatusValidHeader,
+			TxCount:   uint32(len(block.Transactions)),
+			FileNum:   fileNum,
+			DataPos:   offset,
+			DataSize:  size,
+			ChainWork: newWork,
 		}
 
 		undoData, err := c.utxoSet.ConnectBlock(block, newHeight)
@@ -562,7 +620,12 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 		}
 
 		undoBytes := utxo.SerializeUndoData(undoData)
-		undoOffset, undoSize, err := c.store.WriteUndo(fileNum, undoBytes)
+		var undoOffset, undoSize uint32
+		if useNoSync {
+			undoOffset, undoSize, err = c.store.WriteUndoNoSync(fileNum, undoBytes)
+		} else {
+			undoOffset, undoSize, err = c.store.WriteUndo(fileNum, undoBytes)
+		}
 		if err != nil {
 			c.utxoSet.DisconnectBlock(block, undoData)
 			return 0, fmt.Errorf("store undo data: %w", err)
@@ -572,7 +635,12 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 		rec.UndoSize = undoSize
 		rec.Status |= store.StatusHaveUndo | store.StatusValidTx
 
-		if err := c.store.PutBlockIndex(blockHash, rec); err != nil {
+		if useNoSync {
+			err = c.store.PutBlockIndexBatch(blockHash, rec)
+		} else {
+			err = c.store.PutBlockIndex(blockHash, rec)
+		}
+		if err != nil {
 			c.utxoSet.DisconnectBlock(block, undoData)
 			return 0, fmt.Errorf("store block index: %w", err)
 		}
@@ -581,22 +649,56 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 		// back in-memory UTXO state so the node never operates with an advanced
 		// UTXO set that isn't persisted. On crash between UTXO flush and chain
 		// tip write, Init() detects the mismatch and advances the tip.
-		if err := c.persistUtxoChanges(block, undoData, blockHash); err != nil {
+		if useNoSync {
+			err = c.persistUtxoChangesNoSync(block, undoData, blockHash)
+		} else {
+			err = c.persistUtxoChanges(block, undoData, blockHash)
+		}
+		if err != nil {
 			c.utxoSet.DisconnectBlock(block, undoData)
 			return 0, fmt.Errorf("persist UTXO changes: %w", err)
 		}
 
-		if err := c.extendChain(blockHash, newHeight, newWork); err != nil {
+		if useNoSync {
+			err = c.extendChainNoSync(blockHash, newHeight, newWork)
+		} else {
+			err = c.extendChain(blockHash, newHeight, newWork)
+		}
+		if err != nil {
 			return 0, err
 		}
 		metrics.Global.BlocksAccepted.Add(1)
+
+		if useNoSync {
+			c.ibdBlocksSinceSync++
+			if c.ibdBlocksSinceSync >= ibdFlushInterval {
+				c.ibdSyncFlush()
+				c.ibdBlocksSinceSync = 0
+			}
+		}
+
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] chain.ProcessBlock → extend main chain",
 				"hash", blockHash.ReverseString()[:16],
-				"height", newHeight)
+				"height", newHeight,
+				"ibd_nosync", useNoSync)
 		}
 
-	} else if newWork.Cmp(c.tipWork) > 0 || (newWork.Cmp(c.tipWork) == 0 && bytes.Compare(blockHash[:], c.tipHash[:]) < 0) {
+	} else if newWork.Cmp(c.tipWork) > 0 {
+		fileNum, offset, size, err := c.store.WriteBlock(blockHash, block)
+		if err != nil {
+			return 0, fmt.Errorf("store block: %w", err)
+		}
+		rec := &store.DiskBlockIndex{
+			Header:    block.Header,
+			Height:    newHeight,
+			Status:    store.StatusHaveData | store.StatusValidHeader,
+			TxCount:   uint32(len(block.Transactions)),
+			FileNum:   fileNum,
+			DataPos:   offset,
+			DataSize:  size,
+			ChainWork: newWork,
+		}
 		if err := c.store.PutBlockIndex(blockHash, rec); err != nil {
 			return 0, fmt.Errorf("store block index: %w", err)
 		}
@@ -617,10 +719,28 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 				c.processOrphans(blockHash)
 				return newHeight, fmt.Errorf("%w: %s", ErrSideChain, err)
 			}
+			// Reorg failed validation — remove the block index entry so
+			// HasBlock won't report this block as known, allowing peers
+			// to re-deliver it if conditions change (TASK-03).
+			_ = c.store.DeleteBlockIndex(blockHash)
 			return 0, fmt.Errorf("reorg to %s: %w", blockHash, err)
 		}
 		metrics.Global.BlocksAccepted.Add(1)
 	} else {
+		fileNum, offset, size, err := c.store.WriteBlock(blockHash, block)
+		if err != nil {
+			return 0, fmt.Errorf("store block: %w", err)
+		}
+		rec := &store.DiskBlockIndex{
+			Header:    block.Header,
+			Height:    newHeight,
+			Status:    store.StatusHaveData | store.StatusValidHeader,
+			TxCount:   uint32(len(block.Transactions)),
+			FileNum:   fileNum,
+			DataPos:   offset,
+			DataSize:  size,
+			ChainWork: newWork,
+		}
 		if err := c.store.PutBlockIndex(blockHash, rec); err != nil {
 			return 0, fmt.Errorf("store block index: %w", err)
 		}
@@ -637,8 +757,25 @@ func (c *Chain) ProcessBlock(block *types.Block) (uint32, error) {
 	}
 
 	c.processOrphans(blockHash)
+	c.pruneSideChainIndex()
 
 	return newHeight, nil
+}
+
+func (c *Chain) pruneSideChainIndex() {
+	cutoff := uint32(0)
+	if c.tipHeight > 1000 {
+		cutoff = c.tipHeight - 1000
+	}
+	for h, height := range c.heightByHash {
+		if height >= cutoff {
+			continue
+		}
+		if mainHash, ok := c.hashByHeight[height]; ok && mainHash == h {
+			continue
+		}
+		delete(c.heightByHash, h)
+	}
 }
 
 // persistUtxoChanges writes UTXO changes for a connected block to the chainstate DB.
@@ -694,6 +831,46 @@ func (c *Chain) persistUtxoDisconnect(block *types.Block, undoData *utxo.BlockUn
 	return c.store.FlushUtxoBatch(wb)
 }
 
+// persistUtxoChangesNoSync is the IBD variant that skips fsync.
+func (c *Chain) persistUtxoChangesNoSync(block *types.Block, undoData *utxo.BlockUndoData, blockHash types.Hash) error {
+	wb := c.store.NewUtxoWriteBatch()
+
+	for _, tx := range block.Transactions {
+		txHash, err := crypto.HashTransaction(&tx)
+		if err != nil {
+			return fmt.Errorf("hash tx during UTXO persist: %w", err)
+		}
+		for i := range tx.Outputs {
+			entry := c.utxoSet.Get(txHash, uint32(i))
+			if entry != nil {
+				wb.PutUtxo(txHash, uint32(i), entry.Serialize())
+			}
+		}
+	}
+
+	if undoData != nil {
+		for _, spent := range undoData.SpentOutputs {
+			wb.DeleteUtxo(spent.OutPoint.Hash, spent.OutPoint.Index)
+		}
+	}
+
+	wb.PutBestBlock(blockHash)
+	return c.store.FlushUtxoBatchNoSync(wb)
+}
+
+// extendChainNoSync updates the chain tip without fsync. Used during IBD.
+func (c *Chain) extendChainNoSync(hash types.Hash, height uint32, work *big.Int) error {
+	if err := c.store.PutChainTipNoSync(hash, height); err != nil {
+		return err
+	}
+	c.heightByHash[hash] = height
+	c.hashByHeight[height] = hash
+	c.tipHash = hash
+	c.tipHeight = height
+	c.tipWork = work
+	return nil
+}
+
 func (c *Chain) extendChain(hash types.Hash, height uint32, work *big.Int) error {
 	if err := c.store.PutChainTip(hash, height); err != nil {
 		return err
@@ -706,35 +883,8 @@ func (c *Chain) extendChain(hash types.Hash, height uint32, work *big.Int) error
 	return nil
 }
 
-func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.Int) (err error) {
-	// Snapshot in-memory state so reorg failures cannot poison the node.
-	heightByHashSnapshot := make(map[types.Hash]uint32, len(c.heightByHash))
-	for h, v := range c.heightByHash {
-		heightByHashSnapshot[h] = v
-	}
-	hashByHeightSnapshot := make(map[uint32]types.Hash, len(c.hashByHeight))
-	for h, v := range c.hashByHeight {
-		hashByHeightSnapshot[h] = v
-	}
-	tipHashSnapshot := c.tipHash
-	tipHeightSnapshot := c.tipHeight
-	tipWorkSnapshot := new(big.Int).Set(c.tipWork)
-	utxoSnapshot := cloneUtxoSet(c.utxoSet)
-
-	restoreSnapshot := func() {
-		c.heightByHash = heightByHashSnapshot
-		c.hashByHeight = hashByHeightSnapshot
-		c.tipHash = tipHashSnapshot
-		c.tipHeight = tipHeightSnapshot
-		c.tipWork = tipWorkSnapshot
-		c.utxoSet = utxoSnapshot
-	}
-	defer func() {
-		if err != nil {
-			restoreSnapshot()
-		}
-	}()
-
+func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.Int) error {
+	// --- Phase 0: Build the new chain path back to the fork point. ---
 	newChain := []types.Hash{newTipHash}
 	current := newTipHash
 
@@ -762,16 +912,41 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 	reorgDepth := oldTipHeight - forkParentHeight
 
 	if c.params.MaxReorgDepth > 0 && reorgDepth > c.params.MaxReorgDepth {
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] reorg rejected: exceeds MaxReorgDepth",
+				"depth", reorgDepth, "limit", c.params.MaxReorgDepth, "fork_height", forkParentHeight)
+		}
 		return fmt.Errorf("%w: depth %d exceeds limit %d (fork at height %d)",
 			ErrReorgTooDeep, reorgDepth, c.params.MaxReorgDepth, forkParentHeight)
 	}
 
+	if c.params.MaxReorgDepth > 0 {
+		cutoff := time.Now().Add(-24 * time.Hour)
+		pruned := c.reorgHistory[:0]
+		var cumulative uint32
+		for _, r := range c.reorgHistory {
+			if r.timestamp.After(cutoff) {
+				pruned = append(pruned, r)
+				cumulative += r.depth
+			}
+		}
+		c.reorgHistory = pruned
+		cumulative += reorgDepth
+		cumulativeLimit := c.params.MaxReorgDepth * 3
+		if cumulative > cumulativeLimit {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] reorg rejected: cumulative depth exceeded",
+					"cumulative", cumulative, "limit", cumulativeLimit, "window", "24h")
+			}
+			return fmt.Errorf("%w: cumulative depth %d exceeds limit %d over 24h sliding window",
+				ErrReorgTooDeep, cumulative, cumulativeLimit)
+		}
+	}
+
 	logging.L.Warn("chain reorg", "component", "chain", "fork_height", forkParentHeight, "old_tip", oldTipHeight, "new_tip", newTipHeight, "depth", reorgDepth)
-	metrics.Global.Reorgs.Add(1)
-	metrics.Global.ReorgDepthTotal.Add(uint64(reorgDepth))
 
 	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg detail",
+		logging.L.Debug("[dbg] reorg phase-0: chain path built",
 			"old_tip_hash", c.tipHash.ReverseString()[:16],
 			"new_tip_hash", newTipHash.ReverseString()[:16],
 			"fork_height", forkParentHeight,
@@ -779,22 +954,31 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 			"connect_count", len(newChain))
 	}
 
-	// Disconnect old main chain blocks (UTXO rollback).
-	// Each disconnect is flushed to chainstate incrementally so a crash
-	// mid-reorg leaves the chainstate consistent at a valid intermediate tip.
+	// --- Phase 1: Dry-run validation against a cloned UTXO set. ---
+	// Clone the live UTXO set and simulate the full disconnect/connect cycle.
+	// If any block on the new chain fails validation, the clone is discarded
+	// and the live chain + chainstate are completely untouched.
+	trialSet := cloneUtxoSet(c.utxoSet)
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg phase-1: UTXO set cloned for trial",
+			"clone_utxo_count", trialSet.Count(),
+			"live_utxo_count", c.utxoSet.Count())
+	}
+
+	// Disconnect old main chain blocks from the clone.
 	for h := c.tipHeight; h > forkParentHeight; h-- {
 		hash, ok := c.hashByHeight[h]
 		if !ok {
-			continue
+			return fmt.Errorf("invariant violation: missing hash at main-chain height %d during trial disconnect", h)
 		}
 		block, err := c.store.GetBlock(hash)
 		if err != nil {
-			return fmt.Errorf("load block at height %d for disconnect: %w", h, err)
+			return fmt.Errorf("load block at height %d for trial disconnect: %w", h, err)
 		}
-
 		rec, err := c.store.GetBlockIndex(hash)
 		if err != nil {
-			return fmt.Errorf("load block index at height %d: %w", h, err)
+			return fmt.Errorf("load block index at height %d for trial: %w", h, err)
 		}
 		if rec.Status&store.StatusHaveUndo == 0 {
 			return fmt.Errorf("no undo data for block at height %d", h)
@@ -807,57 +991,182 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 		if err != nil {
 			return fmt.Errorf("deserialize undo data at height %d: %w", h, err)
 		}
+		if err := trialSet.DisconnectBlock(block, undoData); err != nil {
+			return fmt.Errorf("trial disconnect block at height %d: %w", h, err)
+		}
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] reorg phase-1: trial disconnect ok",
+				"height", h, "hash", hash.ReverseString()[:16],
+				"trial_utxo_count", trialSet.Count())
+		}
+	}
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg phase-1: trial disconnects complete",
+			"trial_utxo_count", trialSet.Count(),
+			"blocks_disconnected", reorgDepth)
+	}
+
+	// Validate and connect new chain blocks against the clone.
+	type trialResult struct {
+		hash     types.Hash
+		height   uint32
+		undoData *utxo.BlockUndoData
+		block    *types.Block
+	}
+	trialConnected := make([]trialResult, 0, len(newChain))
+
+	for i := len(newChain) - 1; i >= 0; i-- {
+		h := forkParentHeight + uint32(len(newChain)-i)
+		blockHash := newChain[i]
+		block, err := c.store.GetBlock(blockHash)
+		if err != nil {
+			return fmt.Errorf("load new chain block %s for trial: %w", blockHash, err)
+		}
+		if _, err := consensus.ValidateTransactionInputs(block, trialSet, h, c.params); err != nil {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] reorg phase-1: trial tx validation FAILED — aborting reorg, no state changed",
+					"height", h, "hash", blockHash.ReverseString()[:16], "error", err)
+			}
+			return fmt.Errorf("trial validate tx inputs at height %d: %w", h, err)
+		}
+		undoData, err := trialSet.ConnectBlock(block, h)
+		if err != nil {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] reorg phase-1: trial UTXO connect FAILED — aborting reorg, no state changed",
+					"height", h, "hash", blockHash.ReverseString()[:16], "error", err)
+			}
+			return fmt.Errorf("trial connect block %s UTXOs: %w", blockHash, err)
+		}
+		trialConnected = append(trialConnected, trialResult{hash: blockHash, height: h, undoData: undoData, block: block})
+
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] reorg phase-1: trial connect ok",
+				"height", h, "hash", blockHash.ReverseString()[:16],
+				"trial_utxo_count", trialSet.Count())
+		}
+	}
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg phase-1: trial PASSED — all new chain blocks valid",
+			"blocks_validated", len(trialConnected),
+			"trial_utxo_count", trialSet.Count())
+	}
+
+	// --- Phase 2: Trial passed — commit the reorg to live state and disk. ---
+	// From this point forward we are committed. The new chain is fully
+	// validated; failures here are I/O errors, not consensus failures.
+	metrics.Global.Reorgs.Add(1)
+	metrics.Global.ReorgDepthTotal.Add(uint64(reorgDepth))
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg phase-2: committing — disconnecting old chain from live state",
+			"live_utxo_count_before", c.utxoSet.Count())
+	}
+
+	// Disconnect old main chain blocks from the live UTXO set and persist.
+	for h := c.tipHeight; h > forkParentHeight; h-- {
+		hash, ok := c.hashByHeight[h]
+		if !ok {
+			return fmt.Errorf("invariant violation: missing hash at main-chain height %d during live disconnect", h)
+		}
+		block, err := c.store.GetBlock(hash)
+		if err != nil {
+			return fmt.Errorf("load block at height %d for disconnect: %w", h, err)
+		}
+		rec, err := c.store.GetBlockIndex(hash)
+		if err != nil {
+			return fmt.Errorf("load block index at height %d for live disconnect: %w", h, err)
+		}
+		undoBytes, err := c.store.ReadUndo(rec.UndoFile, rec.UndoPos, rec.UndoSize)
+		if err != nil {
+			return fmt.Errorf("read undo data at height %d for live disconnect: %w", h, err)
+		}
+		undoData, err := utxo.DeserializeUndoData(undoBytes)
+		if err != nil {
+			return fmt.Errorf("deserialize undo data at height %d for live disconnect: %w", h, err)
+		}
+
 		if err := c.utxoSet.DisconnectBlock(block, undoData); err != nil {
 			return fmt.Errorf("disconnect block at height %d: %w", h, err)
 		}
-
 		parentHash := block.Header.PrevBlock
 		if err := c.persistUtxoDisconnect(block, undoData, parentHash); err != nil {
 			return fmt.Errorf("persist disconnect at height %d: %w", h, err)
 		}
-	}
 
-	// Remove old main chain entries above fork.
-	for h := forkParentHeight + 1; h <= c.tipHeight; h++ {
-		if hash, ok := c.hashByHeight[h]; ok {
-			delete(c.heightByHash, hash)
-			delete(c.hashByHeight, h)
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] reorg phase-2: live disconnect + persist ok",
+				"height", h, "hash", hash.ReverseString()[:16],
+				"live_utxo_count", c.utxoSet.Count())
 		}
 	}
 
+	// Snapshot old main chain hashes for deferred cleanup.
+	oldChainHashes := make(map[uint32]types.Hash)
+	for h := forkParentHeight + 1; h <= c.tipHeight; h++ {
+		if hash, ok := c.hashByHeight[h]; ok {
+			oldChainHashes[h] = hash
+		}
+	}
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg phase-2: old chain entries snapshotted for deferred cleanup, connecting new chain",
+			"live_utxo_count", c.utxoSet.Count())
+	}
+
+	// Connect new chain blocks to the live UTXO set and persist.
+	// Use undo data from the live ConnectBlock call, not the trial clone's.
 	type reorgBlockEntry struct {
 		hash     types.Hash
 		height   uint32
 		undoData *utxo.BlockUndoData
 		block    *types.Block
 	}
-	connected := make([]reorgBlockEntry, 0, len(newChain))
+	connected := make([]reorgBlockEntry, 0, len(trialConnected))
 
-	// Connect new chain blocks and validate transactions.
-	for i := len(newChain) - 1; i >= 0; i-- {
-		h := forkParentHeight + uint32(len(newChain)-i)
-		blockHash := newChain[i]
-		block, err := c.store.GetBlock(blockHash)
+	for _, tr := range trialConnected {
+		liveUndo, err := c.utxoSet.ConnectBlock(tr.block, tr.height)
 		if err != nil {
-			return fmt.Errorf("load new chain block %s: %w", blockHash, err)
+			return fmt.Errorf("connect block %s UTXOs during reorg: %w", tr.hash, err)
 		}
-
-		if _, err := consensus.ValidateTransactionInputs(block, c.utxoSet, h, c.params); err != nil {
-			return fmt.Errorf("validate tx inputs during reorg at height %d: %w", h, err)
+		if err := c.persistUtxoChanges(tr.block, liveUndo, tr.hash); err != nil {
+			return fmt.Errorf("persist UTXO connect during reorg at height %d: %w", tr.height, err)
 		}
-
-		undoData, err := c.utxoSet.ConnectBlock(block, h)
+		rec, err := c.store.GetBlockIndex(tr.hash)
 		if err != nil {
-			return fmt.Errorf("connect block %s UTXOs during reorg: %w", blockHash, err)
+			return fmt.Errorf("get block index for %s: %w", tr.hash, err)
 		}
-
-		if err := c.persistUtxoChanges(block, undoData, blockHash); err != nil {
-			return fmt.Errorf("persist UTXO connect during reorg at height %d: %w", h, err)
+		undoBytes := utxo.SerializeUndoData(liveUndo)
+		undoOffset, undoSize, err := c.store.WriteUndo(rec.FileNum, undoBytes)
+		if err != nil {
+			return fmt.Errorf("write undo data during reorg: %w", err)
 		}
+		rec.UndoFile = rec.FileNum
+		rec.UndoPos = undoOffset
+		rec.UndoSize = undoSize
+		rec.Status |= store.StatusHaveUndo | store.StatusValidTx
+		if err := c.store.PutBlockIndex(tr.hash, rec); err != nil {
+			return fmt.Errorf("update block index during reorg: %w", err)
+		}
+		connected = append(connected, reorgBlockEntry{hash: tr.hash, height: tr.height, undoData: liveUndo, block: tr.block})
+		c.heightByHash[tr.hash] = tr.height
+		c.hashByHeight[tr.height] = tr.hash
 
-		connected = append(connected, reorgBlockEntry{hash: blockHash, height: h, undoData: undoData, block: block})
-		c.heightByHash[blockHash] = h
-		c.hashByHeight[h] = blockHash
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] reorg phase-2: live connect + persist ok",
+				"height", tr.height, "hash", tr.hash.ReverseString()[:16],
+				"live_utxo_count", c.utxoSet.Count())
+		}
+	}
+
+	// Remove old main chain entries above fork — deferred until after all
+	// connects succeed to avoid leaving maps inconsistent on failure.
+	for h, oldHash := range oldChainHashes {
+		delete(c.heightByHash, oldHash)
+		if c.hashByHeight[h] == oldHash {
+			delete(c.hashByHeight, h)
+		}
 	}
 
 	// Write chain tip immediately after all connects are persisted to
@@ -872,28 +1181,28 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 	c.tipHeight = newTipHeight
 	c.tipWork = newWork
 
-	// Persist undo data and block index entries. These are not consensus-
-	// critical for the current tip — they enable future disconnects. A crash
-	// here leaves the chain tip and chainstate consistent; undo data for
-	// these blocks will be regenerated if needed.
-	for _, entry := range connected {
-		rec, err := c.store.GetBlockIndex(entry.hash)
-		if err != nil {
-			return fmt.Errorf("get block index for %s: %w", entry.hash, err)
-		}
-		undoBytes := utxo.SerializeUndoData(entry.undoData)
-		undoOffset, undoSize, err := c.store.WriteUndo(rec.FileNum, undoBytes)
-		if err != nil {
-			return fmt.Errorf("write undo data during reorg: %w", err)
-		}
-		rec.UndoFile = rec.FileNum
-		rec.UndoPos = undoOffset
-		rec.UndoSize = undoSize
-		rec.Status |= store.StatusHaveUndo | store.StatusValidTx
-		if err := c.store.PutBlockIndex(entry.hash, rec); err != nil {
-			return fmt.Errorf("update block index during reorg: %w", err)
-		}
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg phase-2: chain tip updated",
+			"new_tip", newTipHash.ReverseString()[:16],
+			"new_height", newTipHeight,
+			"live_utxo_count", c.utxoSet.Count())
 	}
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] reorg complete",
+			"old_tip_height", oldTipHeight,
+			"new_tip_height", newTipHeight,
+			"fork_height", forkParentHeight,
+			"depth", reorgDepth,
+			"blocks_connected", len(connected),
+			"final_utxo_count", c.utxoSet.Count())
+	}
+
+	c.reorgHistory = append(c.reorgHistory, reorgRecord{
+		height:    newTipHeight,
+		depth:     reorgDepth,
+		timestamp: time.Now(),
+	})
 
 	return nil
 }
@@ -913,23 +1222,57 @@ func cloneUtxoSet(src *utxo.Set) *utxo.Set {
 }
 
 // evictExpiredOrphans removes orphans older than OrphanExpiry.
+// Must be called with c.mu held.
 func (c *Chain) evictExpiredOrphans() {
 	now := time.Now()
 	for hash, ob := range c.orphans {
 		if now.Sub(ob.addedAt) > OrphanExpiry {
+			if logging.DebugMode {
+				logging.L.Debug("evicting expired orphan", "component", "chain",
+					"hash", hash.ReverseString()[:16],
+					"age", now.Sub(ob.addedAt).String())
+			}
 			delete(c.orphans, hash)
 		}
 	}
 }
 
-// evictRandomOrphan removes one random orphan to make room for a new one.
-// Uses map iteration order which is randomized in Go.
-func (c *Chain) evictRandomOrphan() {
-	for hash := range c.orphans {
-		logging.L.Debug("evicting orphan to make room", "component", "chain",
-			"evicted", hash.ReverseString())
-		delete(c.orphans, hash)
-		return
+// EvictExpiredOrphans is the exported, lock-acquiring wrapper for periodic
+// orphan cleanup by the P2P layer. Returns the number of orphans evicted.
+func (c *Chain) EvictExpiredOrphans() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	before := len(c.orphans)
+	c.evictExpiredOrphans()
+	return before - len(c.orphans)
+}
+
+// OrphanCount returns the current number of blocks in the orphan pool.
+func (c *Chain) OrphanCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.orphans)
+}
+
+// evictOldestOrphan removes the oldest orphan (by arrival time) to make room
+// for a new one. This prevents needed blocks from being randomly evicted
+// before their parent arrives.
+func (c *Chain) evictOldestOrphan() {
+	var oldestHash types.Hash
+	var oldestTime time.Time
+	first := true
+	for hash, ob := range c.orphans {
+		if first || ob.addedAt.Before(oldestTime) {
+			oldestHash = hash
+			oldestTime = ob.addedAt
+			first = false
+		}
+	}
+	if !first {
+		logging.L.Debug("evicting oldest orphan to make room", "component", "chain",
+			"evicted", oldestHash.ReverseString(),
+			"age", time.Since(oldestTime).String())
+		delete(c.orphans, oldestHash)
 	}
 }
 
@@ -980,14 +1323,9 @@ func (c *Chain) processOrphans(parentHash types.Hash) {
 
 			getAncestor := c.buildAncestorLookup(orphan.Header.PrevBlock, parentHeight)
 
-			if err := c.engine.ValidateHeader(&orphan.Header, parentHeader, newHeight, getAncestor, c.params); err != nil {
-				logging.L.Debug("orphan failed header validation", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
-				continue
-			}
-
 			nowUnix := uint32(c.timeSource.Now())
-			if err := consensus.ValidateHeaderTimestamp(&orphan.Header, parentHeader, nowUnix, getAncestor, parentHeight, c.params); err != nil {
-				logging.L.Debug("orphan failed timestamp validation", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
+			if err := consensus.FullValidateHeader(c.engine, &orphan.Header, parentHeader, newHeight, getAncestor, nowUnix, parentHeight, c.params); err != nil {
+				logging.L.Debug("orphan failed header validation", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
 				continue
 			}
 
@@ -996,7 +1334,7 @@ func (c *Chain) processOrphans(parentHash types.Hash) {
 				continue
 			}
 
-			blockWork := crypto.CalcWork(orphan.Header.Bits)
+			blockWork := c.engine.CalcBlockWeight(&orphan.Header)
 			parentWork, err := c.workForParentChain(orphan.Header.PrevBlock)
 			if err != nil {
 				logging.L.Debug("orphan parent work lookup failed", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
@@ -1029,15 +1367,18 @@ func (c *Chain) processOrphans(parentHash types.Hash) {
 					logging.L.Warn("orphan UTXO connect failed", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
 					continue
 				}
-				undoBytes := utxo.SerializeUndoData(undoData)
-				undoOffset, undoSize, wErr := c.store.WriteUndo(fileNum, undoBytes)
-				if wErr == nil {
-					rec.UndoFile = fileNum
-					rec.UndoPos = undoOffset
-					rec.UndoSize = undoSize
-					rec.Status |= store.StatusHaveUndo | store.StatusValidTx
-				}
-				if err := c.store.PutBlockIndex(blockHash, rec); err != nil {
+			undoBytes := utxo.SerializeUndoData(undoData)
+			undoOffset, undoSize, wErr := c.store.WriteUndo(fileNum, undoBytes)
+			if wErr != nil {
+				c.utxoSet.DisconnectBlock(orphan, undoData)
+				logging.L.Warn("orphan undo write failed, block rejected", "component", "chain", "hash", blockHash.ReverseString(), "error", wErr)
+				continue
+			}
+			rec.UndoFile = fileNum
+			rec.UndoPos = undoOffset
+			rec.UndoSize = undoSize
+			rec.Status |= store.StatusHaveUndo | store.StatusValidTx
+			if err := c.store.PutBlockIndex(blockHash, rec); err != nil {
 					c.utxoSet.DisconnectBlock(orphan, undoData)
 					logging.L.Warn("orphan block index write failed", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
 					continue
@@ -1052,12 +1393,13 @@ func (c *Chain) processOrphans(parentHash types.Hash) {
 					logging.L.Warn("orphan extend failed", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
 					continue
 				}
-			} else if newWork.Cmp(c.tipWork) > 0 || (newWork.Cmp(c.tipWork) == 0 && bytes.Compare(blockHash[:], c.tipHash[:]) < 0) {
+			} else if newWork.Cmp(c.tipWork) > 0 {
 				_ = c.store.PutBlockIndex(blockHash, rec)
 				c.heightByHash[blockHash] = newHeight
 				if err := c.reorg(blockHash, newHeight, newWork); err != nil {
 					if !errors.Is(err, ErrReorgTooDeep) {
 						delete(c.heightByHash, blockHash)
+						_ = c.store.DeleteBlockIndex(blockHash)
 					}
 					logging.L.Warn("orphan reorg failed", "component", "chain", "hash", blockHash.ReverseString(), "error", err)
 					continue
@@ -1141,6 +1483,8 @@ func (c *Chain) buildAncestorLookup(parentHash types.Hash, parentHeight uint32) 
 }
 
 func (c *Chain) GetBlock(hash types.Hash) (*types.Block, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.store.GetBlock(hash)
 }
 
@@ -1239,4 +1583,24 @@ func (c *Chain) TxOutSetInfo() *TxOutSetInfoResult {
 		TxOuts:     c.utxoSet.Count(),
 		TotalValue: c.utxoSet.TotalValue(),
 	}
+}
+
+// IsTipStale returns true if the tip block's timestamp is significantly older
+// than expected, suggesting the node may be stuck on a stale chain. The
+// threshold is 10x the target block spacing.
+func (c *Chain) IsTipStale() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	tipHeader, err := c.store.GetHeader(c.tipHash)
+	if err != nil {
+		return false
+	}
+	staleFactor := int64(10)
+	threshold := staleFactor * int64(c.params.TargetBlockSpacing.Seconds())
+	if threshold < 60 {
+		threshold = 60
+	}
+	now := c.timeSource.Now()
+	return now-int64(tipHeader.Timestamp) > threshold
 }

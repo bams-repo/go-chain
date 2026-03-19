@@ -14,18 +14,25 @@ type BlockStore interface {
 	// Block data (flat files).
 	HasBlock(hash types.Hash) (bool, error)
 	WriteBlock(hash types.Hash, block *types.Block) (fileNum, offset, size uint32, err error)
+	WriteBlockNoSync(hash types.Hash, block *types.Block) (fileNum, offset, size uint32, err error)
 	ReadBlock(fileNum, offset, size uint32) (*types.Block, error)
 	WriteUndo(fileNum uint32, data []byte) (offset, size uint32, err error)
+	WriteUndoNoSync(fileNum uint32, data []byte) (offset, size uint32, err error)
 	ReadUndo(fileNum, offset, size uint32) ([]byte, error)
+	SyncBlockFiles() error
 
 	// Block index (LevelDB).
 	PutBlockIndex(hash types.Hash, rec *DiskBlockIndex) error
+	PutBlockIndexBatch(hash types.Hash, rec *DiskBlockIndex) error
+	FlushBlockIndex() error
 	GetBlockIndex(hash types.Hash) (*DiskBlockIndex, error)
+	DeleteBlockIndex(hash types.Hash) error
 	ForEachBlockIndex(fn func(hash types.Hash, rec *DiskBlockIndex) error) error
 
 	// Chain tip (stored in block index).
 	GetChainTip() (types.Hash, uint32, error)
 	PutChainTip(hash types.Hash, height uint32) error
+	PutChainTipNoSync(hash types.Hash, height uint32) error
 
 	// Chainstate / UTXO (LevelDB).
 	PutUtxo(txHash types.Hash, index uint32, data []byte) error
@@ -34,6 +41,7 @@ type BlockStore interface {
 	HasUtxo(txHash types.Hash, index uint32) (bool, error)
 	NewUtxoWriteBatch() *ChainstateWriteBatch
 	FlushUtxoBatch(wb *ChainstateWriteBatch) error
+	FlushUtxoBatchNoSync(wb *ChainstateWriteBatch) error
 	GetBestBlock() (types.Hash, error)
 	PutBestBlock(hash types.Hash) error
 	UtxoCount() (int, error)

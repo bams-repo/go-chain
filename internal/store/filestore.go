@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/types"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 )
@@ -56,6 +57,11 @@ func (fs *FileStore) WriteBlock(hash types.Hash, block *types.Block) (fileNum, o
 	return fs.files.WriteBlock(block)
 }
 
+// WriteBlockNoSync writes a block without fsync. Used during IBD.
+func (fs *FileStore) WriteBlockNoSync(hash types.Hash, block *types.Block) (fileNum, offset, size uint32, err error) {
+	return fs.files.WriteBlockNoSync(block)
+}
+
 // ReadBlock reads a block from flat files.
 func (fs *FileStore) ReadBlock(fileNum, offset, size uint32) (*types.Block, error) {
 	return fs.files.ReadBlock(fileNum, offset, size)
@@ -66,9 +72,19 @@ func (fs *FileStore) WriteUndo(fileNum uint32, data []byte) (offset, size uint32
 	return fs.files.WriteUndo(fileNum, data)
 }
 
+// WriteUndoNoSync writes undo data without fsync. Used during IBD.
+func (fs *FileStore) WriteUndoNoSync(fileNum uint32, data []byte) (offset, size uint32, err error) {
+	return fs.files.WriteUndoNoSync(fileNum, data)
+}
+
 // ReadUndo reads undo data from a rev*.dat file.
 func (fs *FileStore) ReadUndo(fileNum, offset, size uint32) ([]byte, error) {
 	return fs.files.ReadUndo(fileNum, offset, size)
+}
+
+// SyncBlockFiles fsyncs the current blk and rev files.
+func (fs *FileStore) SyncBlockFiles() error {
+	return fs.files.SyncAll()
 }
 
 // PutBlockIndex stores a DiskBlockIndex record.
@@ -76,9 +92,24 @@ func (fs *FileStore) PutBlockIndex(hash types.Hash, rec *DiskBlockIndex) error {
 	return fs.index.PutBlockIndex(hash, rec)
 }
 
+// PutBlockIndexBatch stores a DiskBlockIndex record without sync. Used during IBD.
+func (fs *FileStore) PutBlockIndexBatch(hash types.Hash, rec *DiskBlockIndex) error {
+	return fs.index.PutBlockIndexBatch(hash, rec)
+}
+
+// FlushBlockIndex forces a WAL flush on the block index.
+func (fs *FileStore) FlushBlockIndex() error {
+	return fs.index.FlushIndex()
+}
+
 // GetBlockIndex retrieves a DiskBlockIndex record.
 func (fs *FileStore) GetBlockIndex(hash types.Hash) (*DiskBlockIndex, error) {
 	return fs.index.GetBlockIndex(hash)
+}
+
+// DeleteBlockIndex removes a block index entry.
+func (fs *FileStore) DeleteBlockIndex(hash types.Hash) error {
+	return fs.index.DeleteBlockIndex(hash)
 }
 
 // ForEachBlockIndex iterates over all block index entries.
@@ -107,6 +138,14 @@ func (fs *FileStore) PutChainTip(hash types.Hash, height uint32) error {
 	copy(data[:types.HashSize], hash[:])
 	binary.BigEndian.PutUint32(data[types.HashSize:], height)
 	return fs.index.db.Put(keyChainTip, data, &opt.WriteOptions{Sync: true})
+}
+
+// PutChainTipNoSync stores the chain tip without fsync. Used during IBD.
+func (fs *FileStore) PutChainTipNoSync(hash types.Hash, height uint32) error {
+	data := make([]byte, types.HashSize+4)
+	copy(data[:types.HashSize], hash[:])
+	binary.BigEndian.PutUint32(data[types.HashSize:], height)
+	return fs.index.db.Put(keyChainTip, data, &opt.WriteOptions{Sync: false})
 }
 
 // PutUtxo stores a UTXO entry in chainstate.
@@ -139,6 +178,11 @@ func (fs *FileStore) FlushUtxoBatch(wb *ChainstateWriteBatch) error {
 	return fs.chainstate.Flush(wb)
 }
 
+// FlushUtxoBatchNoSync atomically applies UTXO changes without fsync. Used during IBD.
+func (fs *FileStore) FlushUtxoBatchNoSync(wb *ChainstateWriteBatch) error {
+	return fs.chainstate.FlushNoSync(wb)
+}
+
 // GetBestBlock returns the best block hash from chainstate.
 func (fs *FileStore) GetBestBlock() (types.Hash, error) {
 	return fs.chainstate.GetBestBlock()
@@ -160,6 +204,8 @@ func (fs *FileStore) ForEachUtxo(fn func(txHash types.Hash, index uint32, data [
 }
 
 // GetBlock retrieves a full block by hash using the index + flat files.
+// After deserialization, the header hash is recomputed and compared against
+// the expected hash to detect flat-file corruption (similar to Bitcoin Core).
 func (fs *FileStore) GetBlock(hash types.Hash) (*types.Block, error) {
 	rec, err := fs.index.GetBlockIndex(hash)
 	if err != nil {
@@ -168,7 +214,15 @@ func (fs *FileStore) GetBlock(hash types.Hash) (*types.Block, error) {
 	if rec.Status&StatusHaveData == 0 {
 		return nil, fmt.Errorf("block %s has no data on disk", hash)
 	}
-	return fs.files.ReadBlock(rec.FileNum, rec.DataPos, rec.DataSize)
+	block, err := fs.files.ReadBlock(rec.FileNum, rec.DataPos, rec.DataSize)
+	if err != nil {
+		return nil, err
+	}
+	got := crypto.HashBlockHeader(&block.Header)
+	if got != hash {
+		return nil, fmt.Errorf("block data integrity check failed: expected %s, got %s (file %d offset %d)", hash, got, rec.FileNum, rec.DataPos)
+	}
+	return block, nil
 }
 
 // GetHeader retrieves a block header by hash from the index.

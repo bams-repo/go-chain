@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/version"
 )
 
@@ -20,7 +21,7 @@ func main() {
 	flag.Parse()
 
 	if *printVer {
-		fmt.Printf("Fairchain CLI version v%s\n", version.String())
+		fmt.Printf("%s CLI version v%s\n", coinparams.Name, version.String())
 		os.Exit(0)
 	}
 
@@ -43,7 +44,7 @@ func main() {
 	resp, err := http.Get(baseURL + endpoint)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: Could not connect to the server %s\n", baseURL)
-		fmt.Fprintf(os.Stderr, "       Is fairchaind running?\n")
+		fmt.Fprintf(os.Stderr, "       Is %s running?\n", coinparams.DaemonName)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -140,6 +141,33 @@ func resolveEndpoint(command string, params []string) (string, error) {
 		return "/gettxoutsetinfo", nil
 
 	// --- Mining ---
+	case "getblocktemplate":
+		return "/getblocktemplate", nil
+	case "getmininginfo":
+		return "/getmininginfo", nil
+	case "getnetworkhashps":
+		q := "/getnetworkhashps"
+		if len(params) > 0 {
+			q += "?nblocks=" + url.QueryEscape(params[0])
+		}
+		if len(params) > 1 {
+			if strings.Contains(q, "?") {
+				q += "&"
+			} else {
+				q += "?"
+			}
+			q += "height=" + url.QueryEscape(params[1])
+		}
+		return q, nil
+	case "getrawtransaction":
+		if len(params) < 1 {
+			return "", fmt.Errorf("getrawtransaction requires <txid> [verbose]")
+		}
+		q := "/getrawtransaction?txid=" + url.QueryEscape(params[0])
+		if len(params) > 1 && (params[1] == "true" || params[1] == "1") {
+			q += "&verbose=true"
+		}
+		return q, nil
 	case "submitblock":
 		return "", fmt.Errorf("submitblock requires POST — use curl or the RPC directly")
 
@@ -263,14 +291,14 @@ func resolveEndpoint(command string, params []string) (string, error) {
 	case "walletlock":
 		return "/walletlock", nil
 
-	// --- Fairchain-specific ---
+	// --- Chain-specific ---
 	case "getchainstatus":
 		return "/getchainstatus", nil
 	case "metrics":
 		return "/metrics", nil
 
 	default:
-		return "", fmt.Errorf("unknown command: %s\nRun 'fairchain-cli help' for usage", command)
+		return "", fmt.Errorf("unknown command: %s\nRun '%s help' for usage", command, coinparams.CLIName)
 	}
 }
 
@@ -297,9 +325,9 @@ func formatOutput(body []byte) {
 }
 
 func printUsage() {
-	fmt.Println("Fairchain CLI v" + version.String())
+	fmt.Println(coinparams.Name + " CLI v" + version.String())
 	fmt.Println()
-	fmt.Println("Usage: fairchain-cli [options] <command> [params]")
+	fmt.Println("Usage: " + coinparams.CLIName + " [options] <command> [params]")
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  -rpcconnect=<ip>    Connect to RPC at <ip> (default: 127.0.0.1)")
@@ -331,6 +359,15 @@ func printUsage() {
 	fmt.Println("  gettxout <txid> <n>            Get unspent output")
 	fmt.Println("  gettxoutsetinfo                Get UTXO set statistics")
 	fmt.Println()
+	fmt.Println("Mining commands:")
+	fmt.Println("  getblocktemplate               Get block template (BIP 22)")
+	fmt.Println("  getmininginfo                  Get mining-related information")
+	fmt.Println("  getnetworkhashps [nblocks] [h] Estimated network hash rate")
+	fmt.Println("  submitblock                    Submit a block (POST via curl)")
+	fmt.Println()
+	fmt.Println("Raw transaction commands:")
+	fmt.Println("  getrawtransaction <txid> [verbose]  Get raw transaction hex")
+	fmt.Println()
 	fmt.Println("Wallet commands:")
 	fmt.Println("  getnewaddress                  Generate a new receiving address")
 	fmt.Println("  getbalance [minconf]           Get wallet balance (default minconf=1)")
@@ -360,7 +397,7 @@ func printUsage() {
 	fmt.Println("  stop                           Stop the daemon")
 	fmt.Println("  help                           Show this help")
 	fmt.Println()
-	fmt.Println("Fairchain-specific commands:")
+	fmt.Println(coinparams.Name + "-specific commands:")
 	fmt.Println("  getchainstatus                 Get chain status (bits, retarget, peers)")
 	fmt.Println("  metrics                        Get internal metrics")
 }

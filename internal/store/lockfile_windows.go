@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/bams-repo/fairchain/internal/coinparams"
 	"golang.org/x/sys/windows"
 )
 
@@ -23,7 +24,7 @@ func AcquireLock(path string) (*os.File, error) {
 	err = windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ol)
 	if err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("another fairchain instance is using this data directory (lock file: %s)", path)
+		return nil, fmt.Errorf("another %s instance is using this data directory (lock file: %s)", coinparams.NameLower, path)
 	}
 
 	// Write PID for diagnostics.

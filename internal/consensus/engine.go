@@ -1,6 +1,9 @@
 package consensus
 
 import (
+	"math/big"
+
+	"github.com/bams-repo/fairchain/internal/algorithms"
 	"github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/types"
 )
@@ -41,6 +44,16 @@ type Engine interface {
 	// Returns true if a valid nonce was found within maxIterations.
 	// The header's Nonce field is updated in place.
 	SealHeader(header *types.BlockHeader, target types.Hash, maxIterations uint64) (bool, error)
+
+	// CalcBlockWeight returns the consensus weight contributed by a single block.
+	// For PoW, this is the work implied by the header's difficulty bits.
+	// For other engines, this could be ticket count, VRF score, etc.
+	// The chain manager accumulates these to determine the heaviest chain.
+	CalcBlockWeight(header *types.BlockHeader) *big.Int
+
+	// Hasher returns the PoW hash algorithm used by this engine.
+	// The PoW hash is distinct from the block identity hash (DoubleSHA256).
+	Hasher() algorithms.Hasher
 
 	// Name returns the consensus engine name for logging/identification.
 	Name() string

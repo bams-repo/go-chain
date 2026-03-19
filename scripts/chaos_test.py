@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Branding values sourced from internal/coinparams/coinparams.go
 """
 Cross-platform chaos test entrypoint.
 

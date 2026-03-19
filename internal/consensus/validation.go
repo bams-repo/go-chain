@@ -21,6 +21,10 @@ import (
 //   - no duplicate transaction IDs
 //   - coinbase output value <= subsidy
 func ValidateBlockStructure(block *types.Block, height uint32, p *params.ChainParams) error {
+	if block.Header.Version < 1 {
+		return fmt.Errorf("unsupported block version %d", block.Header.Version)
+	}
+
 	if len(block.Transactions) == 0 {
 		return fmt.Errorf("block has no transactions")
 	}
@@ -97,13 +101,23 @@ func ValidateBlockStructure(block *types.Block, height uint32, p *params.ChainPa
 	return nil
 }
 
+// FullValidateHeader performs complete header validation: engine-level checks
+// (PoW, difficulty) plus timestamp rules. Any code path that validates a header
+// should call this to avoid accidentally skipping timestamp checks.
+func FullValidateHeader(e Engine, header *types.BlockHeader, parent *types.BlockHeader, height uint32, getAncestor func(uint32) *types.BlockHeader, nowUnix uint32, tipHeight uint32, p *params.ChainParams) error {
+	if err := e.ValidateHeader(header, parent, height, getAncestor, p); err != nil {
+		return err
+	}
+	return ValidateHeaderTimestamp(header, parent, nowUnix, getAncestor, tipHeight, p)
+}
+
 // ValidateHeaderTimestamp checks the block timestamp against basic rules.
 // For "prev+1": timestamp must be strictly greater than parent.
 // For "median-11": timestamp must be greater than the median of the last 11 blocks.
 // In both cases, timestamp must not be more than MaxTimeFutureDrift ahead of the provided "now".
 func ValidateHeaderTimestamp(header *types.BlockHeader, parent *types.BlockHeader, nowUnix uint32, getAncestor func(height uint32) *types.BlockHeader, tipHeight uint32, p *params.ChainParams) error {
-	maxFuture := nowUnix + uint32(p.MaxTimeFutureDrift/time.Second)
-	if header.Timestamp > maxFuture {
+	maxFuture := int64(nowUnix) + int64(p.MaxTimeFutureDrift/time.Second)
+	if int64(header.Timestamp) > maxFuture {
 		return fmt.Errorf("block timestamp %d too far in future (max %d)", header.Timestamp, maxFuture)
 	}
 
@@ -113,7 +127,7 @@ func ValidateHeaderTimestamp(header *types.BlockHeader, parent *types.BlockHeade
 			return fmt.Errorf("block timestamp %d must be > parent %d", header.Timestamp, parent.Timestamp)
 		}
 	case "median-11":
-		median := calcMedianTimePast(tipHeight, getAncestor)
+		median := CalcMedianTimePast(tipHeight, getAncestor)
 		if header.Timestamp <= median {
 			return fmt.Errorf("block timestamp %d must be > median time past %d", header.Timestamp, median)
 		}
@@ -129,7 +143,7 @@ func ValidateHeaderTimestamp(header *types.BlockHeader, parent *types.BlockHeade
 //
 // The height is encoded as a CScript number: first byte is the number of bytes
 // that follow, then the height in little-endian. For heights 0-16 Bitcoin uses
-// OP_0..OP_16, but fairchain always uses the explicit push encoding for
+// OP_0..OP_16, but this implementation always uses the explicit push encoding for
 // simplicity (matching the miner's buildCoinbase format).
 func validateCoinbaseScriptSig(scriptSig []byte, height uint32) error {
 	if len(scriptSig) < 2 {
@@ -159,11 +173,30 @@ func validateCoinbaseScriptSig(scriptSig []byte, height uint32) error {
 		return fmt.Errorf("encoded height %d does not match block height %d", encodedHeight, height)
 	}
 
+	// Enforce minimal encoding: pushLen must be the minimum needed for the height value.
+	minimalLen := minimalPushLen(height)
+	if pushLen != minimalLen {
+		return fmt.Errorf("non-minimal height encoding: used %d bytes, minimum is %d", pushLen, minimalLen)
+	}
+
 	return nil
 }
 
-// calcMedianTimePast computes the median of the last 11 block timestamps.
-func calcMedianTimePast(tipHeight uint32, getAncestor func(height uint32) *types.BlockHeader) uint32 {
+func minimalPushLen(height uint32) int {
+	switch {
+	case height <= 0xFF:
+		return 1
+	case height <= 0xFFFF:
+		return 2
+	case height <= 0xFFFFFF:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// CalcMedianTimePast computes the median of the last 11 block timestamps.
+func CalcMedianTimePast(tipHeight uint32, getAncestor func(height uint32) *types.BlockHeader) uint32 {
 	const medianCount = 11
 	timestamps := make([]uint32, 0, medianCount)
 

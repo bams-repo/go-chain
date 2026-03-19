@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Branding values sourced from internal/coinparams/coinparams.go
 set -uo pipefail
 
 # ==========================================================================
@@ -208,8 +209,11 @@ BASE_RPC_PORT=31000
 PIDS=()
 
 # Reorg tracking: stores the last-read line offset per node log so we only
-# report new reorgs since the previous status check.
+# report new reorgs since the previous status check, plus all-time totals.
 declare -A REORG_OFFSETS
+declare -A REORG_ALLTIME_COUNT
+declare -A REORG_ALLTIME_MAX
+REORG_GLOBAL_MAX=0
 
 SEED_ADDRS="127.0.0.1:$((BASE_P2P_PORT + 0)),127.0.0.1:$((BASE_P2P_PORT + 1))"
 
@@ -355,7 +359,8 @@ is_alive() {
 # ── Status / Checks ─────────────────────────────────────────
 
 # print_reorg_report scans each node's stdout.log for "chain reorg" lines that
-# appeared since the last call, then prints a per-node summary.
+# appeared since the last call, then prints a per-node summary with both
+# "since last check" and all-time cumulative stats for the current run.
 print_reorg_report() {
     local any_reorgs=0
     local node_summaries=()
@@ -382,7 +387,6 @@ print_reorg_report() {
 
         local count max_depth depths
         count=$(echo "$new_reorgs" | wc -l)
-        # Extract depth values and find the max
         depths=$(echo "$new_reorgs" | sed -n 's/.*depth=\([0-9]*\).*/\1/p')
         max_depth=0
         local depth_list=""
@@ -396,21 +400,33 @@ print_reorg_report() {
             fi
         done <<< "$depths"
 
+        # Update all-time counters for this node.
+        local prev_count=${REORG_ALLTIME_COUNT[$i]:-0}
+        local prev_max=${REORG_ALLTIME_MAX[$i]:-0}
+        REORG_ALLTIME_COUNT[$i]=$((prev_count + count))
+        if [ "$max_depth" -gt "$prev_max" ]; then
+            REORG_ALLTIME_MAX[$i]=$max_depth
+        fi
+        if [ "$max_depth" -gt "$REORG_GLOBAL_MAX" ]; then
+            REORG_GLOBAL_MAX=$max_depth
+        fi
+
         any_reorgs=1
         local role="miner"
         [[ " ${SEED_NODES[*]} " == *" $i "* ]] && role="SEED"
-        node_summaries+=("$(printf "  %-8s %-8s %-10s %s" "[$i]$role" "$count" "$max_depth" "$depth_list")")
+        node_summaries+=("$(printf "  %-8s %-8s %-10s %-12s %-10s %s" "[$i]$role" "$count" "$max_depth" "${REORG_ALLTIME_COUNT[$i]}" "${REORG_ALLTIME_MAX[$i]}" "$depth_list")")
     done
 
     if [ "$any_reorgs" -eq 1 ]; then
-        log "--- Reorgs Since Last Check ---"
-        printf "  %-8s %-8s %-10s %s\n" "Node" "Count" "MaxDepth" "Depths"
-        printf "  %-8s %-8s %-10s %s\n" "--------" "-----" "--------" "------"
+        log "--- Reorgs (since last check / all-time this run) ---"
+        printf "  %-8s %-8s %-10s %-12s %-10s %s\n" "Node" "New" "NewMax" "Total" "AllTimeMax" "NewDepths"
+        printf "  %-8s %-8s %-10s %-12s %-10s %s\n" "--------" "---" "------" "-----" "----------" "---------"
         for summary in "${node_summaries[@]}"; do
             echo "$summary"
         done
+        log "  Global all-time max reorg depth this run: ${REORG_GLOBAL_MAX}"
     else
-        log "--- No reorgs since last check ---"
+        log "--- No new reorgs since last check (all-time max depth this run: ${REORG_GLOBAL_MAX}) ---"
     fi
 }
 
@@ -596,12 +612,18 @@ check_height_index_integrity() {
 
 check_bits_consensus() {
     local label=$1
+    local node_ids=()
+    local heights=()
     local bits_set=()
+
     for i in $(seq 0 $((NUM_NODES - 1))); do
         if is_alive "$i"; then
             local rpc=$((BASE_RPC_PORT + i))
+            local h=$(get_height "$rpc")
             local b=$(get_bits "$rpc")
-            if [ "$b" != "ERR" ]; then
+            if [ "$b" != "ERR" ] && [ "$h" != "ERR" ]; then
+                node_ids+=("$i")
+                heights+=("$h")
                 bits_set+=("$b")
             fi
         fi
@@ -612,14 +634,44 @@ check_bits_consensus() {
         return 0
     fi
 
-    local first="${bits_set[0]}"
-    for b in "${bits_set[@]}"; do
-        if [ "$b" != "$first" ]; then
-            fail "$label: bits DIVERGENCE — not all nodes agree (found $first and $b)"
+    # Find the majority height so we only compare nodes at the same tip.
+    # Mining can advance the tip between sequential RPC calls, causing
+    # spurious divergence when a retarget boundary falls in between.
+    local majority_height=""
+    local majority_count=0
+    for h in "${heights[@]}"; do
+        local cnt=0
+        for h2 in "${heights[@]}"; do
+            [ "$h2" = "$h" ] && ((cnt++))
+        done
+        if [ "$cnt" -gt "$majority_count" ]; then
+            majority_count=$cnt
+            majority_height=$h
+        fi
+    done
+
+    local ref_bits="" compared=0
+    for idx in $(seq 0 $((${#node_ids[@]} - 1))); do
+        if [ "${heights[$idx]}" != "$majority_height" ]; then
+            continue
+        fi
+        if [ -z "$ref_bits" ]; then
+            ref_bits="${bits_set[$idx]}"
+            ((compared++))
+            continue
+        fi
+        ((compared++))
+        if [ "${bits_set[$idx]}" != "$ref_bits" ]; then
+            fail "$label: bits DIVERGENCE at height ${majority_height} — node${node_ids[0]}=$ref_bits vs node${node_ids[$idx]}=${bits_set[$idx]}"
             return 1
         fi
     done
-    pass "$label: all ${#bits_set[@]} nodes agree on bits=$first"
+
+    if [ "$compared" -lt 2 ]; then
+        warn "$label: fewer than 2 nodes at majority height ${majority_height}"
+        return 0
+    fi
+    pass "$label: ${compared} nodes at height ${majority_height} agree on bits=$ref_bits"
     return 0
 }
 
@@ -1376,6 +1428,26 @@ if [ "$FAILURES" -eq 0 ]; then
 else
     echo -e " ${RED}$FAILURES CHECK(S) FAILED${NC}"
 fi
+echo "────────────────────────────────────────────────────────────────────"
+
+# Final all-time reorg summary for this run.
+echo " Reorg Summary (all-time this run):"
+echo "   Global max reorg depth: ${REORG_GLOBAL_MAX}"
+_any_reorgs_final=0
+for i in $(seq 0 $((NUM_NODES - 1))); do
+    _at_count=${REORG_ALLTIME_COUNT[$i]:-0}
+    _at_max=${REORG_ALLTIME_MAX[$i]:-0}
+    if [ "$_at_count" -gt 0 ]; then
+        _any_reorgs_final=1
+        _role="miner"
+        [[ " ${SEED_NODES[*]} " == *" $i "* ]] && _role="SEED"
+        printf "   Node %-8s  reorgs: %-6s  max depth: %s\n" "[$i]$_role" "$_at_count" "$_at_max"
+    fi
+done
+if [ "$_any_reorgs_final" -eq 0 ]; then
+    echo "   No reorgs occurred during this run."
+fi
+
 echo "────────────────────────────────────────────────────────────────────"
 echo " Run #${NEXT_RUN} data preserved in: ${RUN_DIR}"
 echo " Node logs: ${BASEDIR}/node*/stdout.log"

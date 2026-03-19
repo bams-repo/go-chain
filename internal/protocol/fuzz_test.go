@@ -3,13 +3,15 @@ package protocol
 import (
 	"bytes"
 	"testing"
+
+	"github.com/bams-repo/fairchain/internal/version"
 )
 
 func FuzzVersionMsgDecode(f *testing.F) {
 	msg := VersionMsg{
 		Version: 1, Services: 1, Timestamp: 1700000000,
 		AddrRecv: "127.0.0.1:19333", AddrFrom: "127.0.0.1:19334",
-		Nonce: 12345, UserAgent: "/fairchain:0.1.0/", StartHeight: 100,
+		Nonce: 12345, UserAgent: version.UserAgent(), StartHeight: 100,
 	}
 	var buf bytes.Buffer
 	msg.Encode(&buf)

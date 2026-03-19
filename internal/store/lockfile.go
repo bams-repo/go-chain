@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+
+	"github.com/bams-repo/fairchain/internal/coinparams"
 )
 
 // AcquireLock creates and locks a .lock file using flock advisory locking.
@@ -19,7 +21,7 @@ func AcquireLock(path string) (*os.File, error) {
 
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("another fairchain instance is using this data directory (lock file: %s)", path)
+		return nil, fmt.Errorf("another %s instance is using this data directory (lock file: %s)", coinparams.NameLower, path)
 	}
 
 	// Write PID for diagnostics.

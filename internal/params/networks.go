@@ -11,6 +11,12 @@ const (
 	// No single transaction output may exceed this value.
 	MaxMoneyValue = 2_099_999_997_690_000
 
+	// MaxTxSize is the maximum serialized size of a single transaction in bytes.
+	// Bitcoin Core uses MAX_STANDARD_TX_WEIGHT / 4 ≈ 100,000 bytes for standard
+	// transactions. This protects validation from CPU/memory exhaustion on
+	// oversized transactions.
+	MaxTxSize = 100_000
+
 	// 20% premine on top of mined supply for testnet.
 	TestnetPremineAmount = MaxMoneyValue / 5
 )
@@ -21,7 +27,10 @@ var (
 	TestnetBurnScript = []byte("burn:testnet:premine:v1")
 )
 
-// Mainnet is the primary fairchain network.
+// Genesis block coinbase messages below are consensus-critical historical data
+// and must not be changed. New genesis blocks should use coinparams.NameLower.
+
+// Mainnet is the primary network.
 // Economic parameters are aligned with Bitcoin mainnet.
 var Mainnet = &ChainParams{
 	Name:         "mainnet",
@@ -30,10 +39,10 @@ var Mainnet = &ChainParams{
 	DefaultPort:  19333,
 	AddressPrefix: 0x00,
 
-	// Pre-mined genesis block.
+	// Pre-mined genesis block (sha256mem PoW).
 	// Coinbase: "fairchain mainnet genesis"
-	// Timestamp: 1773212462 (2026-03-08T23:41:02Z)
-	// Display hash: 00000db0edab82e820ef5c8c7a12ceb8ec6639e3110457a1cee156361fb87054
+	// Timestamp: 1773212462 (2026-03-11T07:01:02Z)
+	// Display hash: 96922ece0d092d54ba9340e2fd92ed0c725b7218a3395389b94c1263a3e9e204
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
@@ -45,8 +54,8 @@ var Mainnet = &ChainParams{
 				0xc0, 0x41, 0x16, 0xf1, 0xb5, 0x01, 0xdc, 0xb5,
 			},
 			Timestamp: 1773212462,
-			Bits:      0x1e0fffff,
-			Nonce:     433076,
+			Bits:      0x1e7ce359,
+			Nonce:     63815,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -63,10 +72,10 @@ var Mainnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0x54, 0x70, 0xb8, 0x1f, 0x36, 0x56, 0xe1, 0xce,
-		0xa1, 0x57, 0x04, 0x11, 0xe3, 0x39, 0x66, 0xec,
-		0xb8, 0xce, 0x12, 0x7a, 0x8c, 0x5c, 0xef, 0x20,
-		0xe8, 0x82, 0xab, 0xed, 0xb0, 0x0d, 0x00, 0x00,
+		0x04, 0xe2, 0xe9, 0xa3, 0x63, 0x12, 0x4c, 0xb9,
+		0x89, 0x53, 0x39, 0xa3, 0x18, 0x72, 0x5b, 0x72,
+		0x0c, 0xed, 0x92, 0xfd, 0xe2, 0x40, 0x93, 0xba,
+		0x54, 0x2d, 0x09, 0x0d, 0xce, 0x2e, 0x92, 0x96,
 	},
 
 	TargetBlockSpacing:  10 * time.Minute,
@@ -75,8 +84,10 @@ var Mainnet = &ChainParams{
 	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
-	InitialBits:      0x1e0fffff,
-	MinBits:          0x1e0fffff,
+	// Difficulty calibrated for sha256mem (~224 H/s per core).
+	// 0x1e7ce359 ≈ 134K hashes ≈ 10 min on a single core.
+	InitialBits:      0x1e7ce359,
+	MinBits:          0x1f7fffff, // Floor ≈ 8x easier than initial; allows difficulty to recover after hash rate drops
 	NoRetarget:       false,
 
 	MaxBlockSize:     1_000_000,
@@ -89,8 +100,10 @@ var Mainnet = &ChainParams{
 
 	MaxReorgDepth: 288,
 
-	MaxMempoolSize: 5000,
-	MinRelayTxFee:  1000,
+	MaxMempoolSize:    5000,
+	MinRelayTxFee:     1000,
+	MinRelayTxFeeRate: 1, // 1 sat/byte minimum, matching Bitcoin Core's default
+	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
 
 	SeedNodes: []string{},
 
@@ -105,10 +118,10 @@ var Testnet = &ChainParams{
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
 
-	// Pre-mined genesis block.
+	// Pre-mined genesis block (sha256mem PoW).
 	// Coinbase: "fairchain testnet genesis"
 	// Timestamp: 1773533803 (2026-03-15T00:16:43Z)
-	// Display hash: 0000000a561f1ca6014fbc5546a2e1070e009efe7a4ea7db47c9842541a506ce
+	// Display hash: 7258c351b08fc2fb81a87a0d7a9f8a9f082220d966e28e5e28bf99db497f8b46
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
@@ -120,8 +133,8 @@ var Testnet = &ChainParams{
 				0x19, 0x0a, 0xf5, 0x44, 0x52, 0xce, 0xd2, 0x3a,
 			},
 			Timestamp: 1773533803,
-			Bits:      0x1e07ffff,
-			Nonce:     3715263,
+			Bits:      0x1f3a910b,
+			Nonce:     285,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -144,10 +157,10 @@ var Testnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0xce, 0x06, 0xa5, 0x41, 0x25, 0x84, 0xc9, 0x47,
-		0xdb, 0xa7, 0x4e, 0x7a, 0xfe, 0x9e, 0x00, 0x0e,
-		0x07, 0xe1, 0xa2, 0x46, 0x55, 0xbc, 0x4f, 0x01,
-		0xa6, 0x1c, 0x1f, 0x56, 0x0a, 0x00, 0x00, 0x00,
+		0x46, 0x8b, 0x7f, 0x49, 0xdb, 0x99, 0xbf, 0x28,
+		0x5e, 0x8e, 0xe2, 0x66, 0xd9, 0x20, 0x22, 0x08,
+		0x9f, 0x8a, 0x9f, 0x7a, 0x0d, 0x7a, 0xa8, 0x81,
+		0xfb, 0xc2, 0x8f, 0xb0, 0x51, 0xc3, 0x58, 0x72,
 	},
 
 	TargetBlockSpacing:  5 * time.Second,
@@ -156,8 +169,10 @@ var Testnet = &ChainParams{
 	MaxTimeFutureDrift:  2 * time.Minute,
 	MinTimestampRule:    "median-11",
 
-	InitialBits:      0x1e07ffff, // ~2x harder than minimum (50x easier than previous 100x)
-	MinBits:          0x1e0fffff,  // Minimum difficulty (same as mainnet)
+	// Difficulty calibrated for sha256mem (~224 H/s per core).
+	// 0x1f3a910b ≈ 1,119 hashes ≈ 5 sec on a single core.
+	InitialBits:      0x1f3a910b,
+	MinBits:          0x207fffff, // Floor: trivial difficulty (same as regtest)
 	NoRetarget:       false,
 
 	MaxBlockSize:     2_000_000,
@@ -175,8 +190,10 @@ var Testnet = &ChainParams{
 
 	MaxReorgDepth: 1000,
 
-	MaxMempoolSize: 5000,
-	MinRelayTxFee:  100,
+	MaxMempoolSize:    5000,
+	MinRelayTxFee:     100,
+	MinRelayTxFeeRate: 1, // 1 sat/byte minimum
+	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
 
 	SeedNodes: []string{
 		"45.32.196.26:19334",  // main_web
@@ -215,8 +232,10 @@ var Regtest = &ChainParams{
 
 	MaxReorgDepth: 0,
 
-	MaxMempoolSize: 10000,
-	MinRelayTxFee:  0,
+	MaxMempoolSize:    10000,
+	MinRelayTxFee:     0,
+	MinRelayTxFeeRate: 0, // No fee-rate requirement on regtest
+	MempoolExpiry:     1 * time.Hour, // Shorter for testing convenience
 
 	SeedNodes: []string{},
 

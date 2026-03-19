@@ -11,11 +11,23 @@ import (
 // Format: the top byte is the exponent, the lower 3 bytes are the mantissa.
 // target = mantissa * 2^(8*(exponent-3))
 //
-// This matches the Bitcoin nBits encoding.
+// Matches Bitcoin Core's SetCompact: overflow encodings (exponent > 34, or
+// mantissa too large for exponents 32-34) are clamped to zero, and negative
+// encodings return zero.
 func CompactToBig(compact uint32) *big.Int {
 	mantissa := compact & 0x007fffff
 	negative := compact&0x00800000 != 0
 	exponent := compact >> 24
+
+	// Bitcoin Core overflow check: reject encodings that would produce a
+	// value exceeding 256 bits (2^256 - 1).
+	overflow := mantissa != 0 && ((exponent > 34) ||
+		(mantissa > 0xff && exponent > 33) ||
+		(mantissa > 0xffff && exponent > 32))
+
+	if negative || overflow {
+		return new(big.Int)
+	}
 
 	var target big.Int
 	if exponent <= 3 {
@@ -26,9 +38,6 @@ func CompactToBig(compact uint32) *big.Int {
 		target.Lsh(&target, 8*(uint(exponent)-3))
 	}
 
-	if negative {
-		target.Neg(&target)
-	}
 	return &target
 }
 
@@ -46,10 +55,10 @@ func BigToCompact(target *big.Int) uint32 {
 	var compact uint32
 
 	if byteLen <= 3 {
-		compact = uint32(t.Int64()) << (8 * (3 - byteLen))
+		compact = uint32(t.Uint64()) << (8 * (3 - byteLen))
 	} else {
 		shifted := new(big.Int).Rsh(t, 8*(uint(byteLen)-3))
-		compact = uint32(shifted.Int64())
+		compact = uint32(shifted.Uint64() & 0xffffff)
 	}
 
 	// Normalize: if the high bit of the mantissa is set, shift up.
@@ -104,7 +113,8 @@ func CalcWork(bits uint32) *big.Int {
 	return new(big.Int).Div(oneLsh256, denominator)
 }
 
-// ValidateProofOfWork checks that the block header hash is <= the target defined by bits.
+// ValidateProofOfWork checks that a PoW hash is <= the target defined by bits.
+// The hash should be computed by the consensus engine's Hasher, not necessarily DoubleSHA256.
 func ValidateProofOfWork(headerHash types.Hash, bits uint32) error {
 	target := CompactToHash(bits)
 	if !headerHash.LessOrEqual(target) {

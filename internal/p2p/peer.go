@@ -59,8 +59,8 @@ type Peer struct {
 	// Address gossip: Bitcoin Core only responds to one getaddr per connection.
 	getaddrResponded bool
 
-	// Inventory deduplication.
-	knownInv  map[types.Hash]struct{}
+	// Inventory deduplication — bounded FIFO to prevent unbounded growth.
+	knownInv  *boundedHashSet
 	sendQueue chan outMsg
 
 	// Bytes transferred.
@@ -112,7 +112,7 @@ func NewPeer(conn net.Conn, inbound bool, magic [4]byte) *Peer {
 		connectedAt: now,
 		lastPong:    now,
 		windowStart: now,
-		knownInv:    make(map[types.Hash]struct{}),
+		knownInv:    newBoundedHashSet(10000),
 		sendQueue:   make(chan outMsg, peerSendQueueSize),
 		done:        make(chan struct{}),
 	}
@@ -293,26 +293,11 @@ func (p *Peer) MarkGetAddrResponded() bool {
 // --- Inventory ---
 
 func (p *Peer) AddKnownInventory(hash types.Hash) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.knownInv[hash] = struct{}{}
-	if len(p.knownInv) > 10000 {
-		count := 0
-		for k := range p.knownInv {
-			delete(p.knownInv, k)
-			count++
-			if count > 2000 {
-				break
-			}
-		}
-	}
+	p.knownInv.Add(hash)
 }
 
 func (p *Peer) HasKnownInventory(hash types.Hash) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_, ok := p.knownInv[hash]
-	return ok
+	return p.knownInv.Has(hash)
 }
 
 // --- I/O ---
@@ -323,6 +308,18 @@ func (p *Peer) SendMessage(cmd string, payload []byte) {
 	case <-p.done:
 	default:
 		log.Printf("[p2p] send queue full for peer %s, dropping message %s", p.addr, cmd)
+	}
+}
+
+// SendCritical enqueues a consensus-critical message (block, inv) with a
+// brief blocking timeout instead of silently dropping. This prevents block
+// relay messages from being lost under transient load.
+func (p *Peer) SendCritical(cmd string, payload []byte) {
+	select {
+	case p.sendQueue <- outMsg{cmd: cmd, payload: payload}:
+	case <-p.done:
+	case <-time.After(2 * time.Second):
+		log.Printf("[p2p] send queue full for peer %s, dropping critical message %s after timeout", p.addr, cmd)
 	}
 }
 

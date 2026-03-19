@@ -1,10 +1,42 @@
-# Fairchain
+# go-chain
 
-A Go-based blockchain proof-of-concept designed as a modular foundation for fairness-oriented consensus research.
+A modular blockchain written in Go — designed to be forked, configured, and launched.
 
 ## What This Is
 
-Fairchain is a minimal but real blockchain node written in Go. It implements Nakamoto-style proof-of-work as a baseline consensus mechanism, with a pluggable `consensus.Engine` interface designed so future agents can swap in identity-bound, ticket-based, sequential-work consensus without rewriting the node.
+go-chain is a complete, Bitcoin-parity blockchain node built from the ground up in Go. Every policy-level decision — proof-of-work algorithm, difficulty retargeting, coin identity, network parameters, and economics — lives behind a clean interface and can be swapped by editing a single file. Clone the repo, change your parameters, mine a genesis block, and you have a working chain.
+
+[Fairchain](DOCS/fairchain-fork.md) will be the first production fork of go-chain.
+
+## Modular Architecture
+
+### PoW Algorithms (`internal/algorithms/`)
+
+Four built-in algorithms behind a common `Hasher` interface. Set `Algorithm` in `coinparams.go` to switch:
+
+| Algorithm | Value | Description |
+|-----------|-------|-------------|
+| DoubleSHA256 | `"sha256d"` | Bitcoin-compatible. ASIC-mineable. Fastest validation. |
+| Argon2id | `"argon2id"` | CPU-fair, ASIC-resistant. RFC 9106. |
+| Scrypt | `"scrypt"` | Memory-hard (Litecoin-style). |
+| SHA256-Mem | `"sha256mem"` | Memory-hard SHA256. Designed for device fairness. |
+
+### Difficulty Retargeting (`internal/difficulty/`)
+
+Two algorithms behind a `Retargeter` interface. Set `DifficultyAlgorithm` in `coinparams.go`:
+
+| Algorithm | Value | Description |
+|-----------|-------|-------------|
+| Bitcoin | `"bitcoin"` | Nakamoto-style epoch retarget with EDA. |
+| LWMA | `"lwma"` | Zawy12 LWMA-1. Per-block adjustment, responsive to hash rate swings. |
+
+### Coin Parameters (`internal/coinparams/`)
+
+One file defines the entire coin identity — name, ticker, binary names, data directory, decimal precision, PoW algorithm, and difficulty algorithm. Fork the repo, edit this file, and you have a new chain identity.
+
+### Network Definitions (`internal/params/`)
+
+Mainnet, testnet, and regtest are fully parameterized in a single `ChainParams` struct: block timing, subsidy schedule, halving interval, coinbase maturity, reorg depth, mempool policy, seed nodes. No magic numbers in the codebase.
 
 ## Build
 
@@ -13,171 +45,65 @@ make build
 ```
 
 Produces two binaries in `bin/`:
-- `fairchaind` — the full node daemon
-- `fairchain-cli` — command-line RPC client (bitcoin-cli compatible)
+- `fairchaind` — full node daemon (binary name is configurable via `coinparams.go`)
+- `fairchain-cli` — command-line RPC client
 
-Optional build targets:
+Optional:
 ```bash
-make genesis      # Build the genesis block mining tool
-make adversary    # Build the adversarial block generator
+make genesis      # Genesis block mining tool
+make adversary    # Adversarial block generator
 ```
 
 ## Quick Start
 
-### Run a regtest node with mining
-
 ```bash
+# Run a regtest node with mining
 make run-regtest
-```
 
-Or manually:
-
-```bash
-mkdir -p /tmp/fairchain-regtest
-fairchaind \
-  -network regtest \
-  -datadir /tmp/fairchain-regtest \
-  -listen 0.0.0.0:19444 \
-  -rpcbind 127.0.0.1 \
-  -rpcport 19445 \
-  -mine
-```
-
-### Query node status
-
-```bash
+# Query node status
 fairchain-cli getblockchaininfo
 fairchain-cli getblockcount
 fairchain-cli getpeerinfo
-fairchain-cli getnetworkinfo
 ```
 
-### Connect to a remote node
+See [Getting Started](DOCS/getting-started.md) for full setup instructions.
 
-```bash
-fairchain-cli -rpcconnect=45.32.196.26 -rpcport=19445 getblockchaininfo
-```
-
-### Run a second node connected to the first
-
-```bash
-mkdir -p /tmp/fairchain-regtest2
-fairchaind \
-  -network regtest \
-  -datadir /tmp/fairchain-regtest2 \
-  -listen 0.0.0.0:19446 \
-  -rpcbind 127.0.0.1 \
-  -rpcport 19447 \
-  -addnode 127.0.0.1:19444
-```
-
-### Stop the daemon
-
-```bash
-fairchain-cli stop
-```
-
-## Daemon Flags (fairchaind)
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-network` | Network: mainnet, testnet, regtest | regtest |
-| `-datadir` | Data directory | `~/.fairchain` |
-| `-listen` | P2P listen address | `0.0.0.0:19444` |
-| `-rpcbind` | RPC bind address | `127.0.0.1` |
-| `-rpcport` | RPC port | `19445` |
-| `-mine` | Enable mining | false |
-| `-addnode` | Add a peer to connect to | |
-| `-seed-peers` | Comma-separated seed peers | |
-| `-conf` | Path to fairchain.conf | |
-| `-log-level` | Log level: debug, info, warn, error | info |
-| `-version` | Print version and exit | |
-
-## CLI Commands (fairchain-cli)
-
-### Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-rpcconnect` | RPC server host | `127.0.0.1` |
-| `-rpcport` | RPC server port | `19445` |
-| `-version` | Print version and exit | |
-
-### Blockchain
-
-| Command | Description |
-|---------|-------------|
-| `getblockchaininfo` | Get blockchain state |
-| `getblockcount` | Get current block height |
-| `getbestblockhash` | Get hash of best block |
-| `getblockhash <height>` | Get block hash at height |
-| `getblock <hash>` | Get block data by hash |
-| `getdifficulty` | Get current difficulty |
-
-### Network
-
-| Command | Description |
-|---------|-------------|
-| `getnetworkinfo` | Get network state |
-| `getpeerinfo` | Get connected peer details |
-| `getconnectioncount` | Get number of connections |
-| `addnode <ip:port>` | Connect to a node |
-| `disconnectnode <addr>` | Disconnect a peer |
-
-### Mempool
-
-| Command | Description |
-|---------|-------------|
-| `getmempoolinfo` | Get mempool state |
-| `getrawmempool [true]` | List mempool txids (verbose for details) |
-| `getmempoolentry <txid>` | Get mempool entry for a transaction |
-
-### UTXO
-
-| Command | Description |
-|---------|-------------|
-| `gettxout <txid> <n>` | Get unspent output |
-| `gettxoutsetinfo` | Get UTXO set statistics |
-
-### Control
-
-| Command | Description |
-|---------|-------------|
-| `getinfo` | Get node overview |
-| `stop` | Stop the daemon |
-| `help` | Show help |
-
-## What Is Implemented
+## What's Implemented
 
 - **Core types**: Hash, BlockHeader, Block, Transaction (UTXO-style), canonical binary serialization
 - **Crypto**: Double-SHA256, secp256k1 ECDSA, P2PKH scripts, Merkle roots, compact bits/target
-- **Consensus**: Pluggable `consensus.Engine` interface with baseline PoW implementation
+- **Consensus**: Pluggable `consensus.Engine` interface with baseline PoW
 - **Validation**: Block structure, coinbase rules, merkle root, duplicate tx, subsidy, timestamps, difficulty retargeting, script execution
 - **UTXO set**: In-memory with LevelDB persistence, connect/disconnect per block, undo data for reorgs
 - **Mempool**: UTXO-validated, script-validated, fee-rate priority, double-spend detection, eviction
-- **Mining**: Block template builder, fee-inclusive coinbase, P2PKH reward scripts
+- **Mining**: Block template builder (BIP 22), fee-inclusive coinbase, P2PKH reward scripts
 - **P2P networking**: Version handshake, ping/pong keepalive, inventory gossip, block/tx propagation, initial block sync, peer address gossip, misbehavior scoring, IP banning, rate limiting, inbound eviction, exponential reconnection backoff
 - **Wire protocol**: Binary message encoding (version, verack, ping/pong, inv, getdata, block, tx, getblocks, addr)
-- **RPC API**: Bitcoin Core-compatible HTTP JSON API (20 endpoints)
-- **CLI**: Bitcoin-cli compatible command-line client
+- **RPC API**: Bitcoin Core-compatible HTTP JSON-RPC (40+ endpoints, stratum pool compatible)
+- **CLI**: bitcoin-cli compatible command-line client
 - **Storage**: LevelDB block index + flat file blocks (blk*.dat/rev*.dat) + LevelDB chainstate
+- **Wallet**: HD wallet (BIP39), encryption, backup, WIF import/export
 - **Tests**: 60+ unit tests + 9 fuzz targets + 16-phase chaos test
 
-## Configuration
+## Documentation
 
-Supports both JSON config files and Bitcoin Core-style `fairchain.conf` (INI format with `[main]`, `[test]`, `[regtest]` sections). All settings can be overridden via CLI flags.
+| Document | Description |
+|----------|-------------|
+| [Getting Started](DOCS/getting-started.md) | Build, run, and configure a node |
+| [How to Fork](DOCS/how-to-fork.md) | Step-by-step guide to launching your own chain |
+| [RPC Commands](DOCS/rpc-commands.md) | Full API reference (40+ endpoints) |
+| [Fairchain Fork](DOCS/fairchain-fork.md) | Roadmap for the Fairchain production fork |
 
-## Architecture
-
-See `WORKFILE.md` for detailed architecture documentation.
-
-## Where to Look First
+## Project Structure
 
 | Area | Path |
 |------|------|
 | Core types & serialization | `internal/types/` |
 | Hashing & merkle | `internal/crypto/` |
-| Chain params | `internal/params/` |
+| Coin identity | `internal/coinparams/` |
+| PoW algorithms | `internal/algorithms/` |
+| Difficulty retargeting | `internal/difficulty/` |
+| Chain params & networks | `internal/params/` |
 | Consensus interface | `internal/consensus/engine.go` |
 | PoW engine | `internal/consensus/pow/` |
 | Block validation | `internal/consensus/validation.go` |
@@ -189,3 +115,7 @@ See `WORKFILE.md` for detailed architecture documentation.
 | RPC API | `internal/rpc/` |
 | Daemon entrypoint | `cmd/node/` |
 | CLI | `cmd/cli/` |
+
+## License
+
+See [LICENSE](LICENSE).

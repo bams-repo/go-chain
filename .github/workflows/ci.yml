@@ -39,6 +39,9 @@ jobs:
       - name: Verify chaos launcher entrypoint
         run: python scripts/chaos_test.py --check-parity
 
+      - name: Lint (go vet)
+        run: go vet ./...
+
       - name: Build all packages
         run: go build ./...
 

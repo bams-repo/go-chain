@@ -12,9 +12,13 @@ import (
 	"os"
 	"time"
 
+	"github.com/bams-repo/fairchain/internal/algorithms"
+	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/types"
 )
+
+var activeHasher algorithms.Hasher
 
 func main() {
 	attack := flag.String("attack", "", "Attack type: bad-nonce, bad-merkle, duplicate, time-warp-future, time-warp-past, orphan-flood, inflated-coinbase, empty-block, wrong-bits, double-spend, immature-coinbase-spend, overspend, duplicate-input, intra-block-double-spend, steal-utxo, steal-premine, difficulty-manipulation")
@@ -23,10 +27,17 @@ func main() {
 	flag.Parse()
 
 	if *attack == "" {
-		fmt.Fprintln(os.Stderr, "Usage: fairchain-adversary -attack <type> -rpc <addr>")
+		fmt.Fprintln(os.Stderr, "Usage: "+coinparams.AdversaryToolName+" -attack <type> -rpc <addr>")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
+
+	h, herr := algorithms.GetHasher(coinparams.Algorithm)
+	if herr != nil {
+		fmt.Fprintf(os.Stderr, "unsupported PoW algorithm %q: %v\n", coinparams.Algorithm, herr)
+		os.Exit(1)
+	}
+	activeHasher = h
 
 	var results []attackResult
 	var err error
@@ -206,7 +217,7 @@ func makeCoinbaseTx(height uint32, value uint64) types.Transaction {
 		Version: 1,
 		Inputs: []types.TxInput{{
 			PreviousOutPoint: types.CoinbaseOutPoint,
-			SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte("fairchain")...),
+			SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte(coinparams.CoinbaseTag)...),
 			Sequence:         0xFFFFFFFF,
 		}},
 		Outputs: []types.TxOutput{{
@@ -402,7 +413,7 @@ func attackInflatedCoinbase(rpc string) ([]attackResult, error) {
 	block.Header.MerkleRoot = merkle
 
 	target := crypto.CompactToHash(block.Header.Bits)
-	found, _ := (&powSealer{}).seal(&block.Header, target, 200000000)
+	found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 200000000)
 	detail := ""
 	if !found {
 		detail = "could not find PoW (expected for high-diff); submitting anyway"
@@ -478,7 +489,7 @@ func attackWrongBits(rpc string) ([]attackResult, error) {
 	block.Header.MerkleRoot = merkle
 
 	target := crypto.CompactToHash(easyBits)
-	found, _ := (&powSealer{}).seal(&block.Header, target, 10000000)
+	found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 10000000)
 	detail := ""
 	if !found {
 		detail = "could not find PoW with easy bits; submitting anyway"
@@ -546,7 +557,7 @@ func buildBlockWithSpendTx(rpc string, spendTxHash types.Hash, spendIndex uint32
 	block.Header.MerkleRoot = merkle
 
 	target := crypto.CompactToHash(bits)
-	found, _ := (&powSealer{}).seal(&block.Header, target, 200000000)
+	found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 200000000)
 	if !found {
 		return block, newHeight, fmt.Errorf("could not find PoW within iteration limit")
 	}
@@ -607,7 +618,7 @@ func findSpendableUTXO(rpc string, mustBeMature bool) (string, uint32, uint64, e
 		binary.LittleEndian.PutUint32(heightBytes, uint32(h))
 
 		// Try the standard miner coinbase format: BIP34 (0x04 + height) + suffix
-		for _, suffix := range []string{"fairchain", "test", ""} {
+		for _, suffix := range []string{coinparams.CoinbaseTag, "test", ""} {
 			cb := types.Transaction{
 				Version: 1,
 				Inputs: []types.TxInput{{
@@ -655,7 +666,7 @@ func findImmatureUTXO(rpc string) (string, uint32, uint64, error) {
 		heightBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(heightBytes, uint32(h))
 
-		for _, suffix := range []string{"fairchain", "test", ""} {
+		for _, suffix := range []string{coinparams.CoinbaseTag, "test", ""} {
 			cb := types.Transaction{
 				Version: 1,
 				Inputs: []types.TxInput{{
@@ -728,7 +739,7 @@ func attackImmatureCoinbaseSpend(rpc string) ([]attackResult, error) {
 			Version: 1,
 			Inputs: []types.TxInput{{
 				PreviousOutPoint: types.CoinbaseOutPoint,
-				SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte("fairchain")...),
+				SignatureScript:  append(append([]byte{0x04}, heightBytes...), []byte(coinparams.CoinbaseTag)...),
 				Sequence:         0xFFFFFFFF,
 			}},
 			Outputs: []types.TxOutput{{
@@ -870,7 +881,7 @@ func attackDuplicateInput(rpc string) ([]attackResult, error) {
 	block.Header.MerkleRoot = merkle
 
 	target := crypto.CompactToHash(bits)
-	found, _ := (&powSealer{}).seal(&block.Header, target, 200000000)
+	found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 200000000)
 	if !found {
 		if block != nil {
 			rejected, detail := submitBlock(rpc, block)
@@ -961,7 +972,7 @@ func attackIntraBlockDoubleSpend(rpc string) ([]attackResult, error) {
 	block.Header.MerkleRoot = merkle
 
 	target := crypto.CompactToHash(bits)
-	found, _ := (&powSealer{}).seal(&block.Header, target, 200000000)
+	found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 200000000)
 	if !found {
 		if block != nil {
 			rejected, detail := submitBlock(rpc, block)
@@ -982,11 +993,13 @@ func attackIntraBlockDoubleSpend(rpc string) ([]attackResult, error) {
 	}}, nil
 }
 
-type powSealer struct{}
+type powSealer struct {
+	hasher algorithms.Hasher
+}
 
 func (p *powSealer) seal(header *types.BlockHeader, target types.Hash, maxIter uint64) (bool, error) {
 	for i := uint64(0); i < maxIter; i++ {
-		hash := crypto.HashBlockHeader(header)
+		hash := p.hasher.PoWHash(header.SerializeToBytes())
 		if hash.LessOrEqual(target) {
 			return true, nil
 		}
@@ -1014,7 +1027,7 @@ func fetchSubsidy(rpc string) uint64 {
 
 // findMinerCoinbaseUTXO searches for a spendable miner coinbase UTXO by
 // reconstructing the exact coinbase transaction the miner produces (height LE
-// bytes + "fairchain", PkScript=0x00, subsidy from chain).
+// bytes + coinbase tag, PkScript=0x00, subsidy from chain).
 func findMinerCoinbaseUTXO(rpc string, mature bool) (types.Hash, uint32, uint64, string, error) {
 	ci, err := fetchChainInfo(rpc)
 	if err != nil {
@@ -1034,7 +1047,7 @@ func findMinerCoinbaseUTXO(rpc string, mature bool) (types.Hash, uint32, uint64,
 	for h := startHeight; h >= 1; h-- {
 		heightBytes := make([]byte, 4)
 		binary.LittleEndian.PutUint32(heightBytes, uint32(h))
-		msg := append(append([]byte{0x04}, heightBytes...), []byte("fairchain")...)
+		msg := append(append([]byte{0x04}, heightBytes...), []byte(coinparams.CoinbaseTag)...)
 
 		cb := types.Transaction{
 			Version: 1,
@@ -1136,7 +1149,7 @@ func attackStealUTXO(rpc string) ([]attackResult, error) {
 		block.Header.MerkleRoot = merkle
 
 		target := crypto.CompactToHash(bits)
-		found, _ := (&powSealer{}).seal(&block.Header, target, 500000000)
+		found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 500000000)
 		if !found {
 			results = append(results, attackResult{
 				Attack: "steal-utxo",
@@ -1267,7 +1280,7 @@ func attackStealPremine(rpc string) ([]attackResult, error) {
 		block.Header.MerkleRoot = merkle
 
 		target := crypto.CompactToHash(bits)
-		found, _ := (&powSealer{}).seal(&block.Header, target, 500000000)
+		found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 500000000)
 		if !found {
 			results = append(results, attackResult{
 				Attack: "steal-premine",
@@ -1389,7 +1402,7 @@ func attackDifficultyManipulation(rpc string, epochs int) ([]attackResult, error
 			block.Header.MerkleRoot = merkle
 
 			target := crypto.CompactToHash(bits)
-			found, _ := (&powSealer{}).seal(&block.Header, target, 500000000)
+			found, _ := (&powSealer{hasher: activeHasher}).seal(&block.Header, target, 500000000)
 			if !found {
 				results = append(results, attackResult{
 					Attack: "difficulty-manipulation",

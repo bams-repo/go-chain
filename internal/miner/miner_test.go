@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bams-repo/fairchain/internal/algorithms/sha256d"
 	"github.com/bams-repo/fairchain/internal/chain"
 	"github.com/bams-repo/fairchain/internal/consensus/pow"
 	"github.com/bams-repo/fairchain/internal/crypto"
+	bitcoindiff "github.com/bams-repo/fairchain/internal/difficulty/bitcoin"
 	"github.com/bams-repo/fairchain/internal/mempool"
 	fcparams "github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/store"
@@ -31,7 +33,7 @@ func setupTestMiner(t *testing.T) (*Miner, *chain.Chain, *fcparams.ChainParams) 
 		RewardScript:    []byte{0x00},
 	}
 	genesis := fcparams.BuildGenesisBlock(cfg)
-	if err := pow.MineGenesis(&genesis); err != nil {
+	if err := pow.New(sha256d.New(), bitcoindiff.New()).MineGenesis(&genesis); err != nil {
 		t.Fatalf("mine genesis: %v", err)
 	}
 	genesisHash := crypto.HashBlockHeader(&genesis.Header)
@@ -49,13 +51,13 @@ func setupTestMiner(t *testing.T) (*Miner, *chain.Chain, *fcparams.ChainParams) 
 	}
 	t.Cleanup(func() { s.Close() })
 
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	c := chain.New(p, engine, s, nil)
 	if err := c.Init(); err != nil {
 		t.Fatalf("init chain: %v", err)
 	}
 
-	mp := mempool.New(p, c.UtxoSet())
+	mp := mempool.New(p, c.UtxoSet(), func() uint32 { _, h := c.Tip(); return h })
 	m := New(c, engine, mp, p, []byte{0x00}, nil, nil)
 
 	return m, c, p

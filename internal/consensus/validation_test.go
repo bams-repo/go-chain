@@ -10,13 +10,7 @@ import (
 
 func makeTestBlock(height uint32, p *params.ChainParams) types.Block {
 	subsidy := p.CalcSubsidy(height)
-	// BIP34 format: [pushLen=0x04][height LE 4 bytes][tag]
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, height)
-	scriptSig := make([]byte, 0, 1+4+len("test"))
-	scriptSig = append(scriptSig, 0x04)
-	scriptSig = append(scriptSig, heightBytes...)
-	scriptSig = append(scriptSig, []byte("test")...)
+	scriptSig := minimalBIP34ScriptSig(height, []byte("test"))
 
 	coinbase := types.Transaction{
 		Version: 1,
@@ -135,7 +129,7 @@ func TestCalcMedianTimePast(t *testing.T) {
 		return headers[h]
 	}
 
-	median := calcMedianTimePast(14, getAncestor)
+	median := CalcMedianTimePast(14, getAncestor)
 	// Median of timestamps at heights 4..14 (11 values).
 	// Timestamps: 1700000240, ..., 1700000840. Median = 1700000540 (height 9).
 	expected := uint32(1700000000 + 9*60)
@@ -161,4 +155,23 @@ func TestSubsidySchedule(t *testing.T) {
 	if s300 != p.InitialSubsidy/4 {
 		t.Fatalf("subsidy at height 300 = %d, want %d", s300, p.InitialSubsidy/4)
 	}
+}
+
+func minimalBIP34ScriptSig(height uint32, tag []byte) []byte {
+	heightBytes := make([]byte, 4)
+	types.PutUint32LE(heightBytes, height)
+	pushLen := 4
+	switch {
+	case height <= 0xFF:
+		pushLen = 1
+	case height <= 0xFFFF:
+		pushLen = 2
+	case height <= 0xFFFFFF:
+		pushLen = 3
+	}
+	sig := make([]byte, 0, 1+pushLen+len(tag))
+	sig = append(sig, byte(pushLen))
+	sig = append(sig, heightBytes[:pushLen]...)
+	sig = append(sig, tag...)
+	return sig
 }

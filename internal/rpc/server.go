@@ -1,16 +1,24 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/chain"
+	"github.com/bams-repo/fairchain/internal/coinparams"
+	"github.com/bams-repo/fairchain/internal/consensus"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/logging"
 	"github.com/bams-repo/fairchain/internal/mempool"
@@ -28,6 +36,12 @@ type AuthConfig struct {
 	CookiePath string
 }
 
+// TLSConfig holds optional TLS certificate paths for the RPC server.
+type TLSConfig struct {
+	CertFile string
+	KeyFile  string
+}
+
 // ShutdownFunc is called when the stop RPC is invoked.
 type ShutdownFunc func()
 
@@ -35,9 +49,15 @@ type ShutdownFunc func()
 // to announce it to the P2P network.
 type TxBroadcaster func(hash types.Hash)
 
+// BlockBroadcaster is called after a block is accepted via submitblock RPC
+// to relay it to the P2P network. Without this, pool-submitted blocks would
+// be accepted locally but never propagated.
+type BlockBroadcaster func(hash types.Hash, block *types.Block)
+
 // Server provides a local HTTP JSON API matching Bitcoin Core's RPC interface.
 type Server struct {
 	chain        *chain.Chain
+	engine       consensus.Engine
 	mempool      *mempool.Mempool
 	p2p          *p2p.Manager
 	params       *params.ChainParams
@@ -46,26 +66,96 @@ type Server struct {
 	authUser     string
 	authPassword string
 	cookiePath   string
-	wallet       WalletInterface
-	broadcastTx  TxBroadcaster
-	feePerByte   uint64
+	wallet         WalletInterface
+	broadcastTx    TxBroadcaster
+	broadcastBlock BlockBroadcaster
+	feePerByte     atomic.Uint64
+	tlsCert        string
+	tlsKey         string
+	dataDir        string // Network-specific data directory for backup path restriction
+	longPoll       longPollState
+	rateLimiter    *ipRateLimiter
+	methodMap      map[string]rpcHandler
 }
 
-// New creates a new RPC server. auth may be nil to disable authentication.
-// Returns an error if authentication is requested but cannot be initialized.
-func New(addr string, c *chain.Chain, mp *mempool.Mempool, pm *p2p.Manager, p *params.ChainParams, auth *AuthConfig) (*Server, error) {
+// --- Per-IP RPC rate limiting ---
+
+const (
+	rpcRateLimit  = 60            // max requests per window per IP
+	rpcRateWindow = 10 * time.Second
+	rpcRateGC     = 60 * time.Second // stale entry cleanup interval
+)
+
+type ipBucket struct {
+	count       int
+	windowStart time.Time
+}
+
+type ipRateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*ipBucket
+}
+
+func newIPRateLimiter() *ipRateLimiter {
+	rl := &ipRateLimiter{buckets: make(map[string]*ipBucket)}
+	go rl.gcLoop()
+	return rl
+}
+
+func (rl *ipRateLimiter) Allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	b, ok := rl.buckets[ip]
+	if !ok || now.Sub(b.windowStart) > rpcRateWindow {
+		rl.buckets[ip] = &ipBucket{count: 1, windowStart: now}
+		return true
+	}
+	b.count++
+	return b.count <= rpcRateLimit
+}
+
+func (rl *ipRateLimiter) gcLoop() {
+	ticker := time.NewTicker(rpcRateGC)
+	defer ticker.Stop()
+	for range ticker.C {
+		rl.mu.Lock()
+		now := time.Now()
+		for ip, b := range rl.buckets {
+			if now.Sub(b.windowStart) > rpcRateWindow*2 {
+				delete(rl.buckets, ip)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
+// New creates a new RPC server. auth may be nil only when --norpcauth is
+// explicitly set. Without auth, all endpoints (including dumpprivkey, stop)
+// are unprotected — only appropriate for local regtest.
+func New(addr string, c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, pm *p2p.Manager, p *params.ChainParams, auth *AuthConfig, tlsCfg *TLSConfig) (*Server, error) {
 	s := &Server{
-		chain:      c,
-		mempool:    mp,
-		p2p:        pm,
-		params:     p,
-		feePerByte: defaultFeePerByte,
+		chain:       c,
+		engine:      e,
+		mempool:     mp,
+		p2p:         pm,
+		params:      p,
+		rateLimiter: newIPRateLimiter(),
+	}
+	s.feePerByte.Store(defaultFeePerByte)
+	s.methodMap = s.buildMethodMap()
+
+	if tlsCfg != nil {
+		s.tlsCert = tlsCfg.CertFile
+		s.tlsKey = tlsCfg.KeyFile
 	}
 
 	if auth != nil {
 		if err := s.initAuth(auth); err != nil {
 			return nil, fmt.Errorf("RPC auth init: %w", err)
 		}
+	} else {
+		logging.L.Warn("RPC authentication DISABLED — all endpoints are unprotected. Use --norpcauth only for local testing.", "component", "rpc")
 	}
 
 	mux := http.NewServeMux()
@@ -96,7 +186,17 @@ func New(addr string, c *chain.Chain, mp *mempool.Mempool, pm *p2p.Manager, p *p
 	mux.HandleFunc("/gettxoutsetinfo", s.handleGetTxOutSetInfo)
 
 	// Bitcoin Core parity: mining RPCs
+	mux.HandleFunc("/getblocktemplate", s.handleGetBlockTemplate)
 	mux.HandleFunc("/submitblock", s.handleSubmitBlock)
+	mux.HandleFunc("/getmininginfo", s.handleGetMiningInfo)
+	mux.HandleFunc("/getnetworkhashps", s.handleGetNetworkHashPS)
+	mux.HandleFunc("/preciousblock", s.handlePreciousBlock)
+
+	// Bitcoin Core parity: raw transaction RPCs
+	mux.HandleFunc("/getrawtransaction", s.handleGetRawTransaction)
+
+	// Bitcoin Core JSON-RPC 1.0 dispatch (stratum pool compatibility)
+	mux.HandleFunc("/", s.handleJSONRPC)
 
 	// Bitcoin Core parity: control RPCs
 	mux.HandleFunc("/getinfo", s.handleGetInfo)
@@ -127,19 +227,26 @@ func New(addr string, c *chain.Chain, mp *mempool.Mempool, pm *p2p.Manager, p *p
 	mux.HandleFunc("/walletpassphrase", s.handleWalletPassphrase)
 	mux.HandleFunc("/walletlock", s.handleWalletLock)
 
-	// Fairchain-specific
+	// Chain-specific
 	mux.HandleFunc("/getchainstatus", s.handleGetChainStatus)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/prom", s.handlePrometheus)
 	mux.HandleFunc("/dumpwallet", s.handleDumpWallet)
 
 	var handler http.Handler = mux
 	if s.authUser != "" {
 		handler = s.authMiddleware(mux)
 	}
+	handler = s.rateLimitMiddleware(handler)
+	handler = s.recoveryMiddleware(handler)
 
 	s.server = &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:           addr,
+		Handler:        handler,
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   60 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	return s, nil
@@ -190,10 +297,39 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		if !ok ||
 			subtle.ConstantTimeCompare([]byte(user), []byte(s.authUser)) != 1 ||
 			subtle.ConstantTimeCompare([]byte(pass), []byte(s.authPassword)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Basic realm="fairchain-rpc"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="`+coinparams.RPCRealm+`"`)
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+		if !s.rateLimiter.Allow(ip) {
+			w.Header().Set("Retry-After", "10")
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				logging.L.Error("RPC handler panic", "component", "rpc", "panic", rec, "stack", string(buf[:n]))
+				writeError(w, http.StatusInternalServerError, "internal server error")
+			}
+		}()
 		next.ServeHTTP(w, r)
 	})
 }
@@ -213,15 +349,58 @@ func (s *Server) SetBroadcastTx(fn TxBroadcaster) {
 	s.broadcastTx = fn
 }
 
-// Start begins serving RPC requests.
+// SetDataDir sets the network-specific data directory for restricting backup paths.
+func (s *Server) SetDataDir(dir string) {
+	s.dataDir = dir
+}
+
+// SetBroadcastBlock registers the callback for relaying pool-submitted blocks
+// to the P2P network. This is critical for stratum pool operation — without it,
+// blocks accepted via submitblock would never reach other nodes.
+func (s *Server) SetBroadcastBlock(fn BlockBroadcaster) {
+	s.broadcastBlock = fn
+}
+
+// Start begins serving RPC requests. Non-loopback binds require TLS to
+// prevent credentials from being transmitted in cleartext.
 func (s *Server) Start() error {
-	logging.L.Info("RPC listening", "component", "rpc", "addr", s.server.Addr)
+	useTLS := s.tlsCert != "" && s.tlsKey != ""
+
+	if !isLoopback(s.server.Addr) && !useTLS {
+		return fmt.Errorf("RPC bound to non-loopback address %s without TLS — refusing to start. "+
+			"Provide --rpctlscert and --rpctlskey, or bind to 127.0.0.1", s.server.Addr)
+	}
+
+	if useTLS {
+		logging.L.Info("RPC listening (TLS)", "component", "rpc", "addr", s.server.Addr)
+	} else {
+		logging.L.Info("RPC listening", "component", "rpc", "addr", s.server.Addr)
+	}
+
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if useTLS {
+			err = s.server.ListenAndServeTLS(s.tlsCert, s.tlsKey)
+		} else {
+			err = s.server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			logging.L.Error("RPC server error", "component", "rpc", "error", err)
 		}
 	}()
 	return nil
+}
+
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Stop gracefully shuts down the RPC server and removes the cookie file if one was generated.
@@ -255,7 +434,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	writeJSON(w, "Fairchain server stopping")
+	writeJSON(w, coinparams.Name+" server stopping")
 	if s.shutdownFn != nil {
 		go s.shutdownFn()
 	}
@@ -487,16 +666,43 @@ func (s *Server) handleSubmitBlock(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	var block types.Block
-	if err := block.Deserialize(r.Body); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid block: %v", err))
+
+	body, err := readLimitedBody(r, 8*1024*1024)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
+
+	var block types.Block
+
+	// Try hex-encoded block first (Bitcoin Core parity for stratum pools).
+	hexStr := string(bytes.TrimSpace(body))
+	if isHexString(hexStr) {
+		blockBytes, decErr := hex.DecodeString(hexStr)
+		if decErr != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid hex: %v", decErr))
+			return
+		}
+		if err := block.Deserialize(bytes.NewReader(blockBytes)); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid block: %v", err))
+			return
+		}
+	} else {
+		// Fall back to raw binary deserialization (legacy format).
+		if err := block.Deserialize(bytes.NewReader(body)); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid block: %v", err))
+			return
+		}
+	}
+
 	height, err := s.chain.ProcessBlock(&block)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("rejected: %v", err))
 		return
 	}
+
+	s.postBlockAccept(&block, height)
+
 	blockHash := crypto.HashBlockHeader(&block.Header)
 	writeJSON(w, map[string]interface{}{
 		"accepted": true,
@@ -505,12 +711,47 @@ func (s *Server) handleSubmitBlock(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePreciousBlock is a no-op that matches Bitcoin Core's preciousblock RPC.
+// ckpool calls this after submitting a block to hint that the node should
+// prefer it as the chain tip.
+func (s *Server) handlePreciousBlock(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, nil)
+}
+
+// handleGetRawTransaction returns a hex-encoded raw transaction by txid.
+func (s *Server) handleGetRawTransaction(w http.ResponseWriter, r *http.Request) {
+	txidStr := r.URL.Query().Get("txid")
+	if txidStr == "" {
+		writeError(w, http.StatusBadRequest, "missing txid parameter")
+		return
+	}
+	verbose := r.URL.Query().Get("verbose") == "true" || r.URL.Query().Get("verbose") == "1"
+
+	var params []json.RawMessage
+	txidJSON, _ := json.Marshal(txidStr)
+	params = append(params, json.RawMessage(txidJSON))
+	if verbose {
+		params = append(params, json.RawMessage("true"))
+	}
+
+	result, rpcErr := s.rpcGetRawTransaction(params)
+	if rpcErr != nil {
+		writeError(w, http.StatusNotFound, rpcErr.Message)
+		return
+	}
+	writeJSON(w, result)
+}
+
 // --- Mempool RPCs ---
 
 func (s *Server) handleGetMempoolInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
-		"loaded": true,
-		"size":   s.mempool.Count(),
+		"loaded":           true,
+		"size":             s.mempool.Count(),
+		"bytes":            s.mempool.TotalSize(),
+		"maxmempool":       300 * 1024 * 1024,
+		"mempoolminfee":    s.params.MinRelayTxFeeRate,
+		"mempoolexpiry":    int64(s.params.MempoolExpiry.Hours()),
 	})
 }
 
@@ -537,6 +778,7 @@ func (s *Server) handleGetRawMempool(w http.ResponseWriter, r *http.Request) {
 				"base": e.Fee,
 			},
 			"feerate": e.FeeRate,
+			"time":    e.AddedAt.Unix(),
 		}
 	}
 	writeJSON(w, result)
@@ -567,6 +809,7 @@ func (s *Server) handleGetMempoolEntry(w http.ResponseWriter, r *http.Request) {
 			"base": entry.Fee,
 		},
 		"feerate": entry.FeeRate,
+		"time":    entry.AddedAt.Unix(),
 	}
 	writeJSON(w, resp)
 }
@@ -637,6 +880,11 @@ func (s *Server) handleGetTxOutSetInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, metrics.Global.Snapshot())
+}
+
+func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.Write([]byte(metrics.Global.Prometheus()))
 }
 
 // --- Helpers ---

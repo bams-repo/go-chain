@@ -64,13 +64,34 @@ type Manager struct {
 	seenBlocks *boundedHashSet
 	seenTxs    *boundedHashSet
 
-	// Sync request throttle: prevents spamming getblocks when already waiting
-	// for a response. Matches Bitcoin Core's single-flight sync approach.
-	lastSyncReq   time.Time
-	lastSyncReqMu sync.Mutex
+	// Per-peer sync request throttle: prevents spamming getblocks per peer when
+	// already waiting for a response. Enables parallel block requests from
+	// multiple peers during IBD (Bitcoin Core parity).
+	lastSyncReqPerPeer   map[string]time.Time
+	lastSyncReqPerPeerMu sync.Mutex
+
+	// Per-peer addr rate limit: max 1000 addresses per connection lifetime
+	// to prevent peer store flooding (Bitcoin Core parity).
+	addrCountPerPeer map[string]int
+	addrCountMu      sync.Mutex
+
+	// Current sync peer — only this peer is exempt from rate limits during IBD.
+	syncPeerAddr    string
+	syncPeerAddrMu  sync.RWMutex
+	syncPeerSince   time.Time
+	lastSyncHeight  uint32
+
+	// IBD block processing queue: decouples network I/O from block validation.
+	ibdBlockQueue chan *ibdBlockItem
+	ibdQueueDone  chan struct{}
 
 	ctx      context.Context
 	listener net.Listener
+}
+
+type ibdBlockItem struct {
+	block *types.Block
+	peer  *Peer
 }
 
 const (
@@ -108,11 +129,7 @@ func (s *boundedHashSet) Add(h types.Hash) {
 	if _, ok := s.items[h]; ok {
 		return
 	}
-	if len(s.items) >= s.cap {
-		evict := s.order[0]
-		s.order = s.order[1:]
-		delete(s.items, evict)
-	}
+	s.evictUntilSpace()
 	s.items[h] = struct{}{}
 	s.order = append(s.order, h)
 }
@@ -130,11 +147,7 @@ func (s *boundedHashSet) AddOrHas(h types.Hash) bool {
 	if _, ok := s.items[h]; ok {
 		return true
 	}
-	if len(s.items) >= s.cap {
-		evict := s.order[0]
-		s.order = s.order[1:]
-		delete(s.items, evict)
-	}
+	s.evictUntilSpace()
 	s.items[h] = struct{}{}
 	s.order = append(s.order, h)
 	return false
@@ -144,6 +157,22 @@ func (s *boundedHashSet) Remove(h types.Hash) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.items, h)
+}
+
+// evictUntilSpace removes the oldest entry from the FIFO, skipping stale
+// entries that were already removed via Remove() to prevent unbounded
+// growth of the order slice.
+func (s *boundedHashSet) evictUntilSpace() {
+	for len(s.items) >= s.cap && len(s.order) > 0 {
+		evict := s.order[0]
+		s.order = s.order[1:]
+		delete(s.items, evict)
+	}
+	if cap(s.order) > s.cap*2 && len(s.order) < s.cap {
+		compacted := make([]types.Hash, len(s.order), s.cap)
+		copy(compacted, s.order)
+		s.order = compacted
+	}
 }
 
 // ManagerOptions holds optional configuration for the P2P manager.
@@ -156,8 +185,12 @@ type ManagerOptions struct {
 func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps store.PeerStore, listenAddr string, maxIn, maxOut int, seeds []string, ts TimeSampler, opts *ManagerOptions) *Manager {
 	var nonce uint64
 	b := make([]byte, 8)
-	rand.Read(b)
-	nonce = binary.LittleEndian.Uint64(b)
+	if _, err := rand.Read(b); err != nil {
+		logging.L.Warn("rand.Read failed for local nonce, using time-based fallback", "component", "p2p", "error", err)
+		nonce = uint64(time.Now().UnixNano())
+	} else {
+		nonce = binary.LittleEndian.Uint64(b)
+	}
 
 	mgr := &Manager{
 		params:      p,
@@ -175,8 +208,12 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		banned:      make(map[string]time.Time),
 		backoff:     make(map[string]time.Time),
 		backoffN:    make(map[string]int),
-		seenBlocks:  newBoundedHashSet(maxSeenBlocks),
-		seenTxs:     newBoundedHashSet(maxSeenTxs),
+		seenBlocks:         newBoundedHashSet(maxSeenBlocks),
+		seenTxs:            newBoundedHashSet(maxSeenTxs),
+		lastSyncReqPerPeer: make(map[string]time.Time),
+		addrCountPerPeer:   make(map[string]int),
+		ibdBlockQueue:      make(chan *ibdBlockItem, 1024),
+		ibdQueueDone:       make(chan struct{}),
 	}
 
 	if opts != nil {
@@ -204,6 +241,9 @@ func (m *Manager) Start(ctx context.Context) error {
 	go m.pingLoop(ctx)
 	go m.livenessLoop(ctx)
 	go m.addrBroadcastLoop(ctx)
+	go m.orphanEvictionLoop(ctx)
+	go m.mempoolExpiryLoop(ctx)
+	go m.ibdProcessLoop(ctx)
 	if logging.DebugMode {
 		go m.topologyLoop(ctx)
 	}
@@ -287,8 +327,11 @@ func (m *Manager) ConnectionCounts() (inbound, outbound int) {
 }
 
 // AddNode attempts to connect to the given address. Returns an error if
-// already connected or banned.
+// already connected, banned, or the address is malformed/private.
 func (m *Manager) AddNode(addr string) error {
+	if err := validatePeerAddress(addr); err != nil {
+		return fmt.Errorf("invalid address %q: %w", addr, err)
+	}
 	if m.IsBanned(addr) {
 		return fmt.Errorf("node %s is banned", addr)
 	}
@@ -303,6 +346,85 @@ func (m *Manager) AddNode(addr string) error {
 	m.mu.Unlock()
 	go m.connectPeer(m.ctx, addr)
 	return nil
+}
+
+// validatePeerAddress checks that addr is a well-formed host:port with a
+// numeric port and a non-private, non-loopback IP to prevent SSRF.
+func validatePeerAddress(addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("must be host:port: %w", err)
+	}
+	if host == "" {
+		return fmt.Errorf("empty host")
+	}
+	port := 0
+	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port must be a number between 1 and 65535")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		ips, err := net.LookupIP(host)
+		if err != nil || len(ips) == 0 {
+			return fmt.Errorf("cannot resolve hostname %q", host)
+		}
+		ip = ips[0]
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return fmt.Errorf("loopback and unspecified addresses not allowed")
+	}
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("private/link-local addresses not allowed via addnode")
+	}
+	return nil
+}
+
+// validateGossipAddress performs lightweight validation on addresses received
+// via addr gossip. Rejects private, loopback, and malformed addresses to
+// prevent peer store poisoning and eclipse attacks.
+//
+// When localLoopback is true (the node itself is listening on loopback),
+// loopback addresses are accepted — this enables mesh formation for testnet,
+// regtest, and local multi-node setups. Bitcoin Core doesn't need this because
+// it uses a different discovery mechanism for regtest; for a small network
+// that relies on addr gossip for mesh formation, this is necessary.
+func validateGossipAddress(addr string, localLoopback ...bool) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("must be host:port: %w", err)
+	}
+	if host == "" {
+		return fmt.Errorf("empty host")
+	}
+	port := 0
+	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("non-IP address")
+	}
+	isLocal := len(localLoopback) > 0 && localLoopback[0]
+	if ip.IsLoopback() {
+		if isLocal {
+			return nil
+		}
+		return fmt.Errorf("non-routable address")
+	}
+	if ip.IsUnspecified() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("non-routable address")
+	}
+	return nil
+}
+
+// isLocalLoopback returns true if this manager is listening on a loopback address.
+func (m *Manager) isLocalLoopback() bool {
+	host, _, err := net.SplitHostPort(m.listenAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // DisconnectNode disconnects a peer by address. Returns an error if not found.
@@ -381,9 +503,9 @@ func (m *Manager) BroadcastBlock(hash types.Hash, block *types.Block) {
 	for i, p := range eligible {
 		p.AddKnownInventory(hash)
 		if i < maxDirectPush {
-			p.SendMessage(protocol.CmdBlock, blockBytes)
+			p.SendCritical(protocol.CmdBlock, blockBytes)
 		} else {
-			p.SendMessage(protocol.CmdInv, invPayload)
+			p.SendCritical(protocol.CmdInv, invPayload)
 		}
 	}
 }
@@ -451,8 +573,11 @@ func (m *Manager) IsBanned(addr string) bool {
 }
 
 // addMisbehavior increases a peer's ban score and disconnects+bans if threshold reached.
-// In -connect mode the operator explicitly chose these peers, so banning them
-// would sever the only links the node has. Log the misbehavior but keep the connection.
+// In -connect mode the operator explicitly chose these peers, so banning or disconnecting
+// them would sever the only links the node has. This is intentional: -connect mode is used
+// for internal testing and chain diagnostics where the peer must remain connected even if
+// it sends invalid data (e.g. testing adversary scenarios, replaying bad blocks, etc.).
+// Log the misbehavior but keep the connection alive.
 func (m *Manager) addMisbehavior(peer *Peer, score int32, reason string) {
 	if len(m.connectOnly) > 0 {
 		logging.L.Debug("peer misbehavior (connect-only, ban suppressed)", "component", "p2p",
@@ -514,6 +639,48 @@ func (m *Manager) outboundCount() int {
 	return count
 }
 
+// maxOutboundPerSubnet limits how many outbound peers may share a /16 subnet.
+// Bitcoin Core uses 1 to resist eclipse attacks; we use 2 to be slightly more
+// lenient for small networks where operators may share a hosting provider.
+const maxOutboundPerSubnet = 2
+
+// subnetKey returns the /16 prefix for an address string ("host:port").
+// For IPv4-mapped IPv6 (::ffff:a.b.c.d) the IPv4 /16 is returned.
+// Returns "" if the address cannot be parsed (e.g. hostname).
+func subnetKey(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return ""
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d", v4[0], v4[1])
+	}
+	// IPv6: use the first 4 bytes (/32) as a rough grouping.
+	if len(ip) >= 4 {
+		return fmt.Sprintf("%02x%02x:%02x%02x", ip[0], ip[1], ip[2], ip[3])
+	}
+	return ""
+}
+
+// outboundSubnetCount returns how many outbound peers share the given /16 subnet.
+// Caller must hold m.mu (at least RLock).
+func (m *Manager) outboundSubnetCount(sn string) int {
+	if sn == "" {
+		return 0
+	}
+	count := 0
+	for _, p := range m.peers {
+		if !p.IsInbound() && subnetKey(p.Addr()) == sn {
+			count++
+		}
+	}
+	return count
+}
+
 // --- Inbound eviction (Bitcoin Core parity) ---
 // When inbound slots are full and a new inbound peer connects, evict the
 // worst-performing inbound peer. "Worst" = highest ping latency among those
@@ -548,6 +715,10 @@ func (m *Manager) maybeEvictInbound() {
 
 // --- Connection loops ---
 
+// maxInboundPerIP limits inbound connections from a single IP address.
+// Bitcoin Core defaults to 1 per IP for inbound connections.
+const maxInboundPerIP = 1
+
 func (m *Manager) acceptLoop(ctx context.Context) {
 	for {
 		conn, err := m.listener.Accept()
@@ -561,22 +732,56 @@ func (m *Manager) acceptLoop(ctx context.Context) {
 			}
 		}
 
-		if m.IsBanned(conn.RemoteAddr().String()) {
+		remoteAddr := conn.RemoteAddr().String()
+		if m.IsBanned(remoteAddr) {
 			conn.Close()
 			continue
 		}
 
-		m.mu.RLock()
+		remoteIP, _, _ := net.SplitHostPort(remoteAddr)
+		isLoopback := net.ParseIP(remoteIP) != nil && net.ParseIP(remoteIP).IsLoopback()
+
+		m.mu.Lock()
 		inboundCount := 0
+		ipCount := 0
 		for _, p := range m.peers {
 			if p.IsInbound() {
 				inboundCount++
+				peerIP, _, _ := net.SplitHostPort(p.Addr())
+				if peerIP == remoteIP {
+					ipCount++
+				}
 			}
 		}
-		m.mu.RUnlock()
+		m.mu.Unlock()
+
+		// Per-IP inbound limit: Bitcoin Core enforces 1 inbound per IP to resist
+		// Sybil attacks. Loopback is exempt because multiple local nodes (testnet,
+		// regtest, chaos tests) legitimately share 127.0.0.1.
+		if !isLoopback && ipCount >= maxInboundPerIP {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] acceptLoop: per-IP inbound limit reached", "ip", remoteIP, "count", ipCount)
+			}
+			conn.Close()
+			continue
+		}
 
 		if inboundCount >= m.maxInbound {
 			m.maybeEvictInbound()
+			time.Sleep(50 * time.Millisecond)
+
+			m.mu.Lock()
+			recount := 0
+			for _, p := range m.peers {
+				if p.IsInbound() {
+					recount++
+				}
+			}
+			m.mu.Unlock()
+			if recount >= m.maxInbound {
+				conn.Close()
+				continue
+			}
 		}
 
 		peer := NewPeer(conn, true, m.params.NetworkMagic)
@@ -732,6 +937,20 @@ func (m *Manager) connectPeer(ctx context.Context, addr string) {
 			return
 		}
 	}
+	// Subnet diversity: reject outbound connection if the /16 is already saturated.
+	// Loopback is exempt — multiple local nodes legitimately share 127.0.0.1.
+	host, _, _ := net.SplitHostPort(addr)
+	addrIsLoopback := net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback()
+	if !addrIsLoopback {
+		sn := subnetKey(addr)
+		if sn != "" && m.outboundSubnetCount(sn) >= maxOutboundPerSubnet {
+			m.mu.RUnlock()
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] connectPeer: subnet limit reached", "addr", addr, "subnet", sn)
+			}
+			return
+		}
+	}
 	m.mu.RUnlock()
 
 	if m.IsBanned(addr) {
@@ -757,9 +976,24 @@ func (m *Manager) connectPeer(ctx context.Context, addr string) {
 
 func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 	defer func() {
+		if r := recover(); r != nil {
+			logging.L.Error("panic in peer handler — disconnecting peer",
+				"component", "p2p", "addr", peer.Addr(), "panic", fmt.Sprintf("%v", r))
+			m.addMisbehavior(peer, 100, fmt.Sprintf("handler panic: %v", r))
+		}
 		peer.Close()
 		m.mu.Lock()
-		delete(m.peers, peer.Addr())
+		disconnectedAddr := peer.Addr()
+		delete(m.peers, disconnectedAddr)
+		m.mu.Unlock()
+		// Clean up per-peer tracking maps when peer disconnects.
+		m.addrCountMu.Lock()
+		delete(m.addrCountPerPeer, disconnectedAddr)
+		m.addrCountMu.Unlock()
+		m.lastSyncReqPerPeerMu.Lock()
+		delete(m.lastSyncReqPerPeer, disconnectedAddr)
+		m.lastSyncReqPerPeerMu.Unlock()
+		m.mu.Lock()
 		var best uint32
 		for _, p := range m.peers {
 			if v := p.Version(); v != nil && v.StartHeight > best {
@@ -809,7 +1043,7 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 	// ephemeral TCP address. This ensures addr gossip propagates reachable
 	// addresses, matching Bitcoin Core's behavior of tracking listen addrs.
 	listenAddr := peer.Version().AddrFrom
-	if listenAddr != "" && listenAddr != m.listenAddr {
+	if listenAddr != "" && listenAddr != m.listenAddr && validateGossipAddress(listenAddr, m.isLocalLoopback()) == nil {
 		m.peerStore.PutPeer(listenAddr)
 	} else if peer.Addr() != m.listenAddr {
 		m.peerStore.PutPeer(peer.Addr())
@@ -858,9 +1092,15 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 
 		// During IBD the sync peer legitimately floods us with blocks in
 		// response to getblocks; penalizing that traffic would ban the very
-		// peer we need. Bitcoin Core similarly relaxes DoS scoring during
-		// initial block download.
-		if !peer.CheckRateLimit() && !m.IsSyncing() {
+		// peer we need. Only the active sync peer is exempt — all other peers
+		// remain rate-limited even during IBD to prevent abuse.
+		isSyncPeer := false
+		if m.IsSyncing() {
+			m.syncPeerAddrMu.RLock()
+			isSyncPeer = peer.Addr() == m.syncPeerAddr
+			m.syncPeerAddrMu.RUnlock()
+		}
+		if !peer.CheckRateLimit() && !isSyncPeer {
 			m.addMisbehavior(peer, 10, "message rate limit exceeded")
 			if peer.BanScore() >= BanThreshold {
 				return
@@ -941,7 +1181,10 @@ func (m *Manager) livenessLoop(ctx context.Context) {
 
 func (m *Manager) randomNonce() uint64 {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		logging.L.Warn("rand.Read failed for random nonce, using time-based fallback", "component", "p2p", "error", err)
+		return uint64(time.Now().UnixNano())
+	}
 	return binary.LittleEndian.Uint64(b)
 }
 
@@ -1146,8 +1389,28 @@ func (m *Manager) handleMessage(ctx context.Context, peer *Peer, hdr *protocol.M
 			m.addMisbehavior(peer, 10, "malformed addr")
 			return
 		}
-		for _, a := range addr.Addresses {
-			if !m.IsBanned(a) && a != m.listenAddr {
+
+		// Per-peer addr rate limit: max 1000 addresses per connection lifetime
+		// to prevent peer store flooding (Bitcoin Core parity).
+		m.addrCountMu.Lock()
+		peerAddr := peer.Addr()
+		received := m.addrCountPerPeer[peerAddr]
+		remaining := 1000 - received
+		if remaining <= 0 {
+			m.addrCountMu.Unlock()
+			logging.L.Debug("addr rate limit exceeded, ignoring", "component", "p2p", "peer", peerAddr, "total_received", received)
+			return
+		}
+		addrs := addr.Addresses
+		if len(addrs) > remaining {
+			addrs = addrs[:remaining]
+		}
+		m.addrCountPerPeer[peerAddr] = received + len(addrs)
+		m.addrCountMu.Unlock()
+
+		localLB := m.isLocalLoopback()
+		for _, a := range addrs {
+			if !m.IsBanned(a) && a != m.listenAddr && validateGossipAddress(a, localLB) == nil {
 				m.peerStore.PutPeer(a)
 			}
 		}
@@ -1207,11 +1470,20 @@ func (m *Manager) handleInv(peer *Peer, inv *protocol.InvMsg) {
 	}
 }
 
+// maxGetDataBlockResponses caps the number of blocks served per getdata message
+// to prevent a single peer from triggering a multi-GB bandwidth burst. Bitcoin
+// Core processes getdata batches and limits to avoid this amplification vector.
+const maxGetDataBlockResponses = 500
+
 func (m *Manager) handleGetData(peer *Peer, getData *protocol.GetDataMsg) {
 	var sentBlocks, sentTxs, missingBlocks, missingTxs int
 	for _, iv := range getData.Inventory {
 		switch iv.Type {
 		case protocol.InvTypeBlock:
+			if sentBlocks >= maxGetDataBlockResponses {
+				missingBlocks++
+				continue
+			}
 			block, err := m.chain.GetBlock(iv.Hash)
 			if err != nil {
 				missingBlocks++
@@ -1277,6 +1549,16 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 			"our_height", ourHeight)
 	}
 
+	// During IBD, push to the processing queue to decouple network I/O
+	// from block validation. Request next batch immediately after queuing.
+	if m.IsSyncing() {
+		m.ibdBlockQueue <- &ibdBlockItem{block: block, peer: peer}
+		if peer.BestHeight() > 0 {
+			m.requestBlocks(peer)
+		}
+		return
+	}
+
 	height, err := m.chain.ProcessBlock(block)
 	if err != nil {
 		if errors.Is(err, chain.ErrSideChain) {
@@ -1293,10 +1575,11 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 		}
 		m.seenBlocks.Remove(blockHash)
 		if errors.Is(err, chain.ErrOrphanBlock) {
-			logging.L.Info("orphan block, requesting chain from peer", "component", "p2p",
+			logging.L.Info("orphan block, requesting parent from peer", "component", "p2p",
 				"hash", blockHash.ReverseString(),
 				"parent", block.Header.PrevBlock.ReverseString(),
 				"addr", peer.Addr())
+			m.requestOrphanParent(peer, block.Header.PrevBlock)
 			m.requestBlocks(peer)
 			return
 		}
@@ -1327,7 +1610,6 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 		}
 	}
 	m.mempool.RemoveTxs(confirmedHashes)
-	m.mempool.SetTipHeight(height)
 
 	peer.SetStartHeightIfGreater(height)
 	peer.StampLastBlock()
@@ -1393,33 +1675,31 @@ func (m *Manager) handleGetBlocks(peer *Peer, msg *protocol.GetBlocksMsg) {
 			"blocks_to_send", int(tipHeight)-int(startHeight))
 	}
 
-	sent := 0
-	for h := startHeight + 1; h <= tipHeight && sent < 500; h++ {
+	var invItems []protocol.InvVector
+	for h := startHeight + 1; h <= tipHeight && len(invItems) < 500; h++ {
 		header, err := m.chain.GetHeaderByHeight(h)
 		if err != nil {
 			break
 		}
 		hash := crypto.HashBlockHeader(header)
-		block, err := m.chain.GetBlock(hash)
-		if err != nil {
-			break
-		}
-		blockBytes, err := block.SerializeToBytes()
-		if err != nil {
-			break
-		}
 		peer.AddKnownInventory(hash)
-		peer.SendMessage(protocol.CmdBlock, blockBytes)
-		sent++
+		invItems = append(invItems, protocol.InvVector{Type: protocol.InvTypeBlock, Hash: hash})
 		if hash == msg.HashStop {
 			break
 		}
 	}
+	if len(invItems) > 0 {
+		inv := protocol.InvMsg{Inventory: invItems}
+		var buf bytes.Buffer
+		inv.Encode(&buf)
+		peer.SendMessage(protocol.CmdInv, buf.Bytes())
+	}
+	sent := len(invItems)
 
 	if logging.DebugMode && sent > 0 {
-		logging.L.Debug("[dbg] handleGetBlocks sent",
+		logging.L.Debug("[dbg] handleGetBlocks sent inv",
 			"peer", peer.Addr(),
-			"blocks_sent", sent,
+			"inv_count", sent,
 			"from_height", startHeight+1,
 			"to_height", startHeight+uint32(sent))
 	}
@@ -1474,6 +1754,7 @@ func (m *Manager) gatherAddresses(limit int) []string {
 		seen[addr] = struct{}{}
 		addrs = append(addrs, addr)
 		if len(addrs) >= limit {
+			shuffleStrings(addrs)
 			return addrs
 		}
 	}
@@ -1488,20 +1769,41 @@ func (m *Manager) gatherAddresses(limit int) []string {
 		seen[addr] = struct{}{}
 		addrs = append(addrs, addr)
 		if len(addrs) >= limit {
+			shuffleStrings(addrs)
 			return addrs
 		}
 	}
 
+	shuffleStrings(addrs)
 	return addrs
 }
 
 // shufflePeers performs a Fisher-Yates shuffle on a peer slice using crypto/rand.
 func shufflePeers(peers []*Peer) {
 	for i := len(peers) - 1; i > 0; i-- {
+		var j int
 		b := make([]byte, 8)
-		rand.Read(b)
-		j := int(binary.LittleEndian.Uint64(b) % uint64(i+1))
+		if _, err := rand.Read(b); err != nil {
+			logging.L.Warn("rand.Read failed in shufflePeers, using time-based fallback", "component", "p2p", "error", err)
+			j = int(uint64(time.Now().UnixNano()) % uint64(i+1))
+		} else {
+			j = int(binary.LittleEndian.Uint64(b) % uint64(i+1))
+		}
 		peers[i], peers[j] = peers[j], peers[i]
+	}
+}
+
+// shuffleStrings performs a Fisher-Yates shuffle on a string slice using crypto/rand.
+func shuffleStrings(s []string) {
+	for i := len(s) - 1; i > 0; i-- {
+		b := make([]byte, 8)
+		var j int
+		if _, err := rand.Read(b); err != nil {
+			j = int(uint64(time.Now().UnixNano()) % uint64(i+1))
+		} else {
+			j = int(binary.LittleEndian.Uint64(b) % uint64(i+1))
+		}
+		s[i], s[j] = s[j], s[i]
 	}
 }
 
@@ -1615,31 +1917,181 @@ func (m *Manager) topologyLoop(ctx context.Context) {
 	}
 }
 
+// --- IBD block processing queue ---
+
+// ibdProcessLoop is a dedicated goroutine that drains the IBD block queue,
+// decoupling network I/O from block validation/storage. This allows the P2P
+// read loop to continue receiving blocks while previous blocks are processed.
+func (m *Manager) ibdProcessLoop(ctx context.Context) {
+	defer close(m.ibdQueueDone)
+	for {
+		select {
+		case <-ctx.Done():
+			m.drainIBDQueue()
+			return
+		case item, ok := <-m.ibdBlockQueue:
+			if !ok {
+				return
+			}
+			m.processIBDBlock(item)
+		}
+	}
+}
+
+func (m *Manager) processIBDBlock(item *ibdBlockItem) {
+	block := item.block
+	peer := item.peer
+	blockHash := crypto.HashBlockHeader(&block.Header)
+
+	height, err := m.chain.ProcessBlock(block)
+	if err != nil {
+		if errors.Is(err, chain.ErrSideChain) {
+			logging.L.Info("IBD block stored as side chain", "component", "p2p",
+				"hash", blockHash.ReverseString(), "height", height, "addr", peer.Addr())
+			return
+		}
+		if errors.Is(err, chain.ErrOrphanBlock) {
+			logging.L.Info("IBD orphan block, requesting parent", "component", "p2p",
+				"hash", blockHash.ReverseString(),
+				"parent", block.Header.PrevBlock.ReverseString(),
+				"addr", peer.Addr())
+			m.requestOrphanParent(peer, block.Header.PrevBlock)
+			m.requestBlocks(peer)
+			return
+		}
+		m.seenBlocks.Remove(blockHash)
+		errStr := err.Error()
+		if strings.Contains(errStr, "already in chain") {
+			return
+		}
+		logging.L.Warn("IBD block rejected", "component", "p2p",
+			"hash", blockHash.ReverseString(), "addr", peer.Addr(), "error", err)
+		if strings.Contains(errStr, "proof of work") || strings.Contains(errStr, "merkle") || strings.Contains(errStr, "bits mismatch") {
+			m.addMisbehavior(peer, 100, "invalid block: "+errStr)
+		} else {
+			m.addMisbehavior(peer, 10, "rejected block: "+errStr)
+		}
+		return
+	}
+
+	var confirmedHashes []types.Hash
+	for _, tx := range block.Transactions {
+		txHash, hashErr := crypto.HashTransaction(&tx)
+		if hashErr == nil {
+			confirmedHashes = append(confirmedHashes, txHash)
+		}
+	}
+	m.mempool.RemoveTxs(confirmedHashes)
+
+	peer.SetStartHeightIfGreater(height)
+	peer.StampLastBlock()
+	peer.SetSyncedBlocks(int32(height))
+	peer.SetSyncedHeaders(int32(height))
+	m.mu.Lock()
+	if height > m.bestPeerHeight {
+		m.bestPeerHeight = height
+	}
+	m.mu.Unlock()
+
+	logging.L.Info("IBD block accepted", "component", "p2p",
+		"hash", blockHash.ReverseString(), "height", height, "addr", peer.Addr())
+}
+
+// drainIBDQueue processes all remaining blocks in the IBD queue.
+func (m *Manager) drainIBDQueue() {
+	for {
+		select {
+		case item := <-m.ibdBlockQueue:
+			m.processIBDBlock(item)
+		default:
+			return
+		}
+	}
+}
+
 // --- Sync ---
 
 func (m *Manager) syncLoop(ctx context.Context) {
+	const syncPeerTimeout = 30 * time.Second
+	wasIBD := false
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			if wasIBD {
+				m.chain.SetIBDMode(false)
+			}
 			return
 		case <-ticker.C:
 			_, ourHeight := m.chain.Tip()
 
+			isIBD := m.IsSyncing()
+			if isIBD && !wasIBD {
+				m.chain.SetIBDMode(true)
+				logging.L.Info("entering IBD mode", "component", "p2p", "height", ourHeight)
+			} else if !isIBD && wasIBD {
+				m.drainIBDQueue()
+				m.chain.SetIBDMode(false)
+				logging.L.Info("exiting IBD mode", "component", "p2p", "height", ourHeight)
+			}
+			wasIBD = isIBD
+
 			m.mu.RLock()
-			var syncPeer *Peer
+			var bestPeer *Peer
 			var bestHeight uint32
+			var candidates []*Peer
 			for _, p := range m.peers {
 				ph := p.BestHeight()
+				if ph > ourHeight {
+					candidates = append(candidates, p)
+				}
 				if ph > bestHeight {
 					bestHeight = ph
-					syncPeer = p
+					bestPeer = p
 				}
 			}
 			m.mu.RUnlock()
 
+			syncPeer := bestPeer
+
 			if syncPeer != nil && bestHeight > ourHeight {
+				m.syncPeerAddrMu.Lock()
+				currentAddr := m.syncPeerAddr
+				if currentAddr == syncPeer.Addr() &&
+					!m.syncPeerSince.IsZero() &&
+					time.Since(m.syncPeerSince) > syncPeerTimeout &&
+					ourHeight == m.lastSyncHeight {
+
+					var alt *Peer
+					others := make([]*Peer, 0, len(candidates))
+					for _, c := range candidates {
+						if c.Addr() != currentAddr {
+							others = append(others, c)
+						}
+					}
+					if len(others) > 0 {
+						shufflePeers(others)
+						alt = others[0]
+					}
+					if alt != nil {
+						logging.L.Warn("rotating sync peer due to timeout with no progress",
+							"component", "p2p",
+							"old_peer", currentAddr,
+							"new_peer", alt.Addr(),
+							"height", ourHeight)
+						syncPeer = alt
+					}
+				}
+
+				m.syncPeerAddr = syncPeer.Addr()
+				if currentAddr != syncPeer.Addr() || ourHeight != m.lastSyncHeight {
+					m.syncPeerSince = time.Now()
+					m.lastSyncHeight = ourHeight
+				}
+				m.syncPeerAddrMu.Unlock()
+
 				if logging.DebugMode {
 					logging.L.Debug("[dbg] syncLoop: behind, requesting blocks",
 						"our_height", ourHeight,
@@ -1647,20 +2099,41 @@ func (m *Manager) syncLoop(ctx context.Context) {
 						"sync_peer", syncPeer.Addr())
 				}
 				m.requestBlocks(syncPeer)
+			} else {
+				m.syncPeerAddrMu.Lock()
+				m.syncPeerAddr = ""
+				m.syncPeerSince = time.Time{}
+				m.lastSyncHeight = 0
+				m.syncPeerAddrMu.Unlock()
+
+				if m.chain.IsTipStale() {
+					logging.L.Warn("chain tip appears stale, requesting blocks from all peers",
+						"component", "p2p", "height", ourHeight)
+					m.mu.RLock()
+					allPeers := make([]*Peer, 0, len(m.peers))
+					for _, p := range m.peers {
+						allPeers = append(allPeers, p)
+					}
+					m.mu.RUnlock()
+					for _, p := range allPeers {
+						m.requestBlocks(p)
+					}
+				}
 			}
 		}
 	}
 }
 
 func (m *Manager) requestBlocks(peer *Peer) {
-	m.lastSyncReqMu.Lock()
-	if time.Since(m.lastSyncReq) < 500*time.Millisecond {
-		m.lastSyncReqMu.Unlock()
-		logging.L.Debug("requestBlocks throttled", "component", "p2p", "peer", peer.Addr())
+	addr := peer.Addr()
+	m.lastSyncReqPerPeerMu.Lock()
+	if !m.IsSyncing() && time.Since(m.lastSyncReqPerPeer[addr]) < 500*time.Millisecond {
+		m.lastSyncReqPerPeerMu.Unlock()
+		logging.L.Debug("requestBlocks throttled", "component", "p2p", "peer", addr)
 		return
 	}
-	m.lastSyncReq = time.Now()
-	m.lastSyncReqMu.Unlock()
+	m.lastSyncReqPerPeer[addr] = time.Now()
+	m.lastSyncReqPerPeerMu.Unlock()
 
 	locator := m.chain.BlockLocator()
 	if len(locator) == 0 {
@@ -1718,4 +2191,97 @@ func (m *Manager) requestBlocks(peer *Peer) {
 		}
 	}
 	logging.L.Warn("all peer queues full, could not send getblocks", "component", "p2p")
+}
+
+// requestOrphanParent sends a targeted getdata for a specific block hash to
+// the given peer. This is used when an orphan block is received — rather than
+// only doing a broad getblocks sync, we directly ask the source peer for the
+// missing parent block. Matches Bitcoin Core's approach of requesting missing
+// parents from the peer that provided the orphan.
+func (m *Manager) requestOrphanParent(peer *Peer, parentHash types.Hash) {
+	getData := protocol.GetDataMsg{
+		Inventory: []protocol.InvVector{
+			{Type: protocol.InvTypeBlock, Hash: parentHash},
+		},
+	}
+	var buf bytes.Buffer
+	getData.Encode(&buf)
+
+	if peer.TrySendMessage(protocol.CmdGetData, buf.Bytes()) {
+		logging.L.Info("requested orphan parent from peer", "component", "p2p",
+			"parent", parentHash.ReverseString(),
+			"peer", peer.Addr())
+		return
+	}
+
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] requestOrphanParent: peer queue full, trying others",
+			"parent", parentHash.ReverseString()[:16],
+			"peer", peer.Addr())
+	}
+
+	m.mu.RLock()
+	candidates := make([]*Peer, 0, len(m.peers))
+	for _, p := range m.peers {
+		if p != peer {
+			candidates = append(candidates, p)
+		}
+	}
+	m.mu.RUnlock()
+	shufflePeers(candidates)
+	for _, p := range candidates {
+		if p.TrySendMessage(protocol.CmdGetData, buf.Bytes()) {
+			logging.L.Info("requested orphan parent from fallback peer", "component", "p2p",
+				"parent", parentHash.ReverseString(),
+				"peer", p.Addr())
+			return
+		}
+	}
+	logging.L.Warn("all peer queues full, could not request orphan parent", "component", "p2p",
+		"parent", parentHash.ReverseString())
+}
+
+// orphanEvictionLoop periodically sweeps expired orphans from the chain's
+// orphan pool. Without this, orphans only get evicted when a new orphan is
+// about to be added, which means stale orphans can sit in memory indefinitely
+// if no new orphans arrive.
+func (m *Manager) orphanEvictionLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			evicted := m.chain.EvictExpiredOrphans()
+			if evicted > 0 {
+				logging.L.Info("evicted expired orphans", "component", "p2p",
+					"evicted", evicted,
+					"remaining", m.chain.OrphanCount())
+			}
+		}
+	}
+}
+
+// mempoolExpiryLoop periodically sweeps transactions that have been in the
+// mempool longer than MempoolExpiry. Matches Bitcoin Core's periodic call to
+// CTxMemPool::Expire() which removes transactions older than -mempoolexpiry
+// (default 336 hours / 2 weeks).
+func (m *Manager) mempoolExpiryLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			expired := m.mempool.ExpireOldTxs()
+			if expired > 0 {
+				metrics.Global.TxsExpired.Add(uint64(expired))
+				logging.L.Info("expired mempool transactions", "component", "mempool",
+					"expired", expired,
+					"remaining", m.mempool.Count())
+			}
+		}
+	}
 }

@@ -11,9 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bams-repo/fairchain/internal/algorithms"
 	"github.com/bams-repo/fairchain/internal/chain"
+	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/config"
 	"github.com/bams-repo/fairchain/internal/consensus/pow"
+	"github.com/bams-repo/fairchain/internal/difficulty"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/logging"
 	"github.com/bams-repo/fairchain/internal/mempool"
@@ -31,7 +34,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "Path to config file (JSON)")
-	confPath := flag.String("conf", "", "Path to fairchain.conf (INI-style)")
+	confPath := flag.String("conf", "", "Path to "+coinparams.ConfFileName+" (INI-style)")
 	network := flag.String("network", "", "Override network (mainnet/testnet/regtest)")
 	dataDir := flag.String("datadir", "", "Override data directory")
 	listen := flag.String("listen", "", "Override P2P listen address (host:port)")
@@ -44,24 +47,27 @@ func main() {
 	connectPeers := flag.String("connect", "", "Connect ONLY to these peers (ip:port,ip:port) — disables all discovery")
 	noSeedNodes := flag.Bool("noseednode", false, "Suppress hardcoded seed nodes from chain params")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	logFormat := flag.String("log-format", "text", "Log format: text or json")
 	debugFlag := flag.Bool("debug", false, "Enable hyper-verbose debug output (block relay, peer topology, sync state)")
+	rpctlsCert := flag.String("rpctlscert", "", "Path to TLS certificate for RPC server (required for non-loopback binds)")
+	rpctlsKey := flag.String("rpctlskey", "", "Path to TLS key for RPC server (required for non-loopback binds)")
 	noRPCAuth := flag.Bool("norpcauth", false, "Disable RPC authentication (testing/regtest only)")
 	migrateFlag := flag.Bool("migrate", false, "Migrate legacy blocks.db to new format")
 	printVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
 	if *printVersion {
-		fmt.Printf("Fairchain Daemon version v%s\n", version.String())
+		fmt.Printf("%s Daemon version v%s\n", coinparams.Name, version.String())
 		os.Exit(0)
 	}
 
-	logging.Init(*logLevel)
+	logging.Init(*logLevel, *logFormat)
 	if *debugFlag {
 		logging.EnableDebug()
 	}
 	log := logging.L
 
-	// Load config: try fairchain.conf first, then JSON, then defaults.
+	// Load config: try INI conf first, then JSON, then defaults.
 	var cfg *config.Config
 	var err error
 
@@ -85,12 +91,12 @@ func main() {
 		}
 	} else {
 		cfg = config.DefaultConfig()
-		// Try loading fairchain.conf from default data dir if it exists.
+		// Try loading conf file from default data dir if it exists.
 		defaultConf := cfg.ConfFilePath()
 		if _, statErr := os.Stat(defaultConf); statErr == nil {
 			cfg, err = config.LoadConf(defaultConf, earlyNetwork)
 			if err != nil {
-				log.Warn("failed to load default fairchain.conf, using defaults", "error", err)
+				log.Warn("failed to load default "+coinparams.ConfFileName+", using defaults", "error", err)
 				cfg = config.DefaultConfig()
 			}
 		}
@@ -142,8 +148,21 @@ func main() {
 	}
 	cfg.DataDirName = params.DataDirName
 
+	// Resolve PoW hash algorithm from coinparams.
+	hasher, err := algorithms.GetHasher(coinparams.Algorithm)
+	if err != nil {
+		log.Error("unsupported PoW algorithm", "algo", coinparams.Algorithm, "error", err)
+		os.Exit(1)
+	}
+
+	// Resolve difficulty retargeting algorithm from coinparams.
+	retargeter, err := difficulty.GetRetargeter(coinparams.DifficultyAlgorithm)
+	if err != nil {
+		log.Error("unsupported difficulty algorithm", "algo", coinparams.DifficultyAlgorithm, "error", err)
+		os.Exit(1)
+	}
 	// Mine and set genesis for the network.
-	initNetworkGenesis(params)
+	initNetworkGenesis(params, hasher, retargeter)
 
 	// Ensure data directory tree exists.
 	if err := cfg.EnsureDataDir(); err != nil {
@@ -151,7 +170,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("starting fairchain node",
+	log.Info("starting "+coinparams.NameLower+" node",
 		"network", cfg.Network,
 		"datadir", cfg.NetworkDataDir(),
 		"blocks", cfg.BlocksDir(),
@@ -208,8 +227,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create consensus engine.
-	engine := pow.New()
+	// Create consensus engine with the resolved PoW hasher and difficulty retargeter.
+	engine := pow.New(hasher, retargeter)
 
 	// Network-adjusted clock (Bitcoin Core GetAdjustedTime parity).
 	adjClock := timeadjust.New()
@@ -227,8 +246,7 @@ func main() {
 	log.Info("chain initialized", "tip", tipHash.ReverseString(), "height", tipHeight)
 
 	// Create mempool with UTXO-aware validation.
-	mp := mempool.New(params, bc.UtxoSet())
-	mp.SetTipHeight(tipHeight)
+	mp := mempool.New(params, bc.UtxoSet(), func() uint32 { _, h := bc.Tip(); return h })
 
 	// Load persisted mempool if available.
 	if mempoolData, loadErr := os.ReadFile(cfg.MempoolPath()); loadErr == nil && len(mempoolData) > 0 {
@@ -284,15 +302,31 @@ func main() {
 			Password:   cfg.RPCPassword,
 			CookiePath: cfg.RPCCookiePath(),
 		}
+	} else {
+		rpcHost, _, _ := splitHostPort(cfg.RPCAddr)
+		if rpcHost != "127.0.0.1" && rpcHost != "::1" && rpcHost != "localhost" && rpcHost != "" {
+			log.Error("--norpcauth is only allowed when RPC is bound to loopback (127.0.0.1/::1/localhost)",
+				"rpcbind", rpcHost)
+			os.Exit(1)
+		}
 	}
-	rpcServer, err := rpc.New(cfg.RPCAddr, bc, mp, p2pMgr, params, rpcAuth)
+	var rpctlsCfg *rpc.TLSConfig
+	if *rpctlsCert != "" && *rpctlsKey != "" {
+		rpctlsCfg = &rpc.TLSConfig{
+			CertFile: *rpctlsCert,
+			KeyFile:  *rpctlsKey,
+		}
+	}
+	rpcServer, err := rpc.New(cfg.RPCAddr, bc, engine, mp, p2pMgr, params, rpcAuth, rpctlsCfg)
 	if err != nil {
 		cancel()
 		logging.L.Error("failed to create RPC server", "error", err)
 		os.Exit(1)
 	}
 	rpcServer.SetWallet(hdWallet)
+	rpcServer.SetDataDir(cfg.NetworkDataDir())
 	rpcServer.SetBroadcastTx(p2pMgr.BroadcastTx)
+	rpcServer.SetBroadcastBlock(p2pMgr.BroadcastBlock)
 	if err := rpcServer.Start(); err != nil {
 		cancel()
 		p2pMgr.Stop()
@@ -332,7 +366,6 @@ func main() {
 				}
 			}
 			mp.RemoveTxs(confirmedHashes)
-			mp.SetTipHeight(height)
 			blockHash := crypto.HashBlockHeader(&block.Header)
 			metrics.Global.BlocksMined.Add(1)
 			log.Info("mined block accepted", "hash", blockHash.ReverseString(), "height", height)
@@ -389,7 +422,7 @@ func main() {
 	log.Info("shutdown complete")
 }
 
-func initNetworkGenesis(p *fcparams.ChainParams) {
+func initNetworkGenesis(p *fcparams.ChainParams, hasher algorithms.Hasher, retargeter difficulty.Retargeter) {
 	if !p.GenesisHash.IsZero() {
 		computed := crypto.HashBlockHeader(&p.GenesisBlock.Header)
 		if computed != p.GenesisHash {
@@ -409,7 +442,7 @@ func initNetworkGenesis(p *fcparams.ChainParams) {
 
 	cfg := fcparams.GenesisConfig{
 		NetworkName:     p.Name,
-		CoinbaseMessage: []byte(fmt.Sprintf("fairchain %s genesis", p.Name)),
+		CoinbaseMessage: []byte(fmt.Sprintf("%s %s genesis", coinparams.NameLower, p.Name)),
 		Timestamp:       1773212462,
 		Bits:            p.InitialBits,
 		Version:         1,
@@ -418,7 +451,8 @@ func initNetworkGenesis(p *fcparams.ChainParams) {
 	}
 
 	block := fcparams.BuildGenesisBlock(cfg)
-	if err := pow.MineGenesis(&block); err != nil {
+	genesisEngine := pow.New(hasher, retargeter)
+	if err := genesisEngine.MineGenesis(&block); err != nil {
 		logging.L.Error("failed to mine genesis", "error", err)
 		os.Exit(1)
 	}

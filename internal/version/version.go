@@ -1,6 +1,10 @@
 package version
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/bams-repo/fairchain/internal/coinparams"
+)
 
 const (
 	// Major is the major version component (breaking protocol changes).
@@ -17,7 +21,7 @@ const (
 	ProtocolVersion uint32 = 1
 
 	// ClientName identifies this implementation.
-	ClientName = "fairchain"
+	ClientName = coinparams.NameLower
 )
 
 // String returns the semantic version string (e.g. "0.1.0").
@@ -27,5 +31,5 @@ func String() string {
 
 // UserAgent returns the BIP-style user agent (e.g. "/fairchain:0.1.0/").
 func UserAgent() string {
-	return fmt.Sprintf("/%s:%s/", ClientName, String())
+	return fmt.Sprintf("%s%s/", coinparams.UserAgentPrefix, String())
 }

@@ -1,6 +1,7 @@
+<!-- Branding values sourced from internal/coinparams/coinparams.go -->
 # Getting Started
 
-This guide covers building Fairchain from source, running your first node, and basic operations.
+This guide covers building go-chain from source, running your first node, and basic operations. The binary names below (`fairchaind`, `fairchain-cli`) reflect the default coin parameters — these change automatically when you rebrand via `coinparams.go`.
 
 ## Prerequisites
 
@@ -13,8 +14,8 @@ This guide covers building Fairchain from source, running your first node, and b
 Clone the repository and build:
 
 ```bash
-git clone https://github.com/bams-repo/fairchain.git
-cd fairchain
+git clone https://github.com/bams-repo/go-chain.git
+cd go-chain
 make build
 ```
 
@@ -34,7 +35,7 @@ make adversary    # Adversarial block generator (testing)
 
 ## Networks
 
-Fairchain supports three networks:
+go-chain supports three networks out of the box:
 
 | Network | Purpose | Block Time | Default P2P Port | Default RPC Port |
 |---------|---------|------------|-------------------|------------------|
@@ -117,7 +118,7 @@ Testnet has hardcoded seed nodes, so the node will automatically discover peers 
 
 ## Configuration Files
 
-Fairchain supports two config file formats. CLI flags always take priority over config file values.
+go-chain supports two config file formats. CLI flags always take priority over config file values.
 
 ### JSON format
 
@@ -263,7 +264,7 @@ For long-running deployments (e.g., testnet seed nodes), create a systemd unit:
 
 ```ini
 [Unit]
-Description=Fairchain Node
+Description=go-chain Node
 After=network.target
 
 [Service]

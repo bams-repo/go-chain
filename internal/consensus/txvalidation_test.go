@@ -17,13 +17,7 @@ func makeTestParams() *params.ChainParams {
 }
 
 func makeCoinbaseTx(height uint32, value uint64) types.Transaction {
-	// BIP34 format: [pushLen=0x04][height LE 4 bytes][tag]
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, height)
-	scriptSig := make([]byte, 0, 1+4+len("test"))
-	scriptSig = append(scriptSig, 0x04)
-	scriptSig = append(scriptSig, heightBytes...)
-	scriptSig = append(scriptSig, []byte("test")...)
+	scriptSig := bip34ScriptSig(height, "test")
 	return types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{{
@@ -41,9 +35,18 @@ func makeCoinbaseTx(height uint32, value uint64) types.Transaction {
 func bip34ScriptSig(height uint32, tag string) []byte {
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, height)
-	s := make([]byte, 0, 1+4+len(tag))
-	s = append(s, 0x04)
-	s = append(s, heightBytes...)
+	pushLen := 4
+	switch {
+	case height <= 0xFF:
+		pushLen = 1
+	case height <= 0xFFFF:
+		pushLen = 2
+	case height <= 0xFFFFFF:
+		pushLen = 3
+	}
+	s := make([]byte, 0, 1+pushLen+len(tag))
+	s = append(s, byte(pushLen))
+	s = append(s, heightBytes[:pushLen]...)
 	s = append(s, []byte(tag)...)
 	return s
 }
@@ -994,5 +997,313 @@ func TestSingleTxValidAccepted(t *testing.T) {
 	}
 	if fee != 500 {
 		t.Fatalf("expected fee=500, got %d", fee)
+	}
+}
+
+// --- LockTime / nSequence enforcement tests (T2-11) ---
+
+func TestCheckTransactionFinality_ZeroLockTime(t *testing.T) {
+	tx := &types.Transaction{
+		LockTime: 0,
+		Inputs:   []types.TxInput{{Sequence: 0}},
+	}
+	if err := CheckTransactionFinality(tx, 100, 1700000000); err != nil {
+		t.Fatalf("locktime 0 should always be final: %v", err)
+	}
+}
+
+func TestCheckTransactionFinality_AllSequencesFinal(t *testing.T) {
+	tx := &types.Transaction{
+		LockTime: 999999,
+		Inputs: []types.TxInput{
+			{Sequence: 0xFFFFFFFF},
+			{Sequence: 0xFFFFFFFF},
+		},
+	}
+	if err := CheckTransactionFinality(tx, 100, 1700000000); err != nil {
+		t.Fatalf("all-final sequences should override locktime: %v", err)
+	}
+}
+
+func TestCheckTransactionFinality_HeightLock_Satisfied(t *testing.T) {
+	tx := &types.Transaction{
+		LockTime: 50,
+		Inputs:   []types.TxInput{{Sequence: 0}},
+	}
+	if err := CheckTransactionFinality(tx, 51, 1700000000); err != nil {
+		t.Fatalf("height lock should be satisfied at height 51: %v", err)
+	}
+}
+
+func TestCheckTransactionFinality_HeightLock_NotSatisfied(t *testing.T) {
+	tx := &types.Transaction{
+		LockTime: 50,
+		Inputs:   []types.TxInput{{Sequence: 0}},
+	}
+	if err := CheckTransactionFinality(tx, 50, 1700000000); err == nil {
+		t.Fatal("height lock should NOT be satisfied at height 50 (need < 50)")
+	}
+}
+
+func TestCheckTransactionFinality_TimeLock_Satisfied(t *testing.T) {
+	tx := &types.Transaction{
+		LockTime: 500_000_001,
+		Inputs:   []types.TxInput{{Sequence: 0}},
+	}
+	if err := CheckTransactionFinality(tx, 100, 500_000_002); err != nil {
+		t.Fatalf("time lock should be satisfied: %v", err)
+	}
+}
+
+func TestCheckTransactionFinality_TimeLock_NotSatisfied(t *testing.T) {
+	tx := &types.Transaction{
+		LockTime: 500_000_100,
+		Inputs:   []types.TxInput{{Sequence: 0}},
+	}
+	if err := CheckTransactionFinality(tx, 100, 500_000_050); err == nil {
+		t.Fatal("time lock should NOT be satisfied when median time < locktime")
+	}
+}
+
+func TestCheckSequenceLocks_DisableFlag(t *testing.T) {
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 1000, 50, false, []byte{0x01})
+
+	tx := &types.Transaction{
+		Inputs: []types.TxInput{{
+			PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0},
+			Sequence:         SequenceLockTimeDisableFlag | 100, // disable flag set
+		}},
+	}
+	if err := CheckSequenceLocks(tx, 51, 0, s); err != nil {
+		t.Fatalf("disable flag should skip sequence lock check: %v", err)
+	}
+}
+
+func TestCheckSequenceLocks_BlockBased_Satisfied(t *testing.T) {
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 1000, 50, false, []byte{0x01})
+
+	tx := &types.Transaction{
+		Inputs: []types.TxInput{{
+			PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0},
+			Sequence:         10, // require 10 confirmations
+		}},
+	}
+	// UTXO at height 50, block at height 60 -> 10 confirmations
+	if err := CheckSequenceLocks(tx, 60, 0, s); err != nil {
+		t.Fatalf("sequence lock should be satisfied at height 60: %v", err)
+	}
+}
+
+func TestCheckSequenceLocks_BlockBased_NotSatisfied(t *testing.T) {
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 1000, 50, false, []byte{0x01})
+
+	tx := &types.Transaction{
+		Inputs: []types.TxInput{{
+			PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0},
+			Sequence:         10, // require 10 confirmations
+		}},
+	}
+	// UTXO at height 50, block at height 55 -> only 5 confirmations
+	if err := CheckSequenceLocks(tx, 55, 0, s); err == nil {
+		t.Fatal("sequence lock should NOT be satisfied at height 55 (need 10 confirmations)")
+	}
+}
+
+func TestLockTimeEnforced_InBlock_Gated(t *testing.T) {
+	p := makeTestParams()
+	p.ActivationHeights["locktime"] = 10
+	kp := newTestKeyPair(t)
+
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 5000, 0, false, kp.pkScript)
+
+	height := uint32(20)
+	subsidy := p.CalcSubsidy(height)
+
+	block := &types.Block{
+		Header: types.BlockHeader{Timestamp: 1700001200},
+		Transactions: []types.Transaction{
+			makeCoinbaseTx(height, subsidy+500),
+			{
+				Version:  1,
+				LockTime: 100, // lock until height 100 — not satisfied at height 20
+				Inputs: []types.TxInput{
+					{PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0}, Sequence: 0},
+				},
+				Outputs: []types.TxOutput{{Value: 4500, PkScript: []byte{0x01}}},
+			},
+		},
+	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
+
+	_, err := ValidateTransactionInputs(block, s, height, p)
+	if err == nil {
+		t.Fatal("expected rejection for unsatisfied locktime in block")
+	}
+}
+
+func TestLockTimeNotEnforced_BeforeActivation(t *testing.T) {
+	p := makeTestParams()
+	p.ActivationHeights["locktime"] = 100
+	kp := newTestKeyPair(t)
+
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 5000, 0, false, kp.pkScript)
+
+	height := uint32(20) // below activation height
+	subsidy := p.CalcSubsidy(height)
+
+	block := &types.Block{
+		Header: types.BlockHeader{Timestamp: 1700001200},
+		Transactions: []types.Transaction{
+			makeCoinbaseTx(height, subsidy+500),
+			{
+				Version:  1,
+				LockTime: 999, // not satisfied, but before activation
+				Inputs: []types.TxInput{
+					{PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0}, Sequence: 0},
+				},
+				Outputs: []types.TxOutput{{Value: 4500, PkScript: []byte{0x01}}},
+			},
+		},
+	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
+
+	_, err := ValidateTransactionInputs(block, s, height, p)
+	if err != nil {
+		t.Fatalf("locktime should not be enforced before activation: %v", err)
+	}
+}
+
+func TestSequenceLock_InBlock_Rejected(t *testing.T) {
+	p := makeTestParams()
+	p.ActivationHeights["locktime"] = 1
+	kp := newTestKeyPair(t)
+
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 5000, 50, false, kp.pkScript)
+
+	height := uint32(55) // only 5 confirmations
+	subsidy := p.CalcSubsidy(height)
+
+	block := &types.Block{
+		Header: types.BlockHeader{Timestamp: 1700001200},
+		Transactions: []types.Transaction{
+			makeCoinbaseTx(height, subsidy+500),
+			{
+				Version: 1,
+				Inputs: []types.TxInput{
+					{PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0}, Sequence: 10}, // need 10 confirmations
+				},
+				Outputs: []types.TxOutput{{Value: 4500, PkScript: []byte{0x01}}},
+			},
+		},
+	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
+
+	_, err := ValidateTransactionInputs(block, s, height, p)
+	if err == nil {
+		t.Fatal("expected rejection for unsatisfied relative locktime in block")
+	}
+}
+
+func TestSequenceLock_InBlock_Accepted(t *testing.T) {
+	p := makeTestParams()
+	p.ActivationHeights["locktime"] = 1
+	kp := newTestKeyPair(t)
+
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 5000, 50, false, kp.pkScript)
+
+	height := uint32(65) // 15 confirmations, need 10
+	subsidy := p.CalcSubsidy(height)
+
+	block := &types.Block{
+		Header: types.BlockHeader{Timestamp: 1700001200},
+		Transactions: []types.Transaction{
+			makeCoinbaseTx(height, subsidy+500),
+			{
+				Version: 1,
+				Inputs: []types.TxInput{
+					{PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0}, Sequence: 10},
+				},
+				Outputs: []types.TxOutput{{Value: 4500, PkScript: []byte{0x01}}},
+			},
+		},
+	}
+	signTxInput(t, &block.Transactions[1], 0, kp)
+
+	_, err := ValidateTransactionInputs(block, s, height, p)
+	if err != nil {
+		t.Fatalf("sequence lock should be satisfied at height 65: %v", err)
+	}
+}
+
+func TestLockTime_Mempool_Rejected(t *testing.T) {
+	p := makeTestParams()
+	p.ActivationHeights["locktime"] = 1
+	kp := newTestKeyPair(t)
+
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 5000, 0, false, kp.pkScript)
+
+	tx := &types.Transaction{
+		Version:  1,
+		LockTime: 100,
+		Inputs: []types.TxInput{
+			{PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0}, Sequence: 0},
+		},
+		Outputs: []types.TxOutput{{Value: 4500, PkScript: []byte{0x01}}},
+	}
+	signTxInput(t, tx, 0, kp)
+
+	_, err := ValidateSingleTransaction(tx, s, 10, p) // tipHeight=10, spendHeight=11
+	if err == nil {
+		t.Fatal("expected mempool rejection for unsatisfied locktime")
+	}
+}
+
+func TestLockTime_Mempool_Accepted(t *testing.T) {
+	p := makeTestParams()
+	p.ActivationHeights["locktime"] = 1
+	kp := newTestKeyPair(t)
+
+	s := utxo.NewSet()
+	var txHash1 types.Hash
+	txHash1[0] = 0x01
+	addUTXO(s, txHash1, 0, 5000, 0, false, kp.pkScript)
+
+	tx := &types.Transaction{
+		Version:  1,
+		LockTime: 10, // satisfied at spendHeight=101
+		Inputs: []types.TxInput{
+			{PreviousOutPoint: types.OutPoint{Hash: txHash1, Index: 0}, Sequence: 0},
+		},
+		Outputs: []types.TxOutput{{Value: 4500, PkScript: []byte{0x01}}},
+	}
+	signTxInput(t, tx, 0, kp)
+
+	_, err := ValidateSingleTransaction(tx, s, 100, p) // tipHeight=100, spendHeight=101
+	if err != nil {
+		t.Fatalf("locktime should be satisfied at height 101: %v", err)
 	}
 }

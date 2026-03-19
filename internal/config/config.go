@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+
+	"github.com/bams-repo/fairchain/internal/coinparams"
 )
 
 // Config holds all node configuration.
@@ -81,6 +85,8 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
+	warnInsecurePermissions(path)
+
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
@@ -94,10 +100,10 @@ func SaveConfig(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
-// LoadConf reads a fairchain.conf INI-style config file.
+// LoadConf reads an INI-style config file (e.g. fairchain.conf).
 // Supports network sections: [main], [test], [regtest].
 // Options use the same names as CLI flags (without --).
 // Priority: CLI > conf > defaults.
@@ -112,6 +118,8 @@ func LoadConf(path string, network string) (*Config, error) {
 		return nil, fmt.Errorf("open conf: %w", err)
 	}
 	defer f.Close()
+
+	warnInsecurePermissions(path)
 
 	sectionForNetwork := confSectionName(network)
 	currentSection := ""
@@ -242,9 +250,9 @@ func (c *Config) RPCCookiePath() string {
 	return filepath.Join(c.NetworkDataDir(), ".cookie")
 }
 
-// ConfFilePath returns the path to fairchain.conf in the data directory root.
+// ConfFilePath returns the path to the conf file in the data directory root.
 func (c *Config) ConfFilePath() string {
-	return filepath.Join(c.DataDir, "fairchain.conf")
+	return filepath.Join(c.DataDir, coinparams.ConfFileName)
 }
 
 // DBPath returns the legacy block database path (for migration detection).
@@ -282,7 +290,23 @@ func (c *Config) EnsureDataDir() error {
 func defaultDataDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ".fairchain"
+		return coinparams.DefaultDataDirName
 	}
-	return filepath.Join(home, ".fairchain")
+	return filepath.Join(home, coinparams.DefaultDataDirName)
+}
+
+// warnInsecurePermissions logs a warning if the config file is readable by
+// group or others, which could expose RPC credentials.
+func warnInsecurePermissions(path string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	mode := info.Mode().Perm()
+	if mode&0077 != 0 {
+		log.Printf("WARNING: config file %s has insecure permissions %04o — should be 0600 to protect RPC credentials", path, mode)
+	}
 }

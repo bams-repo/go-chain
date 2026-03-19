@@ -21,8 +21,9 @@ func init() {
 	}))
 }
 
-// Init replaces the global logger with one configured at the given level.
-func Init(level string) {
+// Init replaces the global logger with one configured at the given level and format.
+// format may be "text" (default) or "json" for structured JSON output.
+func Init(level string, format ...string) {
 	var lvl slog.Level
 	switch level {
 	case "debug":
@@ -35,9 +36,15 @@ func Init(level string) {
 		lvl = slog.LevelInfo
 	}
 
-	L = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: lvl,
-	}))
+	opts := &slog.HandlerOptions{Level: lvl}
+	var handler slog.Handler
+	if len(format) > 0 && format[0] == "json" {
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	}
+
+	L = slog.New(handler)
 	slog.SetDefault(L)
 }
 

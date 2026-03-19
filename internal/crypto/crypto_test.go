@@ -7,7 +7,7 @@ import (
 )
 
 func TestDoubleSHA256Deterministic(t *testing.T) {
-	data := []byte("fairchain test data")
+	data := []byte("deterministic hash test data")
 	h1 := DoubleSHA256(data)
 	h2 := DoubleSHA256(data)
 	if h1 != h2 {

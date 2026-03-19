@@ -1,6 +1,9 @@
+<!-- Branding values sourced from internal/coinparams/coinparams.go -->
 # RPC Commands
 
-Fairchain exposes an HTTP JSON API compatible with Bitcoin Core's RPC interface. Endpoints return JSON responses. State-changing endpoints (sending, signing, encryption, shutdown) require POST requests; read-only endpoints accept GET.
+go-chain exposes an HTTP JSON API compatible with Bitcoin Core's RPC interface. Endpoints return JSON responses. State-changing endpoints (sending, signing, encryption, shutdown) require POST requests; read-only endpoints accept GET.
+
+go-chain also supports **Bitcoin Core JSON-RPC 1.0 dispatch** at `POST /`, enabling direct compatibility with stratum mining pool software (ckpool, Braiins Pool, etc.) and any tool that speaks Bitcoin's JSON-RPC protocol. See [JSON-RPC 1.0 Dispatch](#json-rpc-10-dispatch-stratum-pool-compatibility) for details.
 
 ## Command Index
 
@@ -43,9 +46,20 @@ Fairchain exposes an HTTP JSON API compatible with Bitcoin Core's RPC interface.
 
 ### Mining
 
-| Command | Parameters | Description |
-|---------|------------|-------------|
-| [`submitblock`](#submitblock) | POST body | Submit a mined block |
+| Command | Parameters | Method | Description |
+|---------|------------|--------|-------------|
+| [`getblocktemplate`](#getblocktemplate) | `[template_request]` | GET/JSON-RPC | Block template for mining (BIP 22) |
+| [`submitblock`](#submitblock) | `<hex>` or binary | POST/JSON-RPC | Submit a mined block |
+| [`getmininginfo`](#getmininginfo) | — | GET/JSON-RPC | Mining-related information |
+| [`getnetworkhashps`](#getnetworkhashps) | `[nblocks] [height]` | GET/JSON-RPC | Estimated network hash rate |
+| [`preciousblock`](#preciousblock) | `<hash>` | JSON-RPC | Mark block as precious (no-op, ckpool compat) |
+
+### Raw Transactions
+
+| Command | Parameters | Method | Description |
+|---------|------------|--------|-------------|
+| [`getrawtransaction`](#getrawtransaction) | `<txid> [verbose]` | GET/JSON-RPC | Get raw transaction hex |
+| [`sendrawtransaction`](#sendrawtransaction) | `<hex>` | POST/JSON-RPC | Submit raw transaction |
 
 ### Wallet
 
@@ -82,7 +96,7 @@ Fairchain exposes an HTTP JSON API compatible with Bitcoin Core's RPC interface.
 | [`stop`](#stop) | — | POST | Shutdown daemon |
 | [`help`](#help) | — | CLI | List commands |
 
-### Fairchain-Specific
+### go-chain Extensions
 
 | Command | Parameters | Description |
 |---------|------------|-------------|
@@ -652,17 +666,127 @@ fairchain-cli gettxoutsetinfo
 
 ## Mining Commands
 
+### JSON-RPC 1.0 Dispatch (Stratum Pool Compatibility)
+
+go-chain supports Bitcoin Core's JSON-RPC 1.0 dispatch at `POST /`. This enables any standard stratum pool server (ckpool, Braiins Pool, etc.) to communicate with go-chain using the same protocol they use for Bitcoin Core.
+
+**Format:**
+
+```bash
+curl --user <rpcuser>:<rpcpassword> \
+  --data-binary '{"jsonrpc":"1.0","id":"curltest","method":"<method>","params":[...]}' \
+  -H 'content-type: text/plain;' \
+  http://127.0.0.1:19445/
+```
+
+**Response envelope:**
+
+```json
+{
+  "result": <method-specific result>,
+  "error": null,
+  "id": "curltest"
+}
+```
+
+On error, `result` is `null` and `error` contains `{"code": <int>, "message": "<string>"}`.
+
+All existing REST-style path endpoints (`/getblocktemplate`, `/submitblock`, etc.) continue to work alongside the JSON-RPC dispatcher.
+
+**Available JSON-RPC methods (stratum pool critical methods marked with *):**
+
+| Category | Methods |
+|----------|---------|
+| Mining* | `getblocktemplate`, `submitblock`, `getmininginfo`, `getnetworkhashps`, `preciousblock` |
+| Blockchain* | `getblockchaininfo`, `getblockcount`, `getbestblockhash`, `getblockhash`, `getblock`, `getdifficulty` |
+| Raw Tx* | `getrawtransaction`, `sendrawtransaction` |
+| Network | `getnetworkinfo`, `getpeerinfo`, `getconnectioncount` |
+| Mempool | `getmempoolinfo`, `getrawmempool` |
+| UTXO | `gettxout`, `gettxoutsetinfo` |
+| Wallet* | `validateaddress`, `getnewaddress`, `getbalance`, `getwalletinfo`, `listunspent`, `dumpprivkey`, `importprivkey`, `settxfee`, `sendtoaddress`, `getrawchangeaddress` |
+| Control | `getinfo`, `stop` |
+
+**ckpool compatibility:** All RPC methods that ckpool calls (`getblocktemplate`, `submitblock`, `getbestblockhash`, `getblockcount`, `getblockhash`, `validateaddress`, `getrawtransaction`, `preciousblock`, `sendrawtransaction`) are fully supported. The `validateaddress` response includes the `isscript` and `iswitness` fields that ckpool checks. The `submitblock` response returns `null` on success per BIP 22.
+
+---
+
+### getblocktemplate
+
+Returns data needed to construct a block for mining. Implements BIP 22/23.
+
+**REST:**
+
+```bash
+fairchain-cli getblocktemplate
+```
+
+**JSON-RPC:**
+
+```bash
+curl --user __cookie__:<pass> \
+  --data-binary '{"jsonrpc":"1.0","id":"gbt","method":"getblocktemplate","params":[]}' \
+  -H 'content-type: text/plain;' http://127.0.0.1:19445/
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | number | Block version (currently 1) |
+| `previousblockhash` | string | Hash of the current tip block (hex, reversed) |
+| `transactions` | array | Non-coinbase transactions to include |
+| `coinbaseaux` | object | Data for coinbase scriptSig (`{"flags": ""}`) |
+| `coinbasevalue` | number | Maximum coinbase value (subsidy + fees, in base units) |
+| `target` | string | 256-bit target hash (64-char hex) |
+| `bits` | string | Compact difficulty (8-char hex, e.g. `"1e07ffff"`) |
+| `height` | number | Height of the next block |
+| `curtime` | number | Recommended timestamp (UNIX epoch) |
+| `mintime` | number | Minimum allowed timestamp (median-time-past + 1) |
+| `mutable` | array | Mutable fields: `["time", "transactions/add", "prevblock", "coinbase/append"]` |
+| `noncerange` | string | Valid nonce range: `"00000000ffffffff"` |
+| `sigoplimit` | number | Maximum sigops per block |
+| `sizelimit` | number | Maximum block size in bytes |
+| `longpollid` | string | ID for long-poll updates |
+
+**Transaction entry fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `data` | string | Serialized transaction (hex) |
+| `txid` | string | Transaction ID (hex, reversed) |
+| `hash` | string | Transaction hash (hex, reversed) |
+| `fee` | number | Transaction fee (base units) |
+| `sigops` | number | SigOps count |
+| `weight` | number | Transaction weight |
+| `depends` | array | Dependency indices (empty for independent txs) |
+
+---
+
 ### submitblock
 
-Submits a new block to the network. Requires a POST request with the serialized block as the request body.
+Submits a new block to the network.
 
-This endpoint is not accessible via `fairchain-cli` — use `curl` or a direct HTTP client.
+**REST (hex-encoded):**
+
+```bash
+curl -s -X POST -d '<hex_block_data>' http://127.0.0.1:19445/submitblock
+```
+
+**REST (binary):**
 
 ```bash
 curl -s -X POST --data-binary @block.bin http://127.0.0.1:19445/submitblock
 ```
 
-**Response (accepted):**
+**JSON-RPC (Bitcoin Core compatible):**
+
+```bash
+curl --user __cookie__:<pass> \
+  --data-binary '{"jsonrpc":"1.0","id":"sb","method":"submitblock","params":["<hex_block_data>"]}' \
+  -H 'content-type: text/plain;' http://127.0.0.1:19445/
+```
+
+**REST Response (accepted):**
 
 ```json
 {
@@ -672,13 +796,131 @@ curl -s -X POST --data-binary @block.bin http://127.0.0.1:19445/submitblock
 }
 ```
 
-**Response (rejected):**
+**JSON-RPC Response:** Returns `null` on success. Returns a string reason on failure (e.g. `"high-hash"`, `"bad-prevblk"`). This matches Bitcoin Core's BIP 22 behavior.
 
-```json
-{
-  "error": "rejected: block validation failed: ..."
-}
+---
+
+### getmininginfo
+
+Returns mining-related information.
+
+**REST:**
+
+```bash
+fairchain-cli getmininginfo
 ```
+
+**JSON-RPC:**
+
+```bash
+curl --user __cookie__:<pass> \
+  --data-binary '{"jsonrpc":"1.0","id":"mi","method":"getmininginfo","params":[]}' \
+  -H 'content-type: text/plain;' http://127.0.0.1:19445/
+```
+
+**Response fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `blocks` | number | Current block height |
+| `difficulty` | number | Current PoW difficulty |
+| `networkhashps` | number | Estimated network hashes per second |
+| `pooledtx` | number | Number of transactions in the mempool |
+| `chain` | string | Network name (`"main"`, `"test"`, `"regtest"`) |
+| `warnings` | string | Any network warnings (empty string if none) |
+
+---
+
+### getnetworkhashps
+
+Returns the estimated network hashes per second based on the last N blocks.
+
+**REST:**
+
+```bash
+fairchain-cli getnetworkhashps
+fairchain-cli getnetworkhashps 120
+fairchain-cli getnetworkhashps 120 5000
+```
+
+**JSON-RPC:**
+
+```bash
+curl --user __cookie__:<pass> \
+  --data-binary '{"jsonrpc":"1.0","id":"nhps","method":"getnetworkhashps","params":[120, -1]}' \
+  -H 'content-type: text/plain;' http://127.0.0.1:19445/
+```
+
+**Parameters:**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | `nblocks` | number | 120 | Number of blocks to look back. -1 = since last difficulty change. |
+| 2 | `height` | number | -1 | Estimate at this height. -1 = current tip. |
+
+**Response:** A single number (hashes per second).
+
+---
+
+### preciousblock
+
+Marks a block as "precious", hinting the node should prefer it as the chain tip. This is a no-op in go-chain but the method must exist for ckpool compatibility (ckpool calls this after submitting a block).
+
+**JSON-RPC:**
+
+```bash
+curl --user __cookie__:<pass> \
+  --data-binary '{"jsonrpc":"1.0","id":"pb","method":"preciousblock","params":["<blockhash>"]}' \
+  -H 'content-type: text/plain;' http://127.0.0.1:19445/
+```
+
+**Response:** `null`
+
+---
+
+### getrawtransaction
+
+Returns the raw transaction data as a hex string. Checks the mempool first, then scans the UTXO set to locate the block containing the transaction.
+
+**REST:**
+
+```bash
+fairchain-cli getrawtransaction <txid>
+fairchain-cli getrawtransaction <txid> true
+```
+
+**JSON-RPC:**
+
+```bash
+curl --user __cookie__:<pass> \
+  --data-binary '{"jsonrpc":"1.0","id":"grt","method":"getrawtransaction","params":["<txid>"]}' \
+  -H 'content-type: text/plain;' http://127.0.0.1:19445/
+```
+
+**Parameters:**
+
+| # | Name | Type | Default | Description |
+|---|------|------|---------|-------------|
+| 1 | `txid` | string | required | Transaction ID (hex, reversed byte order) |
+| 2 | `verbose` | bool | false | If true, returns a JSON object instead of hex |
+
+**Response (non-verbose):** Hex-encoded raw transaction data.
+
+**Response (verbose):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `txid` | string | Transaction ID |
+| `hash` | string | Transaction hash |
+| `version` | number | Transaction version |
+| `size` | number | Serialized size in bytes |
+| `locktime` | number | Lock time |
+| `vin` | array | Transaction inputs |
+| `vout` | array | Transaction outputs |
+| `hex` | string | Raw hex data |
+| `confirmations` | number | Number of confirmations |
+| `blockhash` | string | Block hash (if confirmed) |
+| `blockheight` | number | Block height (if confirmed) |
 
 ---
 
@@ -768,7 +1010,7 @@ fairchain-cli getbalance [minconf]
 | Field | Type | Description |
 |-------|------|-------------|
 | `balance` | number | Balance in smallest units |
-| `balance_btc` | number | Balance in whole coins |
+| `balance_fair` | number | Balance in whole coins |
 
 ---
 
@@ -794,7 +1036,7 @@ fairchain-cli listunspent [minconf] [maxconf]
 | `address` | string | Receiving address |
 | `scriptPubKey` | string | Locking script (hex) |
 | `amount` | number | Value in smallest units |
-| `amount_btc` | number | Value in whole coins |
+| `amount_fair` | number | Value in whole coins |
 | `confirmations` | number | Number of confirmations |
 | `spendable` | boolean | Whether the output is spendable |
 
@@ -842,7 +1084,7 @@ fairchain-cli listtransactions [count]
 | `address` | string | Address |
 | `category` | string | `receive`, `generate` (mature coinbase), or `immature` (immature coinbase) |
 | `amount` | number | Value in smallest units |
-| `amount_btc` | number | Value in whole coins |
+| `amount_fair` | number | Value in whole coins |
 | `confirmations` | number | Number of confirmations |
 | `blockheight` | number | Block height the transaction was included in |
 
@@ -863,7 +1105,7 @@ fairchain-cli getwalletinfo
 | `walletname` | string | Wallet name (always `"default"`) |
 | `walletversion` | number | Wallet format version |
 | `balance` | number | Confirmed balance (smallest units) |
-| `balance_btc` | number | Confirmed balance (whole coins) |
+| `balance_fair` | number | Confirmed balance (whole coins) |
 | `unconfirmed_balance` | number | Unconfirmed balance |
 | `txcount` | number | Transaction count |
 | `keypoolsize` | number | Number of derived keys |
@@ -1037,7 +1279,7 @@ fairchain-cli getreceivedbyaddress <address> [minconf]
 | Field | Type | Description |
 |-------|------|-------------|
 | `amount` | number | Total received (smallest units) |
-| `amount_btc` | number | Total received (whole coins) |
+| `amount_fair` | number | Total received (whole coins) |
 
 ---
 
@@ -1049,7 +1291,7 @@ Returns all addresses in the wallet grouped with their balances.
 fairchain-cli listaddressgroupings
 ```
 
-**Response:** array of address groupings, each containing [address, balance, balance_btc].
+**Response:** array of address groupings, each containing [address, balance, balance_fair].
 
 ---
 
@@ -1193,13 +1435,13 @@ fairchain-cli walletlock
 
 ---
 
-## Fairchain-Specific Commands
+## go-chain Extension Commands
 
 These endpoints are not part of Bitcoin Core's RPC interface.
 
 ### getchainstatus
 
-Returns Fairchain-specific chain status including difficulty retarget information.
+Returns chain status including difficulty retarget information.
 
 ```bash
 fairchain-cli getchainstatus

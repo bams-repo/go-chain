@@ -5,10 +5,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/types"
 	"github.com/bams-repo/fairchain/internal/utxo"
@@ -90,7 +92,7 @@ func requirePOST(w http.ResponseWriter, r *http.Request) bool {
 // --- Bitcoin Core parity: wallet RPCs ---
 
 func (s *Server) handleGetNewAddress(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
 	addr, err := s.wallet.GetNewAddress()
@@ -102,7 +104,7 @@ func (s *Server) handleGetNewAddress(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRawChangeAddress(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
 	addr, err := s.wallet.GetChangeAddress()
@@ -114,10 +116,10 @@ func (s *Server) handleGetRawChangeAddress(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleGetBalance(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	minConfStr := r.URL.Query().Get("minconf")
+	minConfStr := r.PostFormValue("minconf")
 	minConf := uint32(1)
 	if minConfStr != "" {
 		val, err := strconv.ParseUint(minConfStr, 10, 32)
@@ -135,17 +137,17 @@ func (s *Server) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	)
 
 	writeJSON(w, map[string]interface{}{
-		"balance":     balance,
-		"balance_btc": float64(balance) / 1e8,
+		"balance":                                balance,
+		"balance_" + coinparams.DisplayUnitName: float64(balance) / coinparams.CoinsPerBaseUnit,
 	})
 }
 
 func (s *Server) handleListUnspent(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	minConfStr := r.URL.Query().Get("minconf")
-	maxConfStr := r.URL.Query().Get("maxconf")
+	minConfStr := r.PostFormValue("minconf")
+	maxConfStr := r.PostFormValue("maxconf")
 	minConf := uint32(1)
 	maxConf := uint32(9999999)
 	if minConfStr != "" {
@@ -171,14 +173,14 @@ func (s *Server) handleListUnspent(w http.ResponseWriter, r *http.Request) {
 		}
 		txHashType := types.Hash(u.TxHash)
 		results = append(results, map[string]interface{}{
-			"txid":          txHashType.ReverseString(),
-			"vout":          u.Index,
-			"address":       u.Address,
-			"scriptPubKey":  hex.EncodeToString(u.PkScript),
-			"amount":        u.Value,
-			"amount_btc":    float64(u.Value) / 1e8,
-			"confirmations": u.Confirmations,
-			"spendable":     true,
+			"txid":                                  txHashType.ReverseString(),
+			"vout":                                  u.Index,
+			"address":                               u.Address,
+			"scriptPubKey":                          hex.EncodeToString(u.PkScript),
+			"amount":                                u.Value,
+			"amount_" + coinparams.DisplayUnitName: float64(u.Value) / coinparams.CoinsPerBaseUnit,
+			"confirmations":                         u.Confirmations,
+			"spendable":                             true,
 		})
 	}
 
@@ -196,8 +198,8 @@ func (s *Server) handleSendToAddress(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	address := r.URL.Query().Get("address")
-	amountStr := r.URL.Query().Get("amount")
+	address := r.PostFormValue("address")
+	amountStr := r.PostFormValue("amount")
 	if address == "" || amountStr == "" {
 		writeError(w, http.StatusBadRequest, "missing address or amount parameter")
 		return
@@ -214,7 +216,7 @@ func (s *Server) handleSendToAddress(w http.ResponseWriter, r *http.Request) {
 
 	tx, err := s.wallet.BuildTransaction(
 		wallet.SendRequest{ToAddress: address, Amount: amount},
-		s.feePerByte,
+		s.feePerByte.Load(),
 		utxos,
 		s.params.CoinbaseMaturity,
 		tipHeight,
@@ -237,7 +239,7 @@ func (s *Server) handleSendRawTransaction(w http.ResponseWriter, r *http.Request
 	if !requirePOST(w, r) {
 		return
 	}
-	hexStr := r.URL.Query().Get("hexstring")
+	hexStr := r.PostFormValue("hexstring")
 	if hexStr == "" {
 		writeError(w, http.StatusBadRequest, "missing hexstring parameter")
 		return
@@ -265,7 +267,7 @@ func (s *Server) handleSendRawTransaction(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleGetWalletInfo(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
 	_, tipHeight := s.chain.Tip()
@@ -283,14 +285,14 @@ func (s *Server) handleGetWalletInfo(w http.ResponseWriter, r *http.Request) {
 	)
 
 	resp := map[string]interface{}{
-		"walletname":           "default",
-		"walletversion":        1,
-		"balance":              balance,
-		"balance_btc":          float64(balance) / 1e8,
-		"unconfirmed_balance":  unconfirmed - balance,
+		"walletname":                              "default",
+		"walletversion":                           1,
+		"balance":                                 balance,
+		"balance_" + coinparams.DisplayUnitName:  float64(balance) / coinparams.CoinsPerBaseUnit,
+		"unconfirmed_balance":                     unconfirmed - balance,
 		"txcount":              0,
 		"keypoolsize":          s.wallet.KeyCount(),
-		"paytxfee":             s.feePerByte,
+		"paytxfee":             s.feePerByte.Load(),
 		"hdseedid":             s.wallet.GetDefaultAddress(),
 		"private_keys_enabled": true,
 		"unlocked_until":       0,
@@ -306,10 +308,10 @@ func (s *Server) handleGetWalletInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDumpPrivKey(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	address := r.URL.Query().Get("address")
+	address := r.PostFormValue("address")
 	if address == "" {
 		writeError(w, http.StatusBadRequest, "missing address parameter")
 		return
@@ -326,7 +328,11 @@ func (s *Server) handleImportPrivKey(w http.ResponseWriter, r *http.Request) {
 	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	privKeyHex := r.URL.Query().Get("privkey")
+	if err := s.wallet.RequireUnlocked(); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	privKeyHex := r.PostFormValue("privkey")
 	if privKeyHex == "" {
 		writeError(w, http.StatusBadRequest, "missing privkey parameter")
 		return
@@ -342,10 +348,10 @@ func (s *Server) handleImportPrivKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListTransactions(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	countStr := r.URL.Query().Get("count")
+	countStr := r.PostFormValue("count")
 	count := 10
 	if countStr != "" {
 		val, err := strconv.Atoi(countStr)
@@ -369,14 +375,14 @@ func (s *Server) handleListTransactions(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		results = append(results, map[string]interface{}{
-			"address":       u.Address,
-			"category":      category,
-			"amount":        u.Value,
-			"amount_btc":    float64(u.Value) / 1e8,
-			"confirmations": u.Confirmations,
-			"txid":          txHashType.ReverseString(),
-			"vout":          u.Index,
-			"blockheight":   u.Height,
+			"address":                                u.Address,
+			"category":                               category,
+			"amount":                                 u.Value,
+			"amount_" + coinparams.DisplayUnitName:  float64(u.Value) / coinparams.CoinsPerBaseUnit,
+			"confirmations":                          u.Confirmations,
+			"txid":                                   txHashType.ReverseString(),
+			"vout":                                   u.Index,
+			"blockheight":                            u.Height,
 		})
 	}
 
@@ -397,7 +403,7 @@ func (s *Server) handleSignRawTransactionWithWallet(w http.ResponseWriter, r *ht
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	hexStr := r.URL.Query().Get("hexstring")
+	hexStr := r.PostFormValue("hexstring")
 	if hexStr == "" {
 		writeError(w, http.StatusBadRequest, "missing hexstring parameter")
 		return
@@ -443,7 +449,10 @@ func (s *Server) handleSignRawTransactionWithWallet(w http.ResponseWriter, r *ht
 }
 
 func (s *Server) handleGetReceivedByAddress(w http.ResponseWriter, r *http.Request) {
-	address := r.URL.Query().Get("address")
+	if !requirePOST(w, r) {
+		return
+	}
+	address := r.PostFormValue("address")
 	if address == "" {
 		writeError(w, http.StatusBadRequest, "missing address parameter")
 		return
@@ -456,7 +465,7 @@ func (s *Server) handleGetReceivedByAddress(w http.ResponseWriter, r *http.Reque
 	}
 	destScript := crypto.MakeP2PKHScript(destPKH)
 
-	minConfStr := r.URL.Query().Get("minconf")
+	minConfStr := r.PostFormValue("minconf")
 	minConf := uint32(1)
 	if minConfStr != "" {
 		val, parseErr := strconv.ParseUint(minConfStr, 10, 32)
@@ -483,13 +492,13 @@ func (s *Server) handleGetReceivedByAddress(w http.ResponseWriter, r *http.Reque
 	})
 
 	writeJSON(w, map[string]interface{}{
-		"amount":     total,
-		"amount_btc": float64(total) / 1e8,
+		"amount":                                total,
+		"amount_" + coinparams.DisplayUnitName: float64(total) / coinparams.CoinsPerBaseUnit,
 	})
 }
 
 func (s *Server) handleListAddressGroupings(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
 	_, tipHeight := s.chain.Tip()
@@ -515,7 +524,7 @@ func (s *Server) handleListAddressGroupings(w http.ResponseWriter, r *http.Reque
 				balance += entry.Value
 			}
 		})
-		grouping = append(grouping, []interface{}{addr, balance, float64(balance) / 1e8})
+		grouping = append(grouping, []interface{}{addr, balance, float64(balance) / coinparams.CoinsPerBaseUnit})
 	}
 
 	if grouping == nil {
@@ -525,34 +534,42 @@ func (s *Server) handleListAddressGroupings(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) handleBackupWallet(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	dest := r.URL.Query().Get("destination")
+	dest := r.PostFormValue("destination")
 	if dest == "" {
 		writeError(w, http.StatusBadRequest, "missing destination parameter")
 		return
 	}
-	// Sanitize: reject path traversal and absolute paths to prevent arbitrary
-	// file writes. Backups must be relative paths without ".." components.
-	if filepath.IsAbs(dest) {
-		writeError(w, http.StatusBadRequest, "absolute paths not allowed; use a relative path")
+	// Extract only the base filename — all backups are written to a dedicated
+	// <datadir>/backups/ subdirectory to prevent arbitrary file overwrites.
+	filename := filepath.Base(filepath.Clean(dest))
+	if filename == "." || filename == string(filepath.Separator) {
+		writeError(w, http.StatusBadRequest, "invalid backup filename")
 		return
 	}
-	cleaned := filepath.Clean(dest)
-	if strings.HasPrefix(cleaned, "..") || strings.Contains(cleaned, string(filepath.Separator)+"..") {
+	if strings.Contains(filename, "..") {
 		writeError(w, http.StatusBadRequest, "path traversal not allowed")
 		return
 	}
-	if err := s.wallet.BackupWallet(cleaned); err != nil {
+	backupDir := filepath.Join(s.dataDir, "backups")
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("create backup dir: %v", err))
+		return
+	}
+	fullPath := filepath.Join(backupDir, filename)
+	if err := s.wallet.BackupWallet(fullPath); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("backup failed: %v", err))
 		return
 	}
-	writeJSON(w, true)
+	writeJSON(w, map[string]interface{}{
+		"filename": filename,
+	})
 }
 
 func (s *Server) handleGetAddressesByLabel(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
 	result := make(map[string]interface{})
@@ -565,7 +582,7 @@ func (s *Server) handleGetAddressesByLabel(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleValidateAddress(w http.ResponseWriter, r *http.Request) {
-	address := r.URL.Query().Get("address")
+	address := r.PostFormValue("address")
 	if address == "" {
 		writeError(w, http.StatusBadRequest, "missing address parameter")
 		return
@@ -593,6 +610,7 @@ func (s *Server) handleValidateAddress(w http.ResponseWriter, r *http.Request) {
 		"ismine":       isMine,
 		"iswatchonly":  false,
 		"isscript":     false,
+		"iswitness":    false,
 		"version":      ver,
 	})
 }
@@ -605,7 +623,7 @@ func (s *Server) handleSetTxFee(w http.ResponseWriter, r *http.Request) {
 	if !requirePOST(w, r) {
 		return
 	}
-	feeStr := r.URL.Query().Get("amount")
+	feeStr := r.PostFormValue("amount")
 	if feeStr == "" {
 		writeError(w, http.StatusBadRequest, "missing amount parameter")
 		return
@@ -619,12 +637,12 @@ func (s *Server) handleSetTxFee(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("fee rate %d exceeds maximum %d sat/byte", fee, maxFeePerByte))
 		return
 	}
-	s.feePerByte = fee
+	s.feePerByte.Store(fee)
 	writeJSON(w, true)
 }
 
 func (s *Server) handleDumpWallet(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
 	if err := s.wallet.RequireUnlocked(); err != nil {
@@ -640,7 +658,10 @@ func (s *Server) handleDumpWallet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetTransaction(w http.ResponseWriter, r *http.Request) {
-	txidStr := r.URL.Query().Get("txid")
+	if !requirePOST(w, r) {
+		return
+	}
+	txidStr := r.PostFormValue("txid")
 	if txidStr == "" {
 		writeError(w, http.StatusBadRequest, "missing txid parameter")
 		return
@@ -725,7 +746,7 @@ func (s *Server) handleEncryptWallet(w http.ResponseWriter, r *http.Request) {
 	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	passphrase := r.URL.Query().Get("passphrase")
+	passphrase := r.PostFormValue("passphrase")
 	if passphrase == "" {
 		writeError(w, http.StatusBadRequest, "missing passphrase parameter")
 		return
@@ -741,8 +762,8 @@ func (s *Server) handleWalletPassphrase(w http.ResponseWriter, r *http.Request) 
 	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
-	passphrase := r.URL.Query().Get("passphrase")
-	timeoutStr := r.URL.Query().Get("timeout")
+	passphrase := r.PostFormValue("passphrase")
+	timeoutStr := r.PostFormValue("timeout")
 	if passphrase == "" {
 		writeError(w, http.StatusBadRequest, "missing passphrase parameter")
 		return
@@ -762,7 +783,7 @@ func (s *Server) handleWalletPassphrase(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleWalletLock(w http.ResponseWriter, r *http.Request) {
-	if !s.requireWallet(w) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
 		return
 	}
 	if err := s.wallet.WalletLock(); err != nil {

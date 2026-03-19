@@ -84,7 +84,7 @@ func (cs *ChainstateDB) GetBestBlock() (types.Hash, error) {
 
 // PutBestBlock stores the best block hash.
 func (cs *ChainstateDB) PutBestBlock(hash types.Hash) error {
-	return cs.db.Put(keyBestBlock, hash[:], nil)
+	return cs.db.Put(keyBestBlock, hash[:], &opt.WriteOptions{Sync: true})
 }
 
 // ChainstateWriteBatch accumulates UTXO changes for atomic application.
@@ -112,9 +112,15 @@ func (wb *ChainstateWriteBatch) PutBestBlock(hash types.Hash) {
 	wb.batch.Put(keyBestBlock, hash[:])
 }
 
-// Flush atomically applies all batched operations.
+// Flush atomically applies all batched operations with synchronous writes.
 func (cs *ChainstateDB) Flush(wb *ChainstateWriteBatch) error {
 	return cs.db.Write(wb.batch, &opt.WriteOptions{Sync: true})
+}
+
+// FlushNoSync atomically applies all batched operations without fsync.
+// Used during IBD where periodic checkpoints provide crash safety.
+func (cs *ChainstateDB) FlushNoSync(wb *ChainstateWriteBatch) error {
+	return cs.db.Write(wb.batch, &opt.WriteOptions{Sync: false})
 }
 
 // ForEachUtxo iterates over all UTXO entries in the chainstate, calling fn

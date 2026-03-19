@@ -143,6 +143,17 @@ func (bi *BlockIndex) PutBlockIndex(hash types.Hash, rec *DiskBlockIndex) error 
 	return bi.db.Put(blockIndexKey(hash), rec.Serialize(), &opt.WriteOptions{Sync: true})
 }
 
+// PutBlockIndexBatch stores a DiskBlockIndex record without synchronous writes.
+// Used during IBD where periodic checkpoints provide crash safety.
+func (bi *BlockIndex) PutBlockIndexBatch(hash types.Hash, rec *DiskBlockIndex) error {
+	return bi.db.Put(blockIndexKey(hash), rec.Serialize(), &opt.WriteOptions{Sync: false})
+}
+
+// FlushIndex forces a WAL flush by writing a no-op compaction hint.
+func (bi *BlockIndex) FlushIndex() error {
+	return bi.db.CompactRange(util.Range{Start: prefixBlock, Limit: nil})
+}
+
 // GetBlockIndex retrieves a DiskBlockIndex record by block hash.
 func (bi *BlockIndex) GetBlockIndex(hash types.Hash) (*DiskBlockIndex, error) {
 	data, err := bi.db.Get(blockIndexKey(hash), nil)
@@ -155,6 +166,13 @@ func (bi *BlockIndex) GetBlockIndex(hash types.Hash) (*DiskBlockIndex, error) {
 // HasBlock checks if a block hash exists in the index.
 func (bi *BlockIndex) HasBlock(hash types.Hash) (bool, error) {
 	return bi.db.Has(blockIndexKey(hash), nil)
+}
+
+// DeleteBlockIndex removes a block index entry. Used to clean up entries for
+// blocks that failed validation after being tentatively written (e.g. a reorg
+// candidate whose transaction inputs turned out to be invalid).
+func (bi *BlockIndex) DeleteBlockIndex(hash types.Hash) error {
+	return bi.db.Delete(blockIndexKey(hash), &opt.WriteOptions{Sync: true})
 }
 
 // PutLastFile stores the last block file number.

@@ -4,10 +4,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bams-repo/fairchain/internal/algorithms/sha256d"
 	"github.com/bams-repo/fairchain/internal/crypto"
+	bitcoindiff "github.com/bams-repo/fairchain/internal/difficulty/bitcoin"
 	fcparams "github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/types"
 )
+
+func testHasher() *sha256d.Hasher    { return sha256d.New() }
+func testRetargeter() *bitcoindiff.Retargeter { return bitcoindiff.New() }
 
 func TestMineGenesisRegtest(t *testing.T) {
 	cfg := fcparams.GenesisConfig{
@@ -20,24 +25,26 @@ func TestMineGenesisRegtest(t *testing.T) {
 		RewardScript:    []byte{0x00},
 	}
 
+	engine := New(testHasher(), testRetargeter())
+
 	block := fcparams.BuildGenesisBlock(cfg)
-	if err := MineGenesis(&block); err != nil {
+	if err := engine.MineGenesis(&block); err != nil {
 		t.Fatalf("MineGenesis: %v", err)
 	}
 
-	hash := crypto.HashBlockHeader(&block.Header)
+	powHash := testHasher().PoWHash(block.Header.SerializeToBytes())
 	target := crypto.CompactToHash(block.Header.Bits)
-	if !hash.LessOrEqual(target) {
-		t.Fatal("mined genesis hash does not meet target")
+	if !powHash.LessOrEqual(target) {
+		t.Fatal("mined genesis PoW hash does not meet target")
 	}
 
-	// Verify reproducibility: mine again with same inputs.
 	block2 := fcparams.BuildGenesisBlock(cfg)
-	if err := MineGenesis(&block2); err != nil {
+	if err := engine.MineGenesis(&block2); err != nil {
 		t.Fatalf("MineGenesis2: %v", err)
 	}
 
 	hash2 := crypto.HashBlockHeader(&block2.Header)
+	hash := crypto.HashBlockHeader(&block.Header)
 	if hash != hash2 {
 		t.Fatalf("genesis mining not reproducible: %s != %s", hash, hash2)
 	}
@@ -47,7 +54,7 @@ func TestMineGenesisRegtest(t *testing.T) {
 }
 
 func TestSealHeader(t *testing.T) {
-	engine := New()
+	engine := New(testHasher(), testRetargeter())
 	header := types.BlockHeader{
 		Version:   1,
 		Timestamp: 1700000000,
@@ -64,14 +71,14 @@ func TestSealHeader(t *testing.T) {
 		t.Fatal("SealHeader should find a solution with easy difficulty")
 	}
 
-	hash := crypto.HashBlockHeader(&header)
-	if !hash.LessOrEqual(target) {
-		t.Fatal("sealed header hash does not meet target")
+	powHash := testHasher().PoWHash(header.SerializeToBytes())
+	if !powHash.LessOrEqual(target) {
+		t.Fatal("sealed header PoW hash does not meet target")
 	}
 }
 
 func TestCalcNextBitsNoRetarget(t *testing.T) {
-	engine := New()
+	engine := New(testHasher(), testRetargeter())
 	p := fcparams.Regtest
 
 	tip := &types.BlockHeader{Bits: p.InitialBits, Timestamp: 1700000000}
@@ -82,7 +89,7 @@ func TestCalcNextBitsNoRetarget(t *testing.T) {
 }
 
 func TestCalcNextBitsRetarget(t *testing.T) {
-	engine := New()
+	engine := New(testHasher(), testRetargeter())
 	p := &fcparams.ChainParams{
 		InitialBits:      0x1e0fffff,
 		MinBits:          0x1e0fffff,
@@ -96,7 +103,7 @@ func TestCalcNextBitsRetarget(t *testing.T) {
 	for i := uint32(0); i <= 10; i++ {
 		headers[i] = &types.BlockHeader{
 			Bits:      p.InitialBits,
-			Timestamp: baseTime + i*60, // 1 block per minute.
+			Timestamp: baseTime + i*60,
 		}
 	}
 
@@ -104,8 +111,6 @@ func TestCalcNextBitsRetarget(t *testing.T) {
 		return headers[h]
 	}
 
-	// At height 10 (retarget boundary), actual timespan = 10 * 60 = 600s.
-	// Target timespan = 10 * 60 = 600s. Should keep same difficulty.
 	bits := engine.CalcNextBits(headers[9], 9, getAncestor, p)
 	if bits != p.InitialBits {
 		t.Logf("bits changed at retarget with matching timespan: 0x%08x -> 0x%08x", p.InitialBits, bits)
@@ -113,7 +118,7 @@ func TestCalcNextBitsRetarget(t *testing.T) {
 }
 
 func TestValidateHeader(t *testing.T) {
-	engine := New()
+	engine := New(testHasher(), testRetargeter())
 	p := fcparams.Regtest
 
 	parent := types.BlockHeader{
@@ -146,7 +151,7 @@ func TestValidateHeader(t *testing.T) {
 }
 
 func TestValidateHeaderBadPrevHash(t *testing.T) {
-	engine := New()
+	engine := New(testHasher(), testRetargeter())
 	p := fcparams.Regtest
 
 	parent := types.BlockHeader{Version: 1, Timestamp: 1700000000, Bits: p.InitialBits}
@@ -164,7 +169,7 @@ func TestValidateHeaderBadPrevHash(t *testing.T) {
 }
 
 func TestValidateHeaderWrongBits(t *testing.T) {
-	engine := New()
+	engine := New(testHasher(), testRetargeter())
 	p := &fcparams.ChainParams{
 		InitialBits:      0x1e0fffff,
 		MinBits:          0x1e0fffff,

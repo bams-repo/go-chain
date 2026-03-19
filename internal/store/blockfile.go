@@ -86,25 +86,157 @@ func (bfm *BlockFileManager) WriteBlock(block *types.Block) (fileNum uint32, off
 	offset = uint32(bfm.curSize)
 	size = uint32(len(data))
 
-	f, err := os.OpenFile(bfm.blkPath(fileNum), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	path := bfm.blkPath(fileNum)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open block file: %w", err)
 	}
 	defer f.Close()
 
-	// Write framing: [magic(4)][size(4 LE)][data].
-	var frame [8]byte
-	copy(frame[:4], bfm.magic[:])
-	binary.LittleEndian.PutUint32(frame[4:], uint32(len(data)))
-	if _, err := f.Write(frame[:]); err != nil {
-		return 0, 0, 0, fmt.Errorf("write block frame: %w", err)
+	preWritePos, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("seek to end of block file: %w", err)
 	}
-	if _, err := f.Write(data); err != nil {
-		return 0, 0, 0, fmt.Errorf("write block data: %w", err)
+
+	record := make([]byte, 8+len(data))
+	copy(record[:4], bfm.magic[:])
+	binary.LittleEndian.PutUint32(record[4:8], uint32(len(data)))
+	copy(record[8:], data)
+
+	n, writeErr := f.Write(record)
+	if writeErr != nil || n != len(record) {
+		// Partial write — truncate back to the pre-write position so we
+		// don't leave a half-written record that would corrupt reads.
+		_ = f.Truncate(preWritePos)
+		_ = f.Sync()
+		if writeErr != nil {
+			return 0, 0, 0, fmt.Errorf("write block record: %w", writeErr)
+		}
+		return 0, 0, 0, fmt.Errorf("short write to block file: wrote %d of %d bytes", n, len(record))
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Truncate(preWritePos)
+		_ = f.Sync()
+		return 0, 0, 0, fmt.Errorf("sync block file: %w", err)
 	}
 
 	bfm.curSize += frameSize
 	return fileNum, offset, size, nil
+}
+
+// WriteBlockNoSync is identical to WriteBlock but skips the fsync call.
+// Used during IBD where periodic checkpoints provide crash safety.
+func (bfm *BlockFileManager) WriteBlockNoSync(block *types.Block) (fileNum uint32, offset uint32, size uint32, err error) {
+	data, err := block.SerializeToBytes()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("serialize block: %w", err)
+	}
+
+	bfm.mu.Lock()
+	defer bfm.mu.Unlock()
+
+	frameSize := int64(8 + len(data))
+	if bfm.curSize > 0 && bfm.curSize+frameSize > maxBlockFileSize {
+		bfm.curFile++
+		bfm.curSize = 0
+	}
+
+	fileNum = bfm.curFile
+	offset = uint32(bfm.curSize)
+	size = uint32(len(data))
+
+	path := bfm.blkPath(fileNum)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("open block file: %w", err)
+	}
+	defer f.Close()
+
+	preWritePos, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("seek to end of block file: %w", err)
+	}
+
+	record := make([]byte, 8+len(data))
+	copy(record[:4], bfm.magic[:])
+	binary.LittleEndian.PutUint32(record[4:8], uint32(len(data)))
+	copy(record[8:], data)
+
+	n, writeErr := f.Write(record)
+	if writeErr != nil || n != len(record) {
+		_ = f.Truncate(preWritePos)
+		if writeErr != nil {
+			return 0, 0, 0, fmt.Errorf("write block record: %w", writeErr)
+		}
+		return 0, 0, 0, fmt.Errorf("short write to block file: wrote %d of %d bytes", n, len(record))
+	}
+
+	bfm.curSize += frameSize
+	return fileNum, offset, size, nil
+}
+
+// WriteUndoNoSync is identical to WriteUndo but skips the fsync call.
+func (bfm *BlockFileManager) WriteUndoNoSync(fileNum uint32, undoData []byte) (offset uint32, size uint32, err error) {
+	bfm.mu.Lock()
+	defer bfm.mu.Unlock()
+
+	path := bfm.revPath(fileNum)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open rev file: %w", err)
+	}
+	defer f.Close()
+
+	preWritePos, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, 0, fmt.Errorf("seek to end of rev file: %w", err)
+	}
+
+	checksum := crypto.DoubleSHA256(undoData)
+
+	record := make([]byte, 8+len(undoData)+32)
+	copy(record[:4], bfm.magic[:])
+	binary.LittleEndian.PutUint32(record[4:8], uint32(len(undoData)))
+	copy(record[8:], undoData)
+	copy(record[8+len(undoData):], checksum[:])
+
+	n, writeErr := f.Write(record)
+	if writeErr != nil || n != len(record) {
+		_ = f.Truncate(preWritePos)
+		if writeErr != nil {
+			return 0, 0, fmt.Errorf("write undo record: %w", writeErr)
+		}
+		return 0, 0, fmt.Errorf("short write to undo file: wrote %d of %d bytes", n, len(record))
+	}
+
+	return uint32(preWritePos), uint32(len(undoData)), nil
+}
+
+// SyncAll fsyncs the current blk*.dat and rev*.dat files.
+func (bfm *BlockFileManager) SyncAll() error {
+	bfm.mu.Lock()
+	fileNum := bfm.curFile
+	bfm.mu.Unlock()
+
+	blkPath := bfm.blkPath(fileNum)
+	if f, err := os.OpenFile(blkPath, os.O_WRONLY, 0600); err == nil {
+		syncErr := f.Sync()
+		f.Close()
+		if syncErr != nil {
+			return fmt.Errorf("sync block file %d: %w", fileNum, syncErr)
+		}
+	}
+
+	revPath := bfm.revPath(fileNum)
+	if f, err := os.OpenFile(revPath, os.O_WRONLY, 0600); err == nil {
+		syncErr := f.Sync()
+		f.Close()
+		if syncErr != nil {
+			return fmt.Errorf("sync rev file %d: %w", fileNum, syncErr)
+		}
+	}
+
+	return nil
 }
 
 // ReadBlock reads a block from the specified file at the given byte offset.
@@ -134,6 +266,9 @@ func (bfm *BlockFileManager) ReadBlock(fileNum, offset, size uint32) (*types.Blo
 	if size > 0 && dataSize != size {
 		return nil, fmt.Errorf("size mismatch: frame says %d, index says %d", dataSize, size)
 	}
+	if dataSize > maxBlockFileSize {
+		return nil, fmt.Errorf("block data size %d exceeds maximum %d — possible corruption", dataSize, maxBlockFileSize)
+	}
 
 	data := make([]byte, dataSize)
 	if _, err := io.ReadFull(f, data); err != nil {
@@ -156,35 +291,41 @@ func (bfm *BlockFileManager) WriteUndo(fileNum uint32, undoData []byte) (offset 
 
 	path := bfm.revPath(fileNum)
 
-	// Get current file size for offset.
-	var curSize int64
-	if info, err := os.Stat(path); err == nil {
-		curSize = info.Size()
-	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return 0, 0, fmt.Errorf("open rev file: %w", err)
 	}
 	defer f.Close()
 
+	preWritePos, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, 0, fmt.Errorf("seek to end of rev file: %w", err)
+	}
+
 	checksum := crypto.DoubleSHA256(undoData)
 
-	var frame [8]byte
-	copy(frame[:4], bfm.magic[:])
-	binary.LittleEndian.PutUint32(frame[4:], uint32(len(undoData)))
+	record := make([]byte, 8+len(undoData)+32)
+	copy(record[:4], bfm.magic[:])
+	binary.LittleEndian.PutUint32(record[4:8], uint32(len(undoData)))
+	copy(record[8:], undoData)
+	copy(record[8+len(undoData):], checksum[:])
 
-	if _, err := f.Write(frame[:]); err != nil {
-		return 0, 0, fmt.Errorf("write undo frame: %w", err)
+	n, writeErr := f.Write(record)
+	if writeErr != nil || n != len(record) {
+		_ = f.Truncate(preWritePos)
+		_ = f.Sync()
+		if writeErr != nil {
+			return 0, 0, fmt.Errorf("write undo record: %w", writeErr)
+		}
+		return 0, 0, fmt.Errorf("short write to undo file: wrote %d of %d bytes", n, len(record))
 	}
-	if _, err := f.Write(undoData); err != nil {
-		return 0, 0, fmt.Errorf("write undo data: %w", err)
-	}
-	if _, err := f.Write(checksum[:]); err != nil {
-		return 0, 0, fmt.Errorf("write undo checksum: %w", err)
+	if err := f.Sync(); err != nil {
+		_ = f.Truncate(preWritePos)
+		_ = f.Sync()
+		return 0, 0, fmt.Errorf("sync undo file: %w", err)
 	}
 
-	return uint32(curSize), uint32(len(undoData)), nil
+	return uint32(preWritePos), uint32(len(undoData)), nil
 }
 
 // ReadUndo reads undo data from the specified rev*.dat file at the given offset.
@@ -211,6 +352,9 @@ func (bfm *BlockFileManager) ReadUndo(fileNum, offset, size uint32) ([]byte, err
 	dataSize := binary.LittleEndian.Uint32(frame[4:])
 	if size > 0 && dataSize != size {
 		return nil, fmt.Errorf("undo size mismatch: frame says %d, index says %d", dataSize, size)
+	}
+	if dataSize > maxBlockFileSize {
+		return nil, fmt.Errorf("undo data size %d exceeds maximum %d — possible corruption", dataSize, maxBlockFileSize)
 	}
 
 	data := make([]byte, dataSize)

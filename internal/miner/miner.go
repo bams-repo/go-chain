@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bams-repo/fairchain/internal/chain"
+	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/consensus"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/logging"
@@ -98,11 +99,37 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 
 	tmpl := m.mempool.BlockTemplate()
 
-	coinbaseTx := m.buildCoinbase(newHeight, subsidy+tmpl.TotalFees)
+	const headerSize = 80
+	const coinbaseEstimate = 150
+	maxTxCount := int(m.params.MaxBlockTxCount)
+	maxSize := int(m.params.MaxBlockSize)
+	if maxTxCount <= 1 {
+		maxTxCount = 0
+	} else {
+		maxTxCount--
+	}
 
-	txs := make([]types.Transaction, 0, 1+len(tmpl.Transactions))
+	var includedTxs []*types.Transaction
+	var totalFees uint64
+	blockSize := headerSize + coinbaseEstimate
+	for i, tx := range tmpl.Transactions {
+		txSize := tmpl.Entries[i].Size
+		if maxTxCount > 0 && len(includedTxs) >= maxTxCount {
+			break
+		}
+		if maxSize > 0 && blockSize+txSize > maxSize {
+			break
+		}
+		includedTxs = append(includedTxs, tx)
+		totalFees += tmpl.Entries[i].Fee
+		blockSize += txSize
+	}
+
+	coinbaseTx := m.buildCoinbase(newHeight, subsidy+totalFees)
+
+	txs := make([]types.Transaction, 0, 1+len(includedTxs))
 	txs = append(txs, coinbaseTx)
-	for _, tx := range tmpl.Transactions {
+	for _, tx := range includedTxs {
 		txs = append(txs, *tx)
 	}
 
@@ -130,6 +157,7 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 
 	target := crypto.CompactToHash(header.Bits)
 
+	extraNonce := uint32(0)
 	const batchSize = 100000
 	for {
 		select {
@@ -152,26 +180,49 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 			return block, nil
 		}
 
+		// Abort if the chain tip changed (new block arrived) to avoid
+		// wasting hash work on a stale parent.
+		currentTip, _ := m.chain.Tip()
+		if currentTip != tipHash {
+			return nil, nil
+		}
+
 		if header.Nonce == 0 {
+			extraNonce++
+			coinbaseTx = m.buildCoinbaseWithExtra(newHeight, subsidy+tmpl.TotalFees, extraNonce)
+			txs[0] = coinbaseTx
 			now := uint32(m.timeSource.Now())
 			if now <= tipHeader.Timestamp {
 				now = tipHeader.Timestamp + 1
 			}
 			header.Timestamp = now
-			merkle, _ = crypto.ComputeMerkleRoot(txs)
+			merkle, err = crypto.ComputeMerkleRoot(txs)
+			if err != nil {
+				return nil, fmt.Errorf("compute merkle root on nonce wrap: %w", err)
+			}
 			header.MerkleRoot = merkle
 		}
 	}
 }
 
 func (m *Miner) buildCoinbase(height uint32, subsidy uint64) types.Transaction {
-	// BIP34: encode height as a CScript push — [pushLen][height LE bytes][tag].
+	return m.buildCoinbaseWithExtra(height, subsidy, 0)
+}
+
+func (m *Miner) buildCoinbaseWithExtra(height uint32, subsidy uint64, extraNonce uint32) types.Transaction {
+	// BIP34: encode height as a CScript push — [pushLen][height LE bytes][extraNonce LE][tag].
+	pushLen := minimalHeightPushLen(height)
 	heightBytes := make([]byte, 4)
 	types.PutUint32LE(heightBytes, height)
-	msg := make([]byte, 0, 1+4+len("fairchain"))
-	msg = append(msg, 0x04) // push 4 bytes
-	msg = append(msg, heightBytes...)
-	msg = append(msg, []byte("fairchain")...)
+	msg := make([]byte, 0, 1+pushLen+4+len(coinparams.CoinbaseTag))
+	msg = append(msg, byte(pushLen))
+	msg = append(msg, heightBytes[:pushLen]...)
+	if extraNonce > 0 {
+		extraBytes := make([]byte, 4)
+		types.PutUint32LE(extraBytes, extraNonce)
+		msg = append(msg, extraBytes...)
+	}
+	msg = append(msg, []byte(coinparams.CoinbaseTag)...)
 
 	return types.Transaction{
 		Version: 1,
@@ -189,5 +240,18 @@ func (m *Miner) buildCoinbase(height uint32, subsidy uint64) types.Transaction {
 			},
 		},
 		LockTime: 0,
+	}
+}
+
+func minimalHeightPushLen(height uint32) int {
+	switch {
+	case height <= 0xFF:
+		return 1
+	case height <= 0xFFFF:
+		return 2
+	case height <= 0xFFFFFF:
+		return 3
+	default:
+		return 4
 	}
 }

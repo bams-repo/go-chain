@@ -1,3 +1,4 @@
+# Branding values sourced from internal/coinparams/coinparams.go
 name: Release
 
 on:

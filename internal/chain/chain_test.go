@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/big"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/bams-repo/fairchain/internal/algorithms/sha256d"
 	"github.com/bams-repo/fairchain/internal/consensus/pow"
 	"github.com/bams-repo/fairchain/internal/crypto"
+	bitcoindiff "github.com/bams-repo/fairchain/internal/difficulty/bitcoin"
 	fcparams "github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/store"
 	"github.com/bams-repo/fairchain/internal/types"
@@ -32,7 +35,7 @@ func setupTestChain(t *testing.T) (*Chain, *fcparams.ChainParams) {
 		RewardScript:    []byte{0x00},
 	}
 	genesis := fcparams.BuildGenesisBlock(cfg)
-	if err := pow.MineGenesis(&genesis); err != nil {
+	if err := pow.New(sha256d.New(), bitcoindiff.New()).MineGenesis(&genesis); err != nil {
 		t.Fatalf("mine genesis: %v", err)
 	}
 	genesisHash := crypto.HashBlockHeader(&genesis.Header)
@@ -50,7 +53,7 @@ func setupTestChain(t *testing.T) (*Chain, *fcparams.ChainParams) {
 	}
 	t.Cleanup(func() { s.Close() })
 
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	c := New(p, engine, s, nil)
 	if err := c.Init(); err != nil {
 		t.Fatalf("init chain: %v", err)
@@ -71,9 +74,7 @@ func mineBlock(t *testing.T, c *Chain, p *fcparams.ChainParams) *types.Block {
 	newHeight := tipHeight + 1
 	subsidy := p.CalcSubsidy(newHeight)
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, newHeight)
-	scriptSig := append(append([]byte{0x04}, heightBytes...), []byte("test")...)
+	scriptSig := minimalBIP34ScriptSig(newHeight, []byte("test"))
 
 	coinbase := types.Transaction{
 		Version: 1,
@@ -101,7 +102,7 @@ func mineBlock(t *testing.T, c *Chain, p *fcparams.ChainParams) *types.Block {
 	}
 
 	target := crypto.CompactToHash(header.Bits)
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	found, _ := engine.SealHeader(&header, target, 10000000)
 	if !found {
 		t.Fatal("could not mine block")
@@ -113,6 +114,25 @@ func mineBlock(t *testing.T, c *Chain, p *fcparams.ChainParams) *types.Block {
 	}
 }
 
+func minimalBIP34ScriptSig(height uint32, tag []byte) []byte {
+	heightBytes := make([]byte, 4)
+	types.PutUint32LE(heightBytes, height)
+	pushLen := 4
+	switch {
+	case height <= 0xFF:
+		pushLen = 1
+	case height <= 0xFFFF:
+		pushLen = 2
+	case height <= 0xFFFFFF:
+		pushLen = 3
+	}
+	sig := make([]byte, 0, 1+pushLen+len(tag))
+	sig = append(sig, byte(pushLen))
+	sig = append(sig, heightBytes[:pushLen]...)
+	sig = append(sig, tag...)
+	return sig
+}
+
 // mineBlockOnParent builds and mines a block on top of a specific parent, not the chain tip.
 // The tag parameter differentiates the coinbase to produce a unique block hash.
 func mineBlockOnParent(t *testing.T, parentHash types.Hash, parentHeader *types.BlockHeader, parentHeight uint32, p *fcparams.ChainParams, tag string) *types.Block {
@@ -121,9 +141,7 @@ func mineBlockOnParent(t *testing.T, parentHash types.Hash, parentHeader *types.
 	newHeight := parentHeight + 1
 	subsidy := p.CalcSubsidy(newHeight)
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, newHeight)
-	scriptSig := append(append([]byte{0x04}, heightBytes...), []byte(tag)...)
+	scriptSig := minimalBIP34ScriptSig(newHeight, []byte(tag))
 
 	coinbase := types.Transaction{
 		Version: 1,
@@ -151,7 +169,7 @@ func mineBlockOnParent(t *testing.T, parentHash types.Hash, parentHeader *types.
 	}
 
 	target := crypto.CompactToHash(header.Bits)
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	found, _ := engine.SealHeader(&header, target, 10000000)
 	if !found {
 		t.Fatal("could not mine block on parent")
@@ -234,9 +252,7 @@ func TestChainOrphan(t *testing.T) {
 	// Mine block 2 on top of block 1 (without submitting block 1 first).
 	// We need to manually construct block 2 since mineBlock uses the chain tip.
 	block1Hash := crypto.HashBlockHeader(&block1.Header)
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, 2)
-	scriptSig2 := append(append([]byte{0x04}, heightBytes...), []byte("test")...)
+	scriptSig2 := minimalBIP34ScriptSig(2, []byte("test"))
 	coinbase2 := types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
@@ -255,7 +271,7 @@ func TestChainOrphan(t *testing.T) {
 		Bits:       p.InitialBits,
 	}
 	target := crypto.CompactToHash(header2.Bits)
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	engine.SealHeader(&header2, target, 10000000)
 	block2 := &types.Block{Header: header2, Transactions: []types.Transaction{coinbase2}}
 
@@ -306,14 +322,15 @@ func TestEqualWorkTieBreaker(t *testing.T) {
 		expectedWinner = hashB
 	}
 
-	// Submit both blocks. The first one extends the chain; the second is a side chain
-	// with equal work, so the tie-breaker (lower hash) should decide.
+	// Submit both blocks. The first one extends the chain; the second is a
+	// side chain with equal work. If blockB has a lower hash it triggers a
+	// reorg; otherwise it is stored as a side chain (ErrSideChain).
 	_, err = c.ProcessBlock(blockA)
 	if err != nil {
 		t.Fatalf("ProcessBlock(blockA): %v", err)
 	}
 	_, err = c.ProcessBlock(blockB)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrSideChain) {
 		t.Fatalf("ProcessBlock(blockB): %v", err)
 	}
 
@@ -442,7 +459,7 @@ func setupRetargetChain(t *testing.T, interval uint32, blockSpacing time.Duratio
 		RewardScript:    []byte{0x00},
 	}
 	genesis := fcparams.BuildGenesisBlock(cfg)
-	if err := pow.MineGenesis(&genesis); err != nil {
+	if err := pow.New(sha256d.New(), bitcoindiff.New()).MineGenesis(&genesis); err != nil {
 		t.Fatalf("mine genesis: %v", err)
 	}
 	genesisHash := crypto.HashBlockHeader(&genesis.Header)
@@ -460,7 +477,7 @@ func setupRetargetChain(t *testing.T, interval uint32, blockSpacing time.Duratio
 	}
 	t.Cleanup(func() { s.Close() })
 
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	c := New(p, engine, s, nil)
 	if err := c.Init(); err != nil {
 		t.Fatalf("init chain: %v", err)
@@ -478,9 +495,7 @@ func mineBlockWithTimestamp(t *testing.T, parentHash types.Hash, parentHeader *t
 	newHeight := parentHeight + 1
 	subsidy := p.CalcSubsidy(newHeight)
 
-	heightBytes := make([]byte, 4)
-	types.PutUint32LE(heightBytes, newHeight)
-	scriptSig := append(append([]byte{0x04}, heightBytes...), []byte(tag)...)
+	scriptSig := minimalBIP34ScriptSig(newHeight, []byte(tag))
 
 	coinbase := types.Transaction{
 		Version: 1,
@@ -496,7 +511,7 @@ func mineBlockWithTimestamp(t *testing.T, parentHash types.Hash, parentHeader *t
 
 	merkle, _ := crypto.ComputeMerkleRoot([]types.Transaction{coinbase})
 
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	bits := engine.CalcNextBits(parentHeader, parentHeight, getAncestor, p)
 
 	header := types.BlockHeader{
@@ -537,7 +552,7 @@ func mineBlockWithTimestamp(t *testing.T, parentHash types.Hash, parentHeader *t
 func TestRC1_SideChainAncestorLookupBug(t *testing.T) {
 	c, p := setupRetargetChain(t, 5, 60*time.Second)
 
-	engine := pow.New()
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
 	baseTime := c.params.GenesisBlock.Header.Timestamp
 
 	// Phase 1: Mine 12 blocks on the main chain with 60s spacing (on-target).
@@ -699,4 +714,537 @@ func TestRC1_SideChainAncestorLookupBug(t *testing.T) {
 	t.Logf("rejects the longer chain's blocks at retarget boundaries because")
 	t.Logf("getAncestorUnsafe returns its own chain's blocks for the retarget")
 	t.Logf("window, not the incoming chain's blocks.")
+}
+
+// TestSideChainAncestorLookup directly verifies that buildAncestorLookup
+// returns side-chain headers at heights where the side chain diverges from
+// the main chain, and falls back to main-chain headers below the fork point.
+func TestSideChainAncestorLookup(t *testing.T) {
+	c, p := setupRetargetChain(t, 5, 60*time.Second)
+	baseTime := c.params.GenesisBlock.Header.Timestamp
+
+	// Mine 8 blocks on the main chain (60s spacing).
+	for i := 1; i <= 8; i++ {
+		tipHash, tipHeight := c.Tip()
+		tipHeader, _ := c.TipHeader()
+		ts := baseTime + uint32(i)*60
+		block := mineBlockWithTimestamp(t, tipHash, tipHeader, tipHeight, p, ts, fmt.Sprintf("main-%d", i), c.getAncestorUnsafe)
+		if _, err := c.ProcessBlock(block); err != nil {
+			t.Fatalf("main chain block %d: %v", i, err)
+		}
+	}
+
+	// Fork at height 3 — build a side chain with different timestamps (120s spacing).
+	forkHash := c.hashByHeight[3]
+	forkHeader, _ := c.store.GetHeader(forkHash)
+	forkHeight := uint32(3)
+
+	prevHash := forkHash
+	prevHeader := forkHeader
+	prevHeight := forkHeight
+
+	sideAncestors := make(map[uint32]*types.BlockHeader)
+	sideHashes := make(map[uint32]types.Hash)
+	for h := uint32(0); h <= forkHeight; h++ {
+		hash := c.hashByHeight[h]
+		hdr, _ := c.store.GetHeader(hash)
+		sideAncestors[h] = hdr
+		sideHashes[h] = hash
+	}
+	sideGetAncestor := func(h uint32) *types.BlockHeader { return sideAncestors[h] }
+
+	for i := 4; i <= 6; i++ {
+		ts := forkHeader.Timestamp + uint32(i-3)*120
+		block := mineBlockWithTimestamp(t, prevHash, prevHeader, prevHeight, p, ts, fmt.Sprintf("side-%d", i), sideGetAncestor)
+		blockHash := crypto.HashBlockHeader(&block.Header)
+		sideAncestors[uint32(i)] = &block.Header
+		sideHashes[uint32(i)] = blockHash
+
+		// Submit to chain — will be stored as side chain (less work than main).
+		_, err := c.ProcessBlock(block)
+		if err != nil && !errors.Is(err, ErrSideChain) {
+			t.Fatalf("side chain block %d: %v", i, err)
+		}
+
+		prevHash = blockHash
+		prevHeader = &block.Header
+		prevHeight = uint32(i)
+	}
+
+	// Now test buildAncestorLookup for the side chain tip (height 6).
+	// The side chain's parent is at height 5 with hash sideHashes[5].
+	sideParentHash := sideHashes[5]
+	sideParentHeight := uint32(5)
+	lookup := c.buildAncestorLookup(sideParentHash, sideParentHeight)
+
+	// Heights 4 and 5 should return side-chain headers (divergent from main).
+	for _, h := range []uint32{4, 5} {
+		got := lookup(h)
+		if got == nil {
+			t.Fatalf("buildAncestorLookup(%d) returned nil", h)
+		}
+		mainHash := c.hashByHeight[h]
+		mainHeader, _ := c.store.GetHeader(mainHash)
+		expectedSide := sideAncestors[h]
+
+		if got.Timestamp != expectedSide.Timestamp {
+			t.Errorf("height %d: got timestamp %d, want side-chain %d", h, got.Timestamp, expectedSide.Timestamp)
+		}
+		if got.Timestamp == mainHeader.Timestamp && expectedSide.Timestamp != mainHeader.Timestamp {
+			t.Errorf("height %d: returned main-chain header instead of side-chain", h)
+		}
+	}
+
+	// Heights at and below the fork point (0-3) should return main-chain headers
+	// since both chains share the same history there.
+	for h := uint32(0); h <= 3; h++ {
+		got := lookup(h)
+		if got == nil {
+			t.Fatalf("buildAncestorLookup(%d) returned nil", h)
+		}
+		mainHash := c.hashByHeight[h]
+		mainHeader, _ := c.store.GetHeader(mainHash)
+		if got.Timestamp != mainHeader.Timestamp {
+			t.Errorf("height %d (shared): got timestamp %d, want %d", h, got.Timestamp, mainHeader.Timestamp)
+		}
+	}
+
+	t.Logf("buildAncestorLookup correctly returns side-chain headers above fork and main-chain headers at/below fork")
+}
+
+// TestReorgAcrossRetargetBoundary verifies that a reorg succeeds when the fork
+// spans a retarget boundary and the two chains produce genuinely different
+// difficulty bits. This requires params where the target is NOT already at the
+// minimum difficulty, so retarget adjustments actually change the bits value.
+func TestReorgAcrossRetargetBoundary(t *testing.T) {
+	// Use a harder initial difficulty (0x1e0fffff) with a high MinBits ceiling
+	// so retarget adjustments produce different bits on each chain.
+	interval := uint32(5)
+	blockSpacing := 60 * time.Second
+	targetTimespan := time.Duration(interval) * blockSpacing
+
+	p := &fcparams.ChainParams{
+		Name:                   "retarget-reorg-test",
+		NetworkMagic:           [4]byte{0xFA, 0x1C, 0xC0, 0xFD},
+		DefaultPort:            19556,
+		TargetBlockSpacing:     blockSpacing,
+		RetargetInterval:       interval,
+		TargetTimespan:         targetTimespan,
+		MaxTimeFutureDrift:     10 * time.Minute,
+		MinTimestampRule:       "prev+1",
+		InitialBits:            0x1e0fffff,
+		MinBits:                0x1e0fffff,
+		NoRetarget:             false,
+		MaxBlockSize:           4_000_000,
+		MaxBlockTxCount:        50_000,
+		InitialSubsidy:         50_0000_0000,
+		SubsidyHalvingInterval: 150,
+		CoinbaseMaturity:       1,
+		MaxMempoolSize:         10000,
+		MinRelayTxFee:          0,
+		SeedNodes:              []string{},
+		ActivationHeights:      map[string]uint32{},
+	}
+
+	cfg := fcparams.GenesisConfig{
+		NetworkName:     "retarget-reorg-test",
+		CoinbaseMessage: []byte("retarget reorg test genesis"),
+		Timestamp:       1700000000,
+		Bits:            p.InitialBits,
+		Version:         1,
+		Reward:          p.InitialSubsidy,
+		RewardScript:    []byte{0x00},
+	}
+	genesis := fcparams.BuildGenesisBlock(cfg)
+	if err := pow.New(sha256d.New(), bitcoindiff.New()).MineGenesis(&genesis); err != nil {
+		t.Fatalf("mine genesis: %v", err)
+	}
+	genesisHash := crypto.HashBlockHeader(&genesis.Header)
+	fcparams.InitGenesis(p, genesis, genesisHash)
+
+	dir := t.TempDir()
+	s, err := store.NewFileStore(
+		filepath.Join(dir, "blocks"),
+		filepath.Join(dir, "blocks", "index"),
+		filepath.Join(dir, "chainstate"),
+		p.NetworkMagic,
+	)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	engine := pow.New(sha256d.New(), bitcoindiff.New())
+	c := New(p, engine, s, nil)
+	if err := c.Init(); err != nil {
+		t.Fatalf("init chain: %v", err)
+	}
+
+	baseTime := genesis.Header.Timestamp
+
+	// Mine 3 shared blocks (60s spacing, on-target).
+	for i := 1; i <= 3; i++ {
+		tipHash, tipHeight := c.Tip()
+		tipHeader, _ := c.TipHeader()
+		ts := baseTime + uint32(i)*60
+		block := mineBlockWithTimestamp(t, tipHash, tipHeader, tipHeight, p, ts, fmt.Sprintf("shared-%d", i), c.getAncestorUnsafe)
+		if _, err := c.ProcessBlock(block); err != nil {
+			t.Fatalf("shared block %d: %v", i, err)
+		}
+	}
+
+	forkHash := c.hashByHeight[3]
+	forkHeader, _ := c.store.GetHeader(forkHash)
+	forkHeight := uint32(3)
+
+	// Main chain: mine blocks 4-10 with SLOW spacing (240s — 4x slower than target).
+	// Slow blocks produce lower difficulty at the retarget boundary.
+	for i := 4; i <= 10; i++ {
+		tipHash, tipHeight := c.Tip()
+		tipHeader, _ := c.TipHeader()
+		ts := baseTime + uint32(3)*60 + uint32(i-3)*240
+		block := mineBlockWithTimestamp(t, tipHash, tipHeader, tipHeight, p, ts, fmt.Sprintf("main-%d", i), c.getAncestorUnsafe)
+		if _, err := c.ProcessBlock(block); err != nil {
+			t.Fatalf("main chain block %d: %v", i, err)
+		}
+	}
+
+	mainTipHash, mainTipHeight := c.Tip()
+	t.Logf("Main chain: height=%d, tip=%s", mainTipHeight, mainTipHash.ReverseString()[:16])
+
+	// Record main chain bits at height 10 (first block after retarget).
+	mainBlock10Hash := c.hashByHeight[10]
+	mainBlock10, _ := c.store.GetHeader(mainBlock10Hash)
+	t.Logf("Main chain bits at height 10: 0x%08x", mainBlock10.Bits)
+
+	// Side chain: mine blocks 4-15 with FAST spacing (15s — 4x faster than target).
+	// Fast blocks produce higher difficulty at the retarget boundary, meaning
+	// each side-chain block contributes MORE work than each main-chain block.
+	sideAncestors := make(map[uint32]*types.BlockHeader)
+	for h := uint32(0); h <= forkHeight; h++ {
+		hash := c.hashByHeight[h]
+		hdr, _ := c.store.GetHeader(hash)
+		sideAncestors[h] = hdr
+	}
+	sideGetAncestor := func(h uint32) *types.BlockHeader { return sideAncestors[h] }
+
+	prevHash := forkHash
+	prevHeader := forkHeader
+	prevHeight := forkHeight
+	var sideBlocks []*types.Block
+
+	for i := 4; i <= 15; i++ {
+		ts := baseTime + uint32(3)*60 + uint32(i-3)*15
+		block := mineBlockWithTimestamp(t, prevHash, prevHeader, prevHeight, p, ts, fmt.Sprintf("side-%d", i), sideGetAncestor)
+		blockHash := crypto.HashBlockHeader(&block.Header)
+		sideAncestors[uint32(i)] = &block.Header
+		sideBlocks = append(sideBlocks, block)
+
+		prevHash = blockHash
+		prevHeader = &block.Header
+		prevHeight = uint32(i)
+	}
+
+	// Verify the two chains produce different bits at the retarget boundary.
+	sideBitsAt10 := sideAncestors[10].Bits
+	t.Logf("Side chain bits at height 10: 0x%08x", sideBitsAt10)
+
+	if mainBlock10.Bits == sideBitsAt10 {
+		t.Logf("WARNING: bits match despite different timespans (clamping to MinBits)")
+	} else {
+		t.Logf("CONFIRMED: chains have different difficulty at retarget boundary (main=0x%08x, side=0x%08x)", mainBlock10.Bits, sideBitsAt10)
+	}
+
+	// Submit all side chain blocks. The side chain has more blocks AND harder
+	// difficulty post-retarget, so it should accumulate more total work.
+	var reorgHeight uint32
+	for i, block := range sideBlocks {
+		height := uint32(4 + i)
+		_, err := c.ProcessBlock(block)
+		if err != nil {
+			if errors.Is(err, ErrSideChain) {
+				continue
+			}
+			t.Fatalf("side chain block at height %d rejected: %v", height, err)
+		}
+		reorgHeight = height
+	}
+
+	newTipHash, newTipHeight := c.Tip()
+	t.Logf("After reorg: height=%d, tip=%s", newTipHeight, newTipHash.ReverseString()[:16])
+
+	if newTipHeight != 15 {
+		t.Fatalf("expected tip at height 15 after reorg, got %d", newTipHeight)
+	}
+	if newTipHash == mainTipHash {
+		t.Fatal("reorg did not happen — still on main chain")
+	}
+	if reorgHeight == 0 {
+		t.Fatal("no block triggered the reorg")
+	}
+
+	// Verify the chain is consistent: walk backwards from tip and confirm all
+	// heights have the side-chain blocks.
+	for h := uint32(15); h > forkHeight; h-- {
+		hash, ok := c.hashByHeight[h]
+		if !ok {
+			t.Fatalf("missing hashByHeight entry at height %d after reorg", h)
+		}
+		_, err := c.store.GetBlock(hash)
+		if err != nil {
+			t.Fatalf("cannot load block at height %d after reorg: %v", h, err)
+		}
+	}
+
+	t.Logf("Reorg across retarget boundary succeeded: fork at height %d, reorg triggered at height %d, new tip at height %d",
+		forkHeight, reorgHeight, newTipHeight)
+}
+
+// TestChainworkFromIndex verifies that the ChainWork stored in the block index
+// for every block matches the cumulative work recomputed by summing CalcWork(bits)
+// from genesis through that block. This confirms TASK-05: workForParentChain
+// reads stored ChainWork (O(1)) and that value is consistent with the canonical
+// per-block work calculation.
+func TestChainworkFromIndex(t *testing.T) {
+	c, p := setupTestChain(t)
+
+	const chainLen = 10
+	for i := 0; i < chainLen; i++ {
+		block := mineBlock(t, c, p)
+		if _, err := c.ProcessBlock(block); err != nil {
+			t.Fatalf("ProcessBlock at height %d: %v", i+1, err)
+		}
+	}
+
+	_, tipHeight := c.Tip()
+	if tipHeight != chainLen {
+		t.Fatalf("tip height = %d, want %d", tipHeight, chainLen)
+	}
+
+	// Walk the chain from genesis to tip, accumulating work from CalcWork(bits)
+	// and comparing against the stored ChainWork at each height.
+	cumulativeWork := new(big.Int)
+	for h := uint32(0); h <= tipHeight; h++ {
+		hash, ok := c.hashByHeight[h]
+		if !ok {
+			t.Fatalf("missing hashByHeight at height %d", h)
+		}
+
+		rec, err := c.store.GetBlockIndex(hash)
+		if err != nil {
+			t.Fatalf("GetBlockIndex at height %d: %v", h, err)
+		}
+
+		blockWork := crypto.CalcWork(rec.Header.Bits)
+		cumulativeWork.Add(cumulativeWork, blockWork)
+
+		if rec.ChainWork == nil {
+			t.Fatalf("height %d: stored ChainWork is nil", h)
+		}
+		if rec.ChainWork.Cmp(cumulativeWork) != 0 {
+			t.Fatalf("height %d: stored ChainWork=%s, recomputed=%s",
+				h, rec.ChainWork.Text(16), cumulativeWork.Text(16))
+		}
+
+		// Also verify workForParentChain returns the same value.
+		fromFunc, err := c.workForParentChain(hash)
+		if err != nil {
+			t.Fatalf("workForParentChain at height %d: %v", h, err)
+		}
+		if fromFunc.Cmp(cumulativeWork) != 0 {
+			t.Fatalf("height %d: workForParentChain=%s, recomputed=%s",
+				h, fromFunc.Text(16), cumulativeWork.Text(16))
+		}
+	}
+
+	t.Logf("ChainWork verified for all %d blocks: stored index values match cumulative CalcWork sums", tipHeight+1)
+}
+
+// TestHasBlockFalseAfterFailedReorg verifies that when a block triggers a
+// reorg that fails tx validation, the block index entry is cleaned up so
+// HasBlock returns false. This prevents the block from being permanently
+// "known" and un-requestable by the P2P layer (TASK-03).
+func TestHasBlockFalseAfterFailedReorg(t *testing.T) {
+	c, p := setupReorgTestChain(t)
+
+	// Main chain: 5 blocks.
+	for i := 0; i < 5; i++ {
+		b := mineBlock(t, c, p)
+		if _, err := c.ProcessBlock(b); err != nil {
+			t.Fatalf("main block %d: %v", i, err)
+		}
+	}
+
+	// Side chain: fork from genesis, 5 valid blocks (stored as side chain).
+	genesisHash := p.GenesisHash
+	genesisHeader := &p.GenesisBlock.Header
+	side := buildChainOnParent(t, genesisHash, genesisHeader, 0, p, 5, "task03")
+	for _, b := range side[:4] {
+		_, err := c.ProcessBlock(b)
+		if err != nil && !errors.Is(err, ErrSideChain) {
+			t.Fatalf("side chain block: %v", err)
+		}
+	}
+	// 5th side block may trigger equal-work reorg — submit it.
+	c.ProcessBlock(side[4])
+
+	// Build a 6th side-chain block with an inflated coinbase (2x subsidy).
+	// This gives the side chain strictly more work, triggering a reorg that
+	// must fail during tx validation.
+	lastValid := side[len(side)-1]
+	lastValidHash := crypto.HashBlockHeader(&lastValid.Header)
+	inflated := mineBlockOnParentWithValue(t, lastValidHash, &lastValid.Header, 5, p, "inflated-task03", p.CalcSubsidy(6)*2)
+	inflatedHash := crypto.HashBlockHeader(&inflated.Header)
+
+	_, err := c.ProcessBlock(inflated)
+	if err == nil {
+		t.Fatal("expected rejection of inflated coinbase block during reorg")
+	}
+
+	// The critical assertion: HasBlock must return false for the rejected
+	// block. Before TASK-03, the block index entry persisted after the
+	// failed reorg, causing HasBlock to return true and permanently
+	// preventing the P2P layer from re-requesting the block.
+	if c.HasBlock(inflatedHash) {
+		t.Fatal("HasBlock returned true for a block whose reorg failed — block index entry was not cleaned up (TASK-03 regression)")
+	}
+
+	// HasBlockOnChain should also be false.
+	if c.HasBlockOnChain(inflatedHash) {
+		t.Fatal("HasBlockOnChain returned true for a rejected reorg block")
+	}
+
+	// The chain should still be on the original main chain.
+	_, tipHeight := c.Tip()
+	if tipHeight < 5 {
+		t.Fatalf("chain should still be at height >= 5, got %d", tipHeight)
+	}
+}
+
+// TestOrphanCountAndEviction verifies that OrphanCount tracks the pool size
+// and EvictExpiredOrphans removes stale entries.
+func TestOrphanCountAndEviction(t *testing.T) {
+	c, p := setupTestChain(t)
+
+	if c.OrphanCount() != 0 {
+		t.Fatalf("expected 0 orphans at start, got %d", c.OrphanCount())
+	}
+
+	// Build a block whose parent is unknown (random hash). This will be
+	// accepted into the orphan pool after passing the PoW sanity check.
+	fakeParent := types.Hash{0xDE, 0xAD}
+	genesisHeader := &p.GenesisBlock.Header
+
+	orphan := mineBlockOnParent(t, fakeParent, genesisHeader, 0, p, "orphan-test")
+
+	_, err := c.ProcessBlock(orphan)
+	if !errors.Is(err, ErrOrphanBlock) {
+		t.Fatalf("expected ErrOrphanBlock, got: %v", err)
+	}
+
+	if c.OrphanCount() != 1 {
+		t.Fatalf("expected 1 orphan, got %d", c.OrphanCount())
+	}
+
+	// EvictExpiredOrphans should not evict a fresh orphan.
+	evicted := c.EvictExpiredOrphans()
+	if evicted != 0 {
+		t.Fatalf("expected 0 evictions for fresh orphan, got %d", evicted)
+	}
+	if c.OrphanCount() != 1 {
+		t.Fatalf("expected 1 orphan after no-op eviction, got %d", c.OrphanCount())
+	}
+}
+
+// TestOrphanExpiryByAge verifies that orphans older than OrphanExpiry are
+// removed by the eviction sweep. Uses direct manipulation of the addedAt
+// timestamp to avoid waiting 20 real minutes.
+func TestOrphanExpiryByAge(t *testing.T) {
+	c, p := setupTestChain(t)
+
+	fakeParent := types.Hash{0xDE, 0xAD}
+	genesisHeader := &p.GenesisBlock.Header
+
+	orphan := mineBlockOnParent(t, fakeParent, genesisHeader, 0, p, "expiry-test")
+
+	_, err := c.ProcessBlock(orphan)
+	if !errors.Is(err, ErrOrphanBlock) {
+		t.Fatalf("expected ErrOrphanBlock, got: %v", err)
+	}
+
+	if c.OrphanCount() != 1 {
+		t.Fatalf("expected 1 orphan, got %d", c.OrphanCount())
+	}
+
+	// Artificially age the orphan past the expiry threshold.
+	c.mu.Lock()
+	for hash, ob := range c.orphans {
+		ob.addedAt = time.Now().Add(-(OrphanExpiry + time.Minute))
+		c.orphans[hash] = ob
+	}
+	c.mu.Unlock()
+
+	evicted := c.EvictExpiredOrphans()
+	if evicted != 1 {
+		t.Fatalf("expected 1 eviction, got %d", evicted)
+	}
+	if c.OrphanCount() != 0 {
+		t.Fatalf("expected 0 orphans after expiry eviction, got %d", c.OrphanCount())
+	}
+}
+
+// TestOrphanPoolCapacity verifies that the orphan pool respects MaxOrphanBlocks
+// and evicts entries when full.
+func TestOrphanPoolCapacity(t *testing.T) {
+	c, p := setupTestChain(t)
+
+	genesisHeader := &p.GenesisBlock.Header
+
+	for i := 0; i < MaxOrphanBlocks+5; i++ {
+		fakeParent := types.Hash{byte(i >> 8), byte(i)}
+		tag := fmt.Sprintf("cap-test-%d", i)
+		orphan := mineBlockOnParent(t, fakeParent, genesisHeader, 0, p, tag)
+		c.ProcessBlock(orphan)
+	}
+
+	if c.OrphanCount() > MaxOrphanBlocks {
+		t.Fatalf("orphan pool exceeded capacity: %d > %d", c.OrphanCount(), MaxOrphanBlocks)
+	}
+}
+
+// TestOrphanResolution verifies that when a parent block arrives, its orphan
+// children are processed and accepted onto the chain.
+func TestOrphanResolution(t *testing.T) {
+	c, p := setupTestChain(t)
+
+	// Mine block 1 (the parent) but don't submit it yet.
+	parent := mineBlock(t, c, p)
+	parentHash := crypto.HashBlockHeader(&parent.Header)
+
+	// Mine block 2 on top of block 1.
+	child := mineBlockOnParent(t, parentHash, &parent.Header, 1, p, "orphan-child")
+
+	// Submit block 2 first — it becomes an orphan.
+	_, err := c.ProcessBlock(child)
+	if !errors.Is(err, ErrOrphanBlock) {
+		t.Fatalf("expected ErrOrphanBlock for out-of-order block, got: %v", err)
+	}
+	if c.OrphanCount() != 1 {
+		t.Fatalf("expected 1 orphan, got %d", c.OrphanCount())
+	}
+
+	// Now submit the parent — the orphan child should be resolved.
+	_, err = c.ProcessBlock(parent)
+	if err != nil {
+		t.Fatalf("parent block rejected: %v", err)
+	}
+
+	// Orphan pool should be empty and chain should be at height 2.
+	if c.OrphanCount() != 0 {
+		t.Fatalf("expected 0 orphans after parent arrived, got %d", c.OrphanCount())
+	}
+	_, tipHeight := c.Tip()
+	if tipHeight != 2 {
+		t.Fatalf("expected chain at height 2 after orphan resolution, got %d", tipHeight)
+	}
 }
