@@ -13,8 +13,10 @@ __pycache__/
 
 # Node.js (GUI wallet frontend)
 node_modules/
-cmd/qt/frontend/dist/
+cmd/qt/frontend/dist/*
+!cmd/qt/frontend/dist/.gitkeep.html
 cmd/qt/build/bin/
+cmd/qt/frontend/package.json.md5
 
 # Go build cache
 *.test
