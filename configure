@@ -110,8 +110,12 @@ fi
 
 # --- Optional: Node.js + npm -------------------------------------------------
 # Tailwind CSS v4 requires Node >= 20 for @tailwindcss/oxide native bindings.
-# If nvm is installed, source it and try to activate a compatible version
-# (reading .nvmrc if present, otherwise installing the minimum required).
+# Resolve .nvmrc from this script (not $PWD). Source nvm with `set +u` — nvm.sh
+# breaks under bash nounset. Sourcing nvm can drop a pre-set PATH from the parent
+# shell if `nvm use` fails; we then prepend the newest nvm Node >= MIN_NODE_MAJOR.
+
+CONFIGURE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NVMRC="$CONFIGURE_DIR/cmd/qt/frontend/.nvmrc"
 
 NPM=""
 NODE=""
@@ -120,46 +124,93 @@ NODE_MAJOR=0
 NVM_ACTIVATED=0
 
 NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-if [ -s "$NVM_DIR/nvm.sh" ]; then
-    . "$NVM_DIR/nvm.sh" --no-use 2>/dev/null || true
 
-    # Try .nvmrc first, fall back to minimum required major.
-    NVMRC="cmd/qt/frontend/.nvmrc"
+_prepend_nvm_node_path() {
+    local dir ver maj
+    if [ ! -d "$NVM_DIR/versions/node" ]; then
+        return 1
+    fi
+    for dir in $(ls -1 "$NVM_DIR/versions/node" 2>/dev/null | sort -V | tac); do
+        [ -x "$NVM_DIR/versions/node/$dir/bin/node" ] || continue
+        ver="${dir#v}"
+        maj="${ver%%.*}"
+        if [ "${maj:-0}" -ge "$MIN_NODE_MAJOR" ] 2>/dev/null; then
+            export PATH="$NVM_DIR/versions/node/$dir/bin:$PATH"
+            NVM_ACTIVATED=1
+            hash -r 2>/dev/null || true
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+    set +u
+    # shellcheck disable=SC1090
+    . "$NVM_DIR/nvm.sh" --no-use
+    set -u
+
     if [ -f "$NVMRC" ]; then
-        DESIRED_MAJOR="$(cat "$NVMRC" | tr -d '[:space:]' | cut -d. -f1)"
-    else
-        DESIRED_MAJOR="$MIN_NODE_MAJOR"
+        if pushd "$(dirname "$NVMRC")" >/dev/null 2>&1; then
+            if nvm use >/dev/null 2>&1; then
+                NVM_ACTIVATED=1
+                hash -r 2>/dev/null || true
+            fi
+            popd >/dev/null 2>&1 || true
+        fi
     fi
 
-    # Try the desired major first, then fall back to any installed >= MIN_NODE_MAJOR.
-    if nvm ls "$DESIRED_MAJOR" &>/dev/null 2>&1; then
-        nvm use "$DESIRED_MAJOR" --silent &>/dev/null 2>&1 && NVM_ACTIVATED=1
-    else
-        # .nvmrc version not installed -- try any version >= MIN_NODE_MAJOR.
-        FALLBACK=""
-        for v in $(nvm ls --no-colors 2>/dev/null | grep -oE 'v[0-9]+' | sed 's/v//' | sort -rn | uniq); do
-            if [ "$v" -ge "$MIN_NODE_MAJOR" ]; then
-                FALLBACK="$v"
-                break
-            fi
-        done
+    if [ "$NVM_ACTIVATED" != "1" ] && declare -F nvm >/dev/null 2>&1; then
+        DESIRED_MAJOR="$MIN_NODE_MAJOR"
+        if [ -f "$NVMRC" ]; then
+            _raw="$(tr -d '[:space:]' < "$NVMRC" | sed 's/^v//')"
+            DESIRED_MAJOR="${_raw%%.*}"
+        fi
 
-        if [ -n "$FALLBACK" ]; then
-            nvm use "$FALLBACK" --silent &>/dev/null 2>&1 && NVM_ACTIVATED=1
+        if [ -n "$DESIRED_MAJOR" ] && nvm use "$DESIRED_MAJOR" >/dev/null 2>&1; then
+            NVM_ACTIVATED=1
+            hash -r 2>/dev/null || true
         else
-            # No compatible version installed -- offer to install.
-            echo ""
-            echo "  Node.js >= $MIN_NODE_MAJOR is required for the GUI frontend (Tailwind v4)."
-            echo "  nvm is available but no compatible Node version is installed."
-            echo ""
-            read -rp "  Install Node $DESIRED_MAJOR via nvm now? [Y/n] " REPLY
-            REPLY="${REPLY:-Y}"
-            if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-                echo "  Installing Node $DESIRED_MAJOR..."
-                nvm install "$DESIRED_MAJOR" &>/dev/null
-                nvm use "$DESIRED_MAJOR" --silent &>/dev/null 2>&1 && NVM_ACTIVATED=1
+            FALLBACK=""
+            for v in $(nvm ls --no-colors 2>/dev/null | grep -oE 'v[0-9]+' | sed 's/v//' | sort -rn | uniq); do
+                if [ "$v" -ge "$MIN_NODE_MAJOR" ]; then
+                    FALLBACK="$v"
+                    break
+                fi
+            done
+
+            if [ -n "$FALLBACK" ] && nvm use "$FALLBACK" >/dev/null 2>&1; then
+                NVM_ACTIVATED=1
+                hash -r 2>/dev/null || true
+            else
+                echo ""
+                echo "  Node.js >= $MIN_NODE_MAJOR is required for the GUI frontend (Tailwind v4)."
+                echo "  nvm is available but no compatible Node version is installed."
+                echo ""
+                if [ -t 0 ]; then
+                    read -rp "  Install Node $DESIRED_MAJOR via nvm now? [Y/n] " REPLY
+                    REPLY="${REPLY:-Y}"
+                else
+                    REPLY="y"
+                fi
+                if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+                    echo "  Installing Node $DESIRED_MAJOR..."
+                    nvm install "$DESIRED_MAJOR" >/dev/null 2>&1 || true
+                    if nvm use "$DESIRED_MAJOR" >/dev/null 2>&1; then
+                        NVM_ACTIVATED=1
+                        hash -r 2>/dev/null || true
+                    fi
+                fi
             fi
         fi
+    fi
+fi
+
+if command -v node &>/dev/null; then
+    _probe="$(node --version | sed 's/^v//')"
+    _maj="${_probe%%.*}"
+    if [ "${_maj:-0}" -lt "$MIN_NODE_MAJOR" ] 2>/dev/null; then
+        _prepend_nvm_node_path || true
     fi
 fi
 
