@@ -342,6 +342,15 @@ func (m *Manager) GetSyncState() string {
 	return m.syncState.String()
 }
 
+// HeaderSyncHeight returns the best validated header height from the header
+// index. During header-first sync this advances ahead of the chain tip.
+func (m *Manager) HeaderSyncHeight() uint32 {
+	if m.headerIndex == nil {
+		return 0
+	}
+	return m.headerIndex.BestHeaderHeight()
+}
+
 // BestPeerHeight returns the highest block height reported by any connected peer.
 func (m *Manager) BestPeerHeight() uint32 {
 	m.mu.RLock()

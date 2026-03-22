@@ -21,6 +21,8 @@ export function GetPeerCount():Promise<number>;
 
 export function GetSyncProgress():Promise<number>;
 
+export function GetSyncStatus():Promise<Record<string, any>>;
+
 export function GetWalletAddress():Promise<string>;
 
 export function SendIRCMessage(arg1:string):Promise<void>;

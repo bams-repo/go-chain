@@ -42,6 +42,10 @@ export function GetSyncProgress() {
   return window['go']['main']['App']['GetSyncProgress']();
 }
 
+export function GetSyncStatus() {
+  return window['go']['main']['App']['GetSyncStatus']();
+}
+
 export function GetWalletAddress() {
   return window['go']['main']['App']['GetWalletAddress']();
 }

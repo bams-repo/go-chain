@@ -189,6 +189,45 @@ func (a *App) GetSyncProgress() (float64, error) {
 	return float64(ourHeight) / float64(bestPeer), nil
 }
 
+// GetSyncStatus returns detailed sync state for the sync overlay modal.
+// Mirrors the information shown by Bitcoin Core's modal sync dialog.
+func (a *App) GetSyncStatus() (map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+
+	bc := a.node.Chain()
+	p2p := a.node.P2PMgr()
+
+	_, blockHeight := bc.Tip()
+	bestPeerHeight := p2p.BestPeerHeight()
+	headerHeight := p2p.HeaderSyncHeight()
+	syncState := p2p.GetSyncState()
+	peers := p2p.PeerCount()
+
+	var progress float64
+	if bestPeerHeight == 0 || blockHeight >= bestPeerHeight {
+		progress = 1.0
+	} else {
+		progress = float64(blockHeight) / float64(bestPeerHeight)
+	}
+
+	var lastBlockTime int64
+	if tipHeader, err := bc.TipHeader(); err == nil {
+		lastBlockTime = int64(tipHeader.Timestamp)
+	}
+
+	return map[string]interface{}{
+		"syncState":      syncState,
+		"headerHeight":   headerHeight,
+		"blockHeight":    blockHeight,
+		"bestPeerHeight": bestPeerHeight,
+		"peers":          peers,
+		"progress":       progress,
+		"lastBlockTime":  lastBlockTime,
+	}, nil
+}
+
 // SetMining toggles the built-in miner at runtime.
 func (a *App) SetMining(enabled bool) error {
 	if a.node == nil {

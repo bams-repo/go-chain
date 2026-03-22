@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CoinInfo, CoinInfoContext } from "./hooks/useCoinInfo";
 import { Sidebar } from "./components/Sidebar";
 import { Header } from "./components/Header";
+import { SyncOverlay } from "./components/SyncOverlay";
 import { Overview } from "./pages/Overview";
 import { Social } from "./pages/Social";
-import { CoinInfo as GetCoinInfo } from "../wailsjs/go/main/App";
+import { CoinInfo as GetCoinInfo, GetSyncStatus } from "../wailsjs/go/main/App";
 
 type Page = "overview" | "social" | "send" | "receive" | "transactions" | "network" | "mining" | "console";
 
@@ -12,9 +13,37 @@ function App() {
   const [coinInfo, setCoinInfo] = useState<CoinInfo | null>(null);
   const [page, setPage] = useState<Page>("overview");
 
+  const [syncing, setSyncing] = useState(true);
+  const [syncDismissed, setSyncDismissed] = useState(false);
+  const wasSynced = useRef(false);
+
   useEffect(() => {
     GetCoinInfo().then((info) => setCoinInfo(info as unknown as CoinInfo));
   }, []);
+
+  useEffect(() => {
+    const poll = () => {
+      GetSyncStatus()
+        .then((s) => {
+          const state = s.syncState as string;
+          const isSyncing = state !== "SYNCED";
+          setSyncing(isSyncing);
+
+          if (!isSyncing) {
+            wasSynced.current = true;
+          } else if (wasSynced.current) {
+            wasSynced.current = false;
+            setSyncDismissed(false);
+          }
+        })
+        .catch(() => {});
+    };
+    poll();
+    const id = setInterval(poll, 1500);
+    return () => clearInterval(id);
+  }, []);
+
+  const handleHide = useCallback(() => setSyncDismissed(true), []);
 
   if (!coinInfo) {
     return (
@@ -26,6 +55,8 @@ function App() {
       </div>
     );
   }
+
+  const showSyncOverlay = syncing && !syncDismissed;
 
   const renderPage = () => {
     switch (page) {
@@ -49,7 +80,7 @@ function App() {
 
   return (
     <CoinInfoContext.Provider value={coinInfo}>
-      <div className="flex h-full" style={{ background: 'var(--color-btc-deep)' }}>
+      <div className="relative flex h-full" style={{ background: 'var(--color-btc-deep)' }}>
         <Sidebar currentPage={page} onNavigate={setPage} />
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <Header />
@@ -57,6 +88,7 @@ function App() {
             {renderPage()}
           </main>
         </div>
+        {showSyncOverlay && <SyncOverlay onHide={handleHide} />}
       </div>
     </CoinInfoContext.Provider>
   );
