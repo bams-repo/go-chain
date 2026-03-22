@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/config"
@@ -24,6 +25,7 @@ import (
 type App struct {
 	ctx  context.Context
 	node *node.Node
+	irc  *ircClient
 }
 
 func NewApp() *App {
@@ -55,10 +57,27 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	a.node = n
+	a.irc = newIRCClient(ircConfig{
+		ServerAddr: "irc.libera.chat:6697",
+		Channel:    "#test112221",
+		NickPrefix: coinparams.NameLower,
+	})
+
+	go func() {
+		connectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		if err := a.irc.Connect(connectCtx); err != nil {
+			logging.L.Warn("wallet social chat failed to connect at startup", "error", err)
+		}
+	}()
+
 	logging.L.Info(coinparams.Name+" Wallet started", "version", version.String())
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	if a.irc != nil {
+		a.irc.Close()
+	}
 	if a.node != nil {
 		a.node.Stop()
 	}
@@ -87,9 +106,9 @@ func (a *App) GetBlockchainInfo() (map[string]interface{}, error) {
 	bc := a.node.Chain()
 	tipHash, tipHeight := bc.Tip()
 	return map[string]interface{}{
-		"height":  tipHeight,
+		"height":   tipHeight,
 		"bestHash": tipHash.ReverseString(),
-		"network": a.node.Config().Network,
+		"network":  a.node.Config().Network,
 	}, nil
 }
 
@@ -113,8 +132,8 @@ func (a *App) GetBalance() (map[string]interface{}, error) {
 	unconfirmed := total - confirmed
 
 	return map[string]interface{}{
-		"confirmed":   float64(confirmed) / coinparams.CoinsPerBaseUnit,
-		"unconfirmed": float64(unconfirmed) / coinparams.CoinsPerBaseUnit,
+		"confirmed":   float64(confirmed) / float64(coinparams.CoinsPerBaseUnit),
+		"unconfirmed": float64(unconfirmed) / float64(coinparams.CoinsPerBaseUnit),
 	}, nil
 }
 
@@ -139,9 +158,72 @@ func (a *App) GetSyncProgress() (float64, error) {
 	if a.node == nil {
 		return 0, fmt.Errorf("node not initialized")
 	}
-	_, height := a.node.Chain().Tip()
-	if height == 0 {
+	_, ourHeight := a.node.Chain().Tip()
+	bestPeer := a.node.P2PMgr().BestPeerHeight()
+	if bestPeer == 0 || ourHeight >= bestPeer {
 		return 1.0, nil
 	}
-	return 1.0, nil
+	return float64(ourHeight) / float64(bestPeer), nil
+}
+
+// SetMining toggles the built-in miner at runtime.
+func (a *App) SetMining(enabled bool) error {
+	if a.node == nil {
+		return fmt.Errorf("node not initialized")
+	}
+	a.node.SetMining(enabled)
+	return nil
+}
+
+// ConnectIRC manually attempts to connect to the configured IRC network.
+func (a *App) ConnectIRC() error {
+	if a.irc == nil {
+		return fmt.Errorf("social chat not initialized")
+	}
+	connectCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return a.irc.Connect(connectCtx)
+}
+
+// GetIRCStatus returns connection metadata used by the social tab.
+func (a *App) GetIRCStatus() map[string]interface{} {
+	if a.irc == nil {
+		return map[string]interface{}{
+			"connected": false,
+			"error":     "social chat not initialized",
+		}
+	}
+	return a.irc.Status()
+}
+
+// GetIRCMessages returns a bounded in-memory history of chat messages.
+func (a *App) GetIRCMessages() []map[string]interface{} {
+	if a.irc == nil {
+		return nil
+	}
+	return a.irc.Messages()
+}
+
+// GetIRCUsers returns the current channel user list.
+func (a *App) GetIRCUsers() []string {
+	if a.irc == nil {
+		return nil
+	}
+	return a.irc.Users()
+}
+
+// SendIRCMessage sends a channel message to the connected IRC server.
+func (a *App) SendIRCMessage(message string) error {
+	if a.irc == nil {
+		return fmt.Errorf("social chat not initialized")
+	}
+	return a.irc.SendMessage(message)
+}
+
+// ChangeIRCNick requests a nickname change on the connected IRC server.
+func (a *App) ChangeIRCNick(nick string) error {
+	if a.irc == nil {
+		return fmt.Errorf("social chat not initialized")
+	}
+	return a.irc.ChangeNick(nick)
 }
