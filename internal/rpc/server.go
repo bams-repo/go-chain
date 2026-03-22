@@ -227,6 +227,8 @@ func New(addr string, c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p
 	mux.HandleFunc("/backupwallet", s.handleBackupWallet)
 	mux.HandleFunc("/getaddressesbylabel", s.handleGetAddressesByLabel)
 	mux.HandleFunc("/gettransaction", s.handleGetTransaction)
+	mux.HandleFunc("/listsinceblock", s.handleListSinceBlock)
+	mux.HandleFunc("/sendmany", s.handleSendMany)
 
 	// Bitcoin Core parity: wallet encryption RPCs
 	mux.HandleFunc("/encryptwallet", s.handleEncryptWallet)
@@ -422,6 +424,10 @@ func (s *Server) Stop(ctx context.Context) error {
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	tipHash, tipHeight := s.chain.Tip()
 	info := s.chain.GetChainInfo()
+	var balance uint64
+	if s.wallet != nil {
+		balance = s.wallet.GetBalance(s.makeUtxoIterator(), tipHeight, 1, s.params.CoinbaseMaturity)
+	}
 	resp := map[string]interface{}{
 		"version":         version.ProtocolVersion,
 		"protocolversion": version.ProtocolVersion,
@@ -431,6 +437,9 @@ func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 		"connections":     s.p2p.PeerCount(),
 		"network":         s.params.Name,
 		"mempool_size":    s.mempool.Count(),
+		"balance":         balance,
+		"paytxfee":        s.feePerByte.Load(),
+		"errors":          "",
 	}
 	writeJSON(w, resp)
 }
@@ -543,10 +552,15 @@ func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
 		confirmations = int64(tipHeight) - int64(blockHeight) + 1
 	}
 
+	blockSize := 0
+	if blockBytes, serErr := block.SerializeToBytes(); serErr == nil {
+		blockSize = len(blockBytes)
+	}
 	resp := map[string]interface{}{
 		"hash":          blockHash.ReverseString(),
 		"confirmations": confirmations,
-		"size":          0,
+		"size":          blockSize,
+		"weight":        blockSize * 4,
 		"height":        blockHeight,
 		"version":       block.Header.Version,
 		"merkleroot":    block.Header.MerkleRoot.ReverseString(),
@@ -554,8 +568,16 @@ func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
 		"time":          block.Header.Timestamp,
 		"nonce":         block.Header.Nonce,
 		"bits":          fmt.Sprintf("%08x", block.Header.Bits),
+		"difficulty":    s.compactToDifficulty(block.Header.Bits),
 		"previousblockhash": block.Header.PrevBlock.ReverseString(),
 		"nTx":           len(block.Transactions),
+	}
+	if heightErr == nil && blockHeight < tipHeight {
+		nextHeader, nextErr := s.chain.GetHeaderByHeight(blockHeight + 1)
+		if nextErr == nil {
+			nextHash := crypto.HashBlockHeader(nextHeader)
+			resp["nextblockhash"] = nextHash.ReverseString()
+		}
 	}
 	writeJSON(w, resp)
 }
