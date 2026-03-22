@@ -30,34 +30,49 @@
 #include <openssl/sha.h>
 
 /* ── sha256mem parameters ─────────────────────────────────────────── */
-#define SHA256MEM_SLOTS       131072
-#define SHA256MEM_MIX_ROUNDS  128
-#define SHA256MEM_CHASE_DEPTH 8
+#define SHA256MEM_SLOTS       4194304
+#define SHA256MEM_FILL_CHAINS 8192
+#define SHA256MEM_MIX_ROUNDS  2048
 
 static void sha256mem_hash(const uint8_t *data, size_t len, uint8_t out[32])
 {
     uint8_t (*mem)[32] = malloc(SHA256MEM_SLOTS * 32);
     if (!mem) { memset(out, 0, 32); return; }
 
+    /* Phase 1: Seed. */
     SHA256(data, len, mem[0]);
-    for (int i = 1; i < SHA256MEM_SLOTS; i++)
-        SHA256(mem[i - 1], 32, mem[i]);
 
+    /* Phase 2: Fast fill — chain FILL_CHAINS SHA256s, copy each result
+     * to fill (SLOTS/FILL_CHAINS) consecutive slots via memcpy. */
+    {
+        int spread = SHA256MEM_SLOTS / SHA256MEM_FILL_CHAINS;
+        /* Copy slot 0 to its spread region */
+        for (int j = 1; j < spread; j++)
+            memcpy(mem[j], mem[0], 32);
+
+        for (int i = 1; i < SHA256MEM_FILL_CHAINS; i++) {
+            int base = i * spread;
+            int prev = (i - 1) * spread;
+            SHA256(mem[prev], 32, mem[base]);
+            for (int j = 1; j < spread; j++)
+                memcpy(mem[base + j], mem[base], 32);
+        }
+    }
+
+    /* Phase 3: SHA256-per-hop mix. */
     uint8_t acc[32];
     memcpy(acc, mem[SHA256MEM_SLOTS - 1], 32);
     for (int i = 0; i < SHA256MEM_MIX_ROUNDS; i++) {
         uint32_t idx;
         memcpy(&idx, acc, 4);
         idx %= SHA256MEM_SLOTS;
-        for (int hop = 0; hop < SHA256MEM_CHASE_DEPTH; hop++) {
-            memcpy(&idx, mem[idx], 4);
-            idx %= SHA256MEM_SLOTS;
-        }
         uint8_t buf[64];
         memcpy(buf, acc, 32);
         memcpy(buf + 32, mem[idx], 32);
         SHA256(buf, 64, acc);
     }
+
+    /* Phase 4: Finalize. */
     SHA256(acc, 32, out);
     free(mem);
 }
@@ -260,9 +275,8 @@ int main(int argc, char **argv)
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("║  Buffer:  %d slots × 32 bytes = %d MiB                    ║\n",
            SHA256MEM_SLOTS, (SHA256MEM_SLOTS * 32) / (1024 * 1024));
-    printf("║  Mix:     %d rounds × %d chase depth = %d serial reads    ║\n",
-           SHA256MEM_MIX_ROUNDS, SHA256MEM_CHASE_DEPTH,
-           SHA256MEM_MIX_ROUNDS * SHA256MEM_CHASE_DEPTH);
+    printf("║  Mix:     %d rounds (SHA256 per hop)                          ║\n",
+           SHA256MEM_MIX_ROUNDS);
     printf("║  Threads: %-3d    Duration: %ds                            ║\n",
            num_threads, duration);
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
