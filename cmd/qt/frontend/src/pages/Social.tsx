@@ -7,24 +7,7 @@ import {
   GetIRCUsers,
   SendIRCMessage,
 } from "../../wailsjs/go/main/App";
-
-type IRCStatus = {
-  connected?: boolean;
-  server?: string;
-  channel?: string;
-  nick?: string;
-  error?: string;
-  topic?: string;
-  userCount?: number;
-};
-
-type IRCMessage = {
-  time?: string;
-  sender?: string;
-  text?: string;
-  self?: boolean;
-  system?: boolean;
-};
+import { IRCMessage, IRCStatus } from "../lib/types";
 
 function timeLabel(iso?: string): string {
   if (!iso) return "";
@@ -282,7 +265,7 @@ export function Social() {
                         </span>
                       </div>
                       <p
-                        className="whitespace-pre-wrap break-words text-sm leading-relaxed"
+                        className="whitespace-pre-wrap wrap-break-word text-sm leading-relaxed"
                         style={{ color: own ? '#000' : 'var(--color-btc-text)' }}
                       >
                         {m.text}

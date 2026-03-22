@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { CoinInfo, CoinInfoContext } from "./hooks/useCoinInfo";
+import { CoinInfoContext } from "./hooks/useCoinInfo";
 import { Sidebar } from "./components/Sidebar";
 import { Header } from "./components/Header";
 import { Overview } from "./pages/Overview";
 import { Social } from "./pages/Social";
 import { CoinInfo as GetCoinInfo } from "../wailsjs/go/main/App";
+import { CoinInfo } from "./lib/types";
 
 type Page = "overview" | "social" | "send" | "receive" | "transactions" | "network" | "mining" | "console";
 

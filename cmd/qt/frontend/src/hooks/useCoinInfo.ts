@@ -1,15 +1,5 @@
 import { createContext, useContext } from "react";
-
-export interface CoinInfo {
-  name: string;
-  nameLower: string;
-  ticker: string;
-  decimals: number;
-  baseUnitName: string;
-  displayUnitName: string;
-  version: string;
-  copyright: string;
-}
+import { CoinInfo } from "../lib/types";
 
 export const CoinInfoContext = createContext<CoinInfo | null>(null);
 
