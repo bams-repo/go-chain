@@ -24,6 +24,10 @@ void sha256mem_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
         uint32_t idx;
         memcpy(&idx, acc, 4);
         idx %= SHA256MEM_SLOTS;
+        for (int hop = 0; hop < SHA256MEM_CHASE_DEPTH; hop++) {
+            memcpy(&idx, mem[idx], 4);
+            idx %= SHA256MEM_SLOTS;
+        }
 
         uint8_t buf[64];
         memcpy(buf, acc, 32);

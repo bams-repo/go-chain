@@ -5,7 +5,7 @@
 #   ./configure              # detect environment, write config.mk
 #   ./configure --with-qt    # enable GUI wallet
 #   make build               # build according to config
-.PHONY: all build build-core qt qt-dev daemon cli genesis adversary \
+.PHONY: all build build-core deps qt qt-dev daemon cli genesis adversary \
         test test-short bench lint fmt tidy clean \
         run-regtest run-regtest2 run-testnet run-testnet2 \
         testnet-status chaos modularity mine-genesis mine-genesis-testnet status
@@ -42,6 +42,10 @@ coinparams.mk: internal/coinparams/coinparams.go scripts/coinparams.sh
 -include coinparams.mk
 $(shell bash scripts/coinparams.sh > coinparams.mk)
 
+# --- Vendored Wails source (go.mod replace directive points here) ---
+WAILS_DEPENDS := depends/wails
+WAILS_DEPENDS_TAG := v2.11.0
+
 # --- Wails build flags ---
 WAILS_BUILD_FLAGS :=
 ifneq ($(WEBKIT_TAG),)
@@ -71,8 +75,16 @@ genesis:
 adversary:
 	$(GO) build -o $(BINDIR)/$(ADVERSARY_NAME) ./cmd/adversary
 
+# --- Vendored dependencies (fetched on demand) ---
+deps:
+	@if [ ! -d "$(WAILS_DEPENDS)" ]; then \
+		echo "Cloning Wails $(WAILS_DEPENDS_TAG) into $(WAILS_DEPENDS)..."; \
+		git clone --depth 1 --branch $(WAILS_DEPENDS_TAG) \
+			https://github.com/wailsapp/wails.git $(WAILS_DEPENDS); \
+	fi
+
 # --- GUI wallet (requires ./configure --with-qt) ---
-qt:
+qt: deps
 ifeq ($(WAILS),)
 	$(error Wails not found. Run: ./configure --with-qt)
 endif
@@ -111,6 +123,7 @@ clean:
 
 distclean: clean
 	rm -f config.mk
+	rm -rf depends/
 
 # --- Run targets ---
 run-regtest:

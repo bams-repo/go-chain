@@ -7,16 +7,19 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bams-repo/fairchain/internal/algorithms"
 	"github.com/bams-repo/fairchain/internal/coinparams"
-	"github.com/bams-repo/fairchain/internal/consensus/pow"
-	"github.com/bams-repo/fairchain/internal/difficulty"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	fcparams "github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/types"
@@ -26,6 +29,7 @@ func main() {
 	network := flag.String("network", "regtest", "Network name: mainnet, testnet, regtest")
 	message := flag.String("message", coinparams.NameLower+" genesis", "Coinbase message for genesis block")
 	timestamp := flag.Int64("timestamp", 0, "Unix timestamp (0 = now)")
+	threads := flag.Int("threads", runtime.NumCPU(), "Number of mining threads")
 	flag.Parse()
 
 	p := fcparams.NetworkByName(*network)
@@ -62,43 +66,158 @@ func main() {
 	log.Printf("  Bits:      0x%08x", cfg.Bits)
 	log.Printf("  Timestamp: %d", cfg.Timestamp)
 	log.Printf("  Message:   %q", string(cfg.CoinbaseMessage))
+	log.Printf("  Threads:   %d", *threads)
 	if len(cfg.ExtraOutputs) > 0 {
 		log.Printf("  Extra outputs: %d", len(cfg.ExtraOutputs))
 	}
 
 	block := fcparams.BuildGenesisBlock(cfg)
 
-	hasher, err := algorithms.GetHasher(coinparams.Algorithm)
+	merkle, err := crypto.ComputeMerkleRoot(block.Transactions)
 	if err != nil {
-		log.Fatalf("Unsupported PoW algorithm %q: %v", coinparams.Algorithm, err)
+		log.Fatalf("compute merkle root: %v", err)
 	}
-	retargeter, err := difficulty.GetRetargeter(coinparams.DifficultyAlgorithm)
-	if err != nil {
-		log.Fatalf("Unsupported difficulty algorithm %q: %v", coinparams.DifficultyAlgorithm, err)
-	}
-	engine := pow.New(hasher, retargeter)
+	block.Header.MerkleRoot = merkle
 
-	log.Println("Mining genesis block (this may take a moment)...")
-	start := time.Now()
-	if err := engine.MineGenesis(&block); err != nil {
-		log.Fatalf("Failed to mine genesis: %v", err)
+	target := crypto.CompactToHash(block.Header.Bits)
+
+	log.Println("Mining genesis block...")
+
+	nThreads := *threads
+	if nThreads < 1 {
+		nThreads = 1
 	}
+
+	var totalHashes atomic.Uint64
+	var found atomic.Bool
+	var winnerMu sync.Mutex
+	var winnerHeader types.BlockHeader
+
+	start := time.Now()
+
+	// Hashrate reporter
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		var lastCount uint64
+		var lastTime time.Time = start
+		for range ticker.C {
+			if found.Load() {
+				return
+			}
+			now := time.Now()
+			count := totalHashes.Load()
+			dt := now.Sub(lastTime).Seconds()
+			dh := count - lastCount
+			rate := float64(dh) / dt
+			log.Printf("  [mining] %d hashes | %.1f H/s | elapsed %v",
+				count, rate, now.Sub(start).Truncate(time.Second))
+			lastCount = count
+			lastTime = now
+		}
+	}()
+
+	// Split the 32-bit nonce space across threads.
+	// Each thread gets a contiguous range.
+	rangeSize := uint64(math.MaxUint32+1) / uint64(nThreads)
+
+	var wg sync.WaitGroup
+	for t := 0; t < nThreads; t++ {
+		wg.Add(1)
+		startNonce := uint32(uint64(t) * rangeSize)
+		endNonce := uint32(uint64(t+1)*rangeSize - 1)
+		if t == nThreads-1 {
+			endNonce = math.MaxUint32
+		}
+
+		go func(threadID int, nonceStart, nonceEnd uint32) {
+			defer wg.Done()
+
+			hasher, err := algorithms.GetHasher(coinparams.Algorithm)
+			if err != nil {
+				log.Printf("thread %d: failed to get hasher: %v", threadID, err)
+				return
+			}
+
+			hdr := block.Header
+			hdr.Nonce = nonceStart
+			var localCount uint64
+
+			for nonce := nonceStart; ; nonce++ {
+				if found.Load() {
+					return
+				}
+
+				hdr.Nonce = nonce
+				hash := hasher.PoWHash(hdr.SerializeToBytes())
+				localCount++
+
+				if localCount%500 == 0 {
+					totalHashes.Add(500)
+				}
+
+				if hash.LessOrEqual(target) {
+					if found.CompareAndSwap(false, true) {
+						totalHashes.Add(localCount % 500)
+						winnerMu.Lock()
+						winnerHeader = hdr
+						winnerMu.Unlock()
+						log.Printf("  [thread %d] FOUND at nonce %d", threadID, nonce)
+					}
+					return
+				}
+
+				if nonce == nonceEnd {
+					totalHashes.Add(localCount % 500)
+					return
+				}
+			}
+		}(t, startNonce, endNonce)
+	}
+
+	wg.Wait()
 	elapsed := time.Since(start)
 
+	if !found.Load() {
+		log.Fatal("Nonce space exhausted without finding valid genesis")
+	}
+
+	block.Header = winnerHeader
 	hash := crypto.HashBlockHeader(&block.Header)
+	total := totalHashes.Load()
+
+	// Compute final hash to verify
+	powHash := func() types.Hash {
+		hasher, _ := algorithms.GetHasher(coinparams.Algorithm)
+		return hasher.PoWHash(block.Header.SerializeToBytes())
+	}()
+	powLE := types.Hash{}
+	for i := 0; i < 32; i++ {
+		powLE[i] = powHash[31-i]
+	}
+	_ = powLE
 
 	log.Printf("Genesis block mined in %v", elapsed)
 	log.Printf("  Hash:       %s", hash.ReverseString())
 	log.Printf("  Nonce:      %d", block.Header.Nonce)
 	log.Printf("  MerkleRoot: %s", block.Header.MerkleRoot.ReverseString())
 	log.Printf("  Timestamp:  %d", block.Header.Timestamp)
+	log.Printf("  Total hashes: %d", total)
+	log.Printf("  Avg hashrate: %.1f H/s (%d threads)", float64(total)/elapsed.Seconds(), nThreads)
+
+	// Verify
+	if err := crypto.ValidateProofOfWork(powHash, block.Header.Bits); err != nil {
+		log.Fatalf("VERIFICATION FAILED: %v", err)
+	}
+	log.Println("  Verification: OK")
 
 	fmt.Println("\n// --- Genesis block Go definition ---")
 	fmt.Printf("// Network: %s\n", p.Name)
 	fmt.Printf("// Hash:    %s\n", hash.ReverseString())
+	fmt.Printf("// PoW:     %s\n", types.Hash(powHash).ReverseString())
 	fmt.Printf("// Nonce:   %d\n", block.Header.Nonce)
 	fmt.Printf("// Mined:   %s\n", time.Unix(int64(block.Header.Timestamp), 0).UTC())
-	fmt.Printf("// Elapsed: %v\n", elapsed)
+	fmt.Printf("// Elapsed: %v (%d threads, %.1f H/s)\n", elapsed, nThreads, float64(total)/elapsed.Seconds())
 	fmt.Println("//")
 	fmt.Printf("// Bits:       0x%08x\n", block.Header.Bits)
 	fmt.Printf("// MerkleRoot: %s\n", block.Header.MerkleRoot)
@@ -135,6 +254,18 @@ func main() {
 	fmt.Println("\t}},")
 	fmt.Println("},")
 	fmt.Printf("GenesisHash: %s,\n", formatHash(hash, 0))
+
+	// Also print the raw LE bytes for easy pasting
+	fmt.Println("")
+	fmt.Println("// GenesisHash bytes (internal byte order):")
+	fmt.Printf("//   %x\n", hash)
+	fmt.Println("// GenesisHash display (RPC/explorer order):")
+	fmt.Printf("//   %s\n", hash.ReverseString())
+
+	// Print nonce in hex too for reference
+	var nonceBuf [4]byte
+	binary.LittleEndian.PutUint32(nonceBuf[:], block.Header.Nonce)
+	fmt.Printf("// Nonce: %d (0x%08x)\n", block.Header.Nonce, block.Header.Nonce)
 }
 
 func formatHash(h types.Hash, indentLevel int) string {

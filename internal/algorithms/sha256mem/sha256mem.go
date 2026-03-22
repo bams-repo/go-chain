@@ -32,15 +32,26 @@ var memPool = sync.Pool{
 // All primitives are standard SHA256 — no novel cryptography.
 const (
 	// Slots is the number of 32-byte entries in the memory buffer.
-	// Memory usage = Slots * 32 bytes. 65536 * 32 = 2 MiB.
-	// 2 MiB fits comfortably in L2/L3 cache on phones and desktops alike,
-	// while being large enough to prevent ASIC register-file tricks.
-	Slots = 65536
+	// Memory usage = Slots * 32 bytes. 131072 * 32 = 4 MiB.
+	// 4 MiB fits in phone L3 cache (~12 MB) with room for 2-3 mining
+	// threads, while exceeding GPU per-SM L2 (~560 KB) by 7x — forcing
+	// GPU threads to hit VRAM at ~300-800 ns per random read.
+	Slots = 131072
 
 	// MixRounds is the number of random-read mixing passes.
-	// Each round does one data-dependent buffer lookup + one SHA256.
-	// 64 rounds ensures the access pattern is thoroughly unpredictable.
-	MixRounds = 64
+	// Each round does ChaseDepth serial pointer-chasing lookups followed
+	// by one SHA256. 128 rounds * 8 hops = 1,024 serial random reads
+	// per hash, creating a latency-bound chain that CPUs serve from L3
+	// at ~10 ns/hop while GPUs stall at ~300-800 ns/hop.
+	MixRounds = 128
+
+	// ChaseDepth is the number of serial data-dependent memory lookups
+	// per mix round. Each hop reads a slot and derives the next address
+	// from its contents, creating an unpredictable pointer chain that
+	// cannot be parallelized. This is the primary GPU/ASIC deterrent:
+	// the latency of each hop is dictated by cache hierarchy, and CPUs
+	// have 20-80x lower random-access latency than GPU VRAM.
+	ChaseDepth = 8
 )
 
 // Hasher implements memory-hard SHA256 proof-of-work hashing.
@@ -48,13 +59,15 @@ const (
 // Algorithm:
 //  1. Seed: SHA256(header) → mem[0]
 //  2. Fill: mem[i] = SHA256(mem[i-1]) for i in 1..Slots-1
-//  3. Mix: 64 rounds of data-dependent random reads from the buffer
+//  3. Mix: 128 rounds of pointer-chasing (8 serial dependent lookups)
+//     followed by one SHA256 per round
 //  4. Finalize: SHA256(accumulator) → output hash
 //
 // The fill phase is sequential (each slot depends on the previous),
-// preventing parallel precomputation. The mix phase has an unpredictable
-// access pattern (each index depends on the current accumulator value),
-// preventing memory-time tradeoffs.
+// preventing parallel precomputation. The mix phase performs serial
+// pointer-chasing where each address depends on the data at the
+// previous address, creating a latency-bound chain that CPUs serve
+// from L3 cache at ~10 ns/hop while GPUs stall at ~300-800 ns/hop.
 type Hasher struct{}
 
 func New() *Hasher { return &Hasher{} }
@@ -71,10 +84,13 @@ func (h *Hasher) PoWHash(data []byte) types.Hash {
 		mem[i] = sha256.Sum256(mem[i-1][:])
 	}
 
-	// Phase 3: Memory-hard mixing — read pattern depends on accumulator.
+	// Phase 3: Memory-hard mixing — pointer-chasing + SHA256.
 	acc := mem[Slots-1]
 	for i := 0; i < MixRounds; i++ {
 		idx := binary.LittleEndian.Uint32(acc[:4]) % uint32(Slots)
+		for hop := 0; hop < ChaseDepth; hop++ {
+			idx = binary.LittleEndian.Uint32(mem[idx][:4]) % uint32(Slots)
+		}
 		var buf [64]byte
 		copy(buf[:32], acc[:])
 		copy(buf[32:], mem[idx][:])

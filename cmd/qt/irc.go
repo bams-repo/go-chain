@@ -26,6 +26,8 @@ type ircConfig struct {
 	ServerAddr string
 	Channel    string
 	NickPrefix string
+	SavedNick  string
+	OnNickChange func(nick string)
 }
 
 type ircMessage struct {
@@ -97,7 +99,10 @@ func (c *ircClient) Connect(ctx context.Context) error {
 		return err
 	}
 
-	nick := buildIRCNick(c.cfg.NickPrefix)
+	nick := c.cfg.SavedNick
+	if nick == "" {
+		nick = buildIRCNick(c.cfg.NickPrefix)
+	}
 	reader := bufio.NewReaderSize(conn, 64*1024)
 	writer := bufio.NewWriterSize(conn, 64*1024)
 
@@ -396,11 +401,16 @@ func (c *ircClient) handleLine(line string) {
 			delete(c.users, sender)
 			c.users[newNick] = struct{}{}
 		}
-		if sender == c.nick {
+		ownChange := sender == c.nick
+		if ownChange {
 			c.nick = newNick
 		}
 		c.appendSystemLocked(sender + " is now known as " + newNick)
+		cb := c.cfg.OnNickChange
 		c.mu.Unlock()
+		if ownChange && cb != nil {
+			cb(newNick)
+		}
 	case "NOTICE":
 		sender := parseSender(prefix)
 		if sender == "" {

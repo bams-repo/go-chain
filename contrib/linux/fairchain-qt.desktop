@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fairchain Wallet
+GenericName=Cryptocurrency Wallet
+Comment=Fairchain peer-to-peer network client and wallet
+Exec=fairchain-qt %u
+Icon=fairchain-qt
+Terminal=false
+Categories=Office;Finance;Network;
+StartupWMClass=fairchain-qt
+MimeType=x-scheme-handler/fairchain;

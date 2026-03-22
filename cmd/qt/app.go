@@ -9,6 +9,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bams-repo/fairchain/internal/coinparams"
@@ -18,14 +21,16 @@ import (
 	"github.com/bams-repo/fairchain/internal/types"
 	"github.com/bams-repo/fairchain/internal/utxo"
 	"github.com/bams-repo/fairchain/internal/version"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 // App is the Go struct bound to the Wails frontend. All public methods are
 // callable from JavaScript via the generated bindings.
 type App struct {
-	ctx  context.Context
-	node *node.Node
-	irc  *ircClient
+	ctx     context.Context
+	node    *node.Node
+	irc     *ircClient
+	trayEnd func()
 }
 
 func NewApp() *App {
@@ -57,10 +62,18 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	a.node = n
+
+	nickPath := ircNickPath(n.Config())
+	savedNick := loadIRCNick(nickPath)
+
 	a.irc = newIRCClient(ircConfig{
 		ServerAddr: "irc.libera.chat:6697",
 		Channel:    "#test112221",
 		NickPrefix: coinparams.NameLower,
+		SavedNick:  savedNick,
+		OnNickChange: func(nick string) {
+			saveIRCNick(nickPath, nick)
+		},
 	})
 
 	go func() {
@@ -72,9 +85,19 @@ func (a *App) startup(ctx context.Context) {
 	}()
 
 	logging.L.Info(coinparams.Name+" Wallet started", "version", version.String())
+
+	trayStart, trayEnd := initTray(trayIconPNG, coinparams.Name+" Wallet", trayCallbacks{
+		OnShow: func() { wailsRuntime.WindowShow(a.ctx) },
+		OnQuit: func() { wailsRuntime.Quit(a.ctx) },
+	})
+	a.trayEnd = trayEnd
+	trayStart()
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	if a.trayEnd != nil {
+		a.trayEnd()
+	}
 	if a.irc != nil {
 		a.irc.Close()
 	}
@@ -226,4 +249,20 @@ func (a *App) ChangeIRCNick(nick string) error {
 		return fmt.Errorf("social chat not initialized")
 	}
 	return a.irc.ChangeNick(nick)
+}
+
+func ircNickPath(cfg *config.Config) string {
+	return filepath.Join(cfg.NetworkDataDir(), "irc_nick")
+}
+
+func loadIRCNick(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func saveIRCNick(path, nick string) {
+	_ = os.WriteFile(path, []byte(nick+"\n"), 0600)
 }

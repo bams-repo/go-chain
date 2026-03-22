@@ -52,6 +52,9 @@ chaos-runs/
 # Modularity test run data
 modularity-runs/
 
+# Vendored dependencies (fetched on demand, like Bitcoin Core depends/)
+depends/
+
 # Environment / secrets
 .env
 *.pem
