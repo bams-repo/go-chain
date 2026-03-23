@@ -111,15 +111,20 @@ var Mainnet = &ChainParams{
 	MinRelayTxFeeRate: 1, // 1 sat/byte minimum, matching Bitcoin Core's default
 	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
 
-	SeedNodes: []string{},
+	SeedNodes: []string{
+		"45.32.196.26:19333",    
+		"149.28.248.117:19333", 
+		"78.141.227.33:19333",  
+		"45.63.16.42:19333",    
+	},
 
-	ActivationHeights: map[string]uint32{},
+	ActivationHeights: map[string]uint32{"locktime": 1},
 }
 
 // Testnet is the public test network with easier difficulty.
 var Testnet = &ChainParams{
 	Name:         "testnet",
-	DataDirName:  "testnet2",
+	DataDirName:  "testnet3",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x02},
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
@@ -202,11 +207,13 @@ var Testnet = &ChainParams{
 	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
 
 	SeedNodes: []string{
-		"45.32.196.26:19334",  // main_web
-		"207.148.9.169:19334", // mining_pool
+		"45.32.196.26:19334",   // main_web
+		"149.28.248.117:19334", // seednode_dallas
+		"78.141.227.33:19334",  // seednode_london
+		"45.63.16.42:19334",    // mynta_webserver
 	},
 
-	ActivationHeights: map[string]uint32{},
+	ActivationHeights: map[string]uint32{"locktime": 1},
 }
 
 // Regtest is a local regression-test network with trivial difficulty and no retarget.
@@ -245,7 +252,7 @@ var Regtest = &ChainParams{
 
 	SeedNodes: []string{},
 
-	ActivationHeights: map[string]uint32{},
+	ActivationHeights: map[string]uint32{"locktime": 1},
 }
 
 // NetworkByName returns chain params by network name.

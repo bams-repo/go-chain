@@ -1,5 +1,5 @@
 import { createContext, useContext } from "react";
-import { CoinInfo } from "../lib/types";
+import { CoinInfo } from "@/lib/types";
 
 export const CoinInfoContext = createContext<CoinInfo | null>(null);
 

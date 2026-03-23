@@ -7,7 +7,7 @@
 #   make build               # build according to config
 .PHONY: all build build-core deps qt qt-dev daemon cli genesis adversary \
         test test-short bench lint fmt tidy clean \
-        run-regtest run-regtest2 run-testnet run-testnet2 \
+        run-regtest run-regtest2 run-testnet run-testnet3 \
         testnet-status chaos modularity mine-genesis mine-genesis-testnet status
 
 MODULE := $(shell grep '^module' go.mod | awk '{print $$2}')
@@ -47,7 +47,9 @@ WAILS_DEPENDS := depends/wails
 WAILS_DEPENDS_TAG := v2.11.0
 
 # --- Wails build flags ---
-WAILS_BUILD_FLAGS :=
+DEFAULT_NETWORK ?= testnet
+QT_LDFLAGS := -X main.defaultNetwork=$(DEFAULT_NETWORK)
+WAILS_BUILD_FLAGS := -ldflags "$(QT_LDFLAGS)"
 ifneq ($(WEBKIT_TAG),)
 WAILS_BUILD_FLAGS += -tags $(WEBKIT_TAG)
 endif
@@ -156,11 +158,11 @@ run-testnet:
 		-rpcport 19335 \
 		-mine
 
-run-testnet2:
-	mkdir -p /tmp/$(COIN_NAME_LOWER)-testnet2
+run-testnet3:
+	mkdir -p /tmp/$(COIN_NAME_LOWER)-testnet3
 	$(BINDIR)/$(DAEMON_NAME) \
 		-network testnet \
-		-datadir /tmp/$(COIN_NAME_LOWER)-testnet2 \
+		-datadir /tmp/$(COIN_NAME_LOWER)-testnet3 \
 		-listen 0.0.0.0:19336 \
 		-rpcbind 127.0.0.1 \
 		-rpcport 19337 \

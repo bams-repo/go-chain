@@ -76,19 +76,23 @@ export function Overview() {
       <div
         className="btc-noise btc-glow-active relative overflow-hidden rounded-xl p-6"
         style={{
-          background: 'linear-gradient(135deg, var(--color-btc-card) 0%, var(--color-btc-surface) 100%)',
-          border: '1px solid var(--color-btc-border)',
+          background: "linear-gradient(135deg, var(--color-btc-card) 0%, var(--color-btc-surface) 100%)",
+          border: "1px solid var(--color-btc-border)",
         }}
       >
-        <div className="absolute -right-8 -top-8 h-32 w-32 rounded-full opacity-[0.04]" style={{ background: 'var(--color-btc-gold)' }} />
+        <div className="absolute -right-8 -top-8 h-32 w-32 rounded-full opacity-[0.04]" style={{ background: "var(--color-btc-gold)" }} />
         <div className="relative z-10">
-          <h3 className="mb-1 text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--color-btc-text-dim)' }}>Balance</h3>
-          <p className="text-3xl font-bold" style={{ color: 'var(--color-btc-text)' }}>
+          <h3 className="mb-1 text-xs font-medium uppercase tracking-wider" style={{ color: "var(--color-btc-text-dim)" }}>
+            Balance
+          </h3>
+          <p className="text-3xl font-bold" style={{ color: "var(--color-btc-text)" }}>
             {confirmed.toFixed(coinInfo.decimals > 4 ? 4 : coinInfo.decimals)}{" "}
-            <span className="text-lg font-medium" style={{ color: 'var(--color-btc-gold)' }}>{coinInfo.ticker}</span>
+            <span className="text-lg font-medium" style={{ color: "var(--color-btc-gold)" }}>
+              {coinInfo.ticker}
+            </span>
           </p>
           {unconfirmed > 0 && (
-            <p className="mt-1.5 text-sm" style={{ color: 'var(--color-btc-gold-light)' }}>
+            <p className="mt-1.5 text-sm" style={{ color: "var(--color-btc-gold-light)" }}>
               +{unconfirmed.toFixed(4)} {coinInfo.ticker} unconfirmed
             </p>
           )}
@@ -99,19 +103,19 @@ export function Overview() {
       <div
         className="btc-glow rounded-xl p-5"
         style={{
-          background: 'var(--color-btc-card)',
-          border: '1px solid var(--color-btc-border)',
+          background: "var(--color-btc-card)",
+          border: "1px solid var(--color-btc-border)",
         }}
       >
-        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--color-btc-text-dim)' }}>
+        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider" style={{ color: "var(--color-btc-text-dim)" }}>
           Default Address
         </h3>
         <code
           className="block break-all rounded-lg px-3 py-2.5 text-sm font-mono"
           style={{
-            background: 'var(--color-btc-deep)',
-            color: 'var(--color-btc-gold-light)',
-            border: '1px solid var(--color-btc-border)',
+            background: "var(--color-btc-deep)",
+            color: "var(--color-btc-gold-light)",
+            border: "1px solid var(--color-btc-border)",
           }}
         >
           {address || "Loading..."}
@@ -122,23 +126,27 @@ export function Overview() {
       <div
         className="btc-glow rounded-xl p-5"
         style={{
-          background: 'var(--color-btc-card)',
-          border: '1px solid var(--color-btc-border)',
+          background: "var(--color-btc-card)",
+          border: "1px solid var(--color-btc-border)",
         }}
       >
-        <h3 className="mb-3 text-xs font-medium uppercase tracking-wider" style={{ color: 'var(--color-btc-text-dim)' }}>
+        <h3 className="mb-3 text-xs font-medium uppercase tracking-wider" style={{ color: "var(--color-btc-text-dim)" }}>
           Chain Status
         </h3>
         <dl className="grid grid-cols-2 gap-4 text-sm">
           <div>
-            <dt style={{ color: 'var(--color-btc-text-muted)' }} className="text-xs">Block Height</dt>
-            <dd className="font-mono font-medium" style={{ color: 'var(--color-btc-text)' }}>
+            <dt style={{ color: "var(--color-btc-text-muted)" }} className="text-xs">
+              Block Height
+            </dt>
+            <dd className="font-mono font-medium" style={{ color: "var(--color-btc-text)" }}>
               {height.toLocaleString()}
             </dd>
           </div>
           <div>
-            <dt style={{ color: 'var(--color-btc-text-muted)' }} className="text-xs">Best Block</dt>
-            <dd className="truncate font-mono font-medium" style={{ color: 'var(--color-btc-text)' }} title={bestHash}>
+            <dt style={{ color: "var(--color-btc-text-muted)" }} className="text-xs">
+              Best Block
+            </dt>
+            <dd className="truncate font-mono font-medium" style={{ color: "var(--color-btc-text)" }} title={bestHash}>
               {bestHash ? bestHash.slice(0, 16) + "\u2026" : "\u2014"}
             </dd>
           </div>
@@ -151,29 +159,29 @@ export function Overview() {
       <div
         className="btc-glow flex items-center justify-end gap-5 rounded-xl px-5 py-3"
         style={{
-          background: 'var(--color-btc-card)',
-          border: '1px solid var(--color-btc-border)',
+          background: "var(--color-btc-card)",
+          border: "1px solid var(--color-btc-border)",
         }}
       >
         <div className="flex items-center gap-2">
           <NetworkIcon peers={peers} />
           <div className="text-xs">
-            <p className="font-medium" style={{ color: 'var(--color-btc-text)' }}>{peers} peer{peers !== 1 ? "s" : ""}</p>
-            <p style={{ color: 'var(--color-btc-text-dim)' }}>
+            <p className="font-medium" style={{ color: "var(--color-btc-text)" }}>
+              {peers} peer{peers !== 1 ? "s" : ""}
+            </p>
+            <p style={{ color: "var(--color-btc-text-dim)" }}>
               {peers >= 8 ? "Excellent" : peers >= 4 ? "Good" : peers >= 1 ? "Low" : "No connections"}
             </p>
           </div>
         </div>
-        <div className="h-6 w-px" style={{ background: 'var(--color-btc-border)' }} />
+        <div className="h-6 w-px" style={{ background: "var(--color-btc-border)" }} />
         <div className="flex items-center gap-2">
           <SyncIcon progress={syncProgress} />
           <div className="text-xs">
-            <p className="font-medium" style={{ color: 'var(--color-btc-text)' }}>
+            <p className="font-medium" style={{ color: "var(--color-btc-text)" }}>
               {synced ? "Synced" : `Syncing ${(syncProgress * 100).toFixed(1)}%`}
             </p>
-            <p style={{ color: 'var(--color-btc-text-dim)' }}>
-              {synced ? "Up to date" : "Downloading blocks\u2026"}
-            </p>
+            <p style={{ color: "var(--color-btc-text-dim)" }}>{synced ? "Up to date" : "Downloading blocks\u2026"}</p>
           </div>
         </div>
       </div>

@@ -7,9 +7,13 @@ export function CoinInfo():Promise<Record<string, any>>;
 
 export function ConnectIRC():Promise<void>;
 
+export function ExecuteRPC(arg1:string,arg2:string):Promise<Record<string, any>>;
+
 export function GetBalance():Promise<Record<string, any>>;
 
 export function GetBlockchainInfo():Promise<Record<string, any>>;
+
+export function GetDebugInfo():Promise<Record<string, any>>;
 
 export function GetIRCMessages():Promise<Array<Record<string, any>>>;
 
@@ -17,12 +21,26 @@ export function GetIRCStatus():Promise<Record<string, any>>;
 
 export function GetIRCUsers():Promise<Array<string>>;
 
+export function GetMiningStatus():Promise<Record<string, any>>;
+
+export function GetNetworkTotals():Promise<Record<string, any>>;
+
 export function GetPeerCount():Promise<number>;
+
+export function GetPeerList():Promise<Array<Record<string, any>>>;
 
 export function GetSyncProgress():Promise<number>;
 
+export function GetSyncStatus():Promise<Record<string, any>>;
+
 export function GetWalletAddress():Promise<string>;
+
+export function ListRPCMethods():Promise<Array<string>>;
+
+export function RescanBlockchain():Promise<string>;
 
 export function SendIRCMessage(arg1:string):Promise<void>;
 
 export function SetMining(arg1:boolean):Promise<void>;
+
+export function ToggleMining():Promise<Record<string, any>>;

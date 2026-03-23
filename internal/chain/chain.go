@@ -276,6 +276,14 @@ func (c *Chain) loadUtxoSetFromChainstate() error {
 }
 
 // rebuildUtxoSet replays all blocks to reconstruct the UTXO set and persist it.
+// RescanUTXOSet rebuilds the UTXO set from stored blocks and persists it.
+func (c *Chain) RescanUTXOSet() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.utxoSet.Clear()
+	return c.rebuildUtxoSet()
+}
+
 func (c *Chain) rebuildUtxoSet() error {
 	for h := uint32(0); h <= c.tipHeight; h++ {
 		hash, ok := c.hashByHeight[h]
@@ -376,6 +384,28 @@ func (c *Chain) TipHeader() (*types.BlockHeader, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.store.GetHeader(c.tipHash)
+}
+
+// NewHeaderIndex creates a HeaderIndex seeded with the existing chain's headers
+// from genesis to the current tip. Used by the P2P layer for header-first sync.
+func (c *Chain) NewHeaderIndex() *HeaderIndex {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	idx := NewHeaderIndex(c.params, c.engine, &c.params.GenesisBlock.Header)
+	now := uint32(time.Now().Unix())
+	for h := uint32(1); h <= c.tipHeight; h++ {
+		hash, ok := c.hashByHeight[h]
+		if !ok {
+			break
+		}
+		header, err := c.store.GetHeader(hash)
+		if err != nil {
+			break
+		}
+		idx.AddHeader(header, now)
+	}
+	return idx
 }
 
 func (c *Chain) GetHeaderByHeight(height uint32) (*types.BlockHeader, error) {

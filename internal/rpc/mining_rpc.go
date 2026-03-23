@@ -510,12 +510,14 @@ func (s *Server) rpcGetMiningInfo(_ []json.RawMessage) (interface{}, *jsonRPCErr
 	}
 
 	return map[string]interface{}{
-		"blocks":        tipHeight,
-		"difficulty":    info.Difficulty,
-		"networkhashps": hashps,
-		"pooledtx":      s.mempool.Count(),
-		"chain":         chainName,
-		"warnings":      "",
+		"blocks":             tipHeight,
+		"difficulty":         info.Difficulty,
+		"networkhashps":      hashps,
+		"pooledtx":           s.mempool.Count(),
+		"chain":              chainName,
+		"currentblockweight": 0,
+		"currentblocksize":   0,
+		"warnings":           "",
 	}, nil
 }
 

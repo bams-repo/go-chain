@@ -33,10 +33,13 @@ const (
 	CmdGetData   = "getdata"
 	CmdBlock     = "block"
 	CmdTx        = "tx"
-	CmdGetBlocks = "getblocks"
-	CmdAddr      = "addr"
-	CmdGetAddr   = "getaddr"
-	CmdReject    = "reject"
+	CmdGetBlocks  = "getblocks"
+	CmdGetHeaders = "getheaders"
+	CmdHeaders    = "headers"
+	CmdSendHeaders = "sendheaders"
+	CmdAddr       = "addr"
+	CmdGetAddr    = "getaddr"
+	CmdReject     = "reject"
 )
 
 // Inventory vector types.
@@ -112,6 +115,121 @@ type RejectMsg struct {
 	Code    uint8
 	Reason  string
 }
+
+// GetHeadersMsg requests block headers starting from known hashes.
+// Wire format is identical to GetBlocksMsg: version(4) + varint(count) +
+// locator hashes (32 each) + hashstop(32).
+type GetHeadersMsg struct {
+	Version            uint32
+	BlockLocatorHashes []types.Hash
+	HashStop           types.Hash
+}
+
+// HeadersMsg carries a batch of block headers.
+// Each header is serialized as 80 bytes followed by a varint tx count of 0,
+// matching Bitcoin Core's wire format.
+type HeadersMsg struct {
+	Headers []types.BlockHeader
+}
+
+// MaxHeadersPerMsg is the maximum number of headers allowed in a single
+// headers message (matches Bitcoin Core).
+const MaxHeadersPerMsg = 2000
+
+// SendHeadersMsg is an empty message requesting the peer announce new blocks
+// via headers messages instead of inv messages (BIP 130).
+type SendHeadersMsg struct{}
+
+// ---- GetHeadersMsg encoding ----
+
+func (m *GetHeadersMsg) Encode(w io.Writer) error {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], m.Version)
+	if _, err := w.Write(buf[:]); err != nil {
+		return err
+	}
+	if err := types.WriteVarInt(w, uint64(len(m.BlockLocatorHashes))); err != nil {
+		return err
+	}
+	for _, h := range m.BlockLocatorHashes {
+		if _, err := w.Write(h[:]); err != nil {
+			return err
+		}
+	}
+	_, err := w.Write(m.HashStop[:])
+	return err
+}
+
+func (m *GetHeadersMsg) Decode(r io.Reader) error {
+	var buf [4]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return err
+	}
+	m.Version = binary.LittleEndian.Uint32(buf[:])
+	count, err := types.ReadVarInt(r)
+	if err != nil {
+		return err
+	}
+	if count > 500 {
+		return fmt.Errorf("block locator count %d exceeds max", count)
+	}
+	m.BlockLocatorHashes = make([]types.Hash, count)
+	for i := uint64(0); i < count; i++ {
+		if _, err := io.ReadFull(r, m.BlockLocatorHashes[i][:]); err != nil {
+			return err
+		}
+	}
+	if _, err := io.ReadFull(r, m.HashStop[:]); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ---- HeadersMsg encoding ----
+
+func (m *HeadersMsg) Encode(w io.Writer) error {
+	if err := types.WriteVarInt(w, uint64(len(m.Headers))); err != nil {
+		return err
+	}
+	for i := range m.Headers {
+		if err := m.Headers[i].Serialize(w); err != nil {
+			return err
+		}
+		if err := types.WriteVarInt(w, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *HeadersMsg) Decode(r io.Reader) error {
+	count, err := types.ReadVarInt(r)
+	if err != nil {
+		return err
+	}
+	if count > MaxHeadersPerMsg {
+		return fmt.Errorf("headers count %d exceeds max %d", count, MaxHeadersPerMsg)
+	}
+	m.Headers = make([]types.BlockHeader, count)
+	for i := uint64(0); i < count; i++ {
+		if err := m.Headers[i].Deserialize(r); err != nil {
+			return err
+		}
+		txCount, err := types.ReadVarInt(r)
+		if err != nil {
+			return err
+		}
+		if txCount != 0 {
+			return fmt.Errorf("headers message: header %d has non-zero tx count %d", i, txCount)
+		}
+	}
+	return nil
+}
+
+// ---- SendHeadersMsg encoding ----
+
+func (m *SendHeadersMsg) Encode(w io.Writer) error { return nil }
+func (m *SendHeadersMsg) Decode(r io.Reader) error  { return nil }
 
 // ---- Encoding helpers ----
 

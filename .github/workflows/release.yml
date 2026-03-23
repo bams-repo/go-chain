@@ -90,6 +90,9 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - name: Clone vendored Wails (go.mod replace directive)
+        run: git clone --depth 1 --branch v2.11.0 https://github.com/wailsapp/wails.git depends/wails
+
       - name: Build binaries
         shell: bash
         env:

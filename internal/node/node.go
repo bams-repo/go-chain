@@ -64,7 +64,8 @@ type Node struct {
 	p2p     *p2p.Manager
 	wallet  *wallet.HDWallet
 	rpc     *rpc.Server
-	miner   *miner.Miner
+	miner       *miner.Miner
+	minerCancel context.CancelFunc
 
 	cancel context.CancelFunc
 }
@@ -304,18 +305,59 @@ func (n *Node) startMiner(ctx context.Context) error {
 
 // SetMining starts or stops the built-in miner at runtime.
 func (n *Node) SetMining(enabled bool) {
-	if enabled && n.miner == nil && n.cancel != nil {
+	if enabled {
+		if n.miner != nil {
+			return // already mining
+		}
 		ctx, cancel := context.WithCancel(context.Background())
-		_ = cancel // miner uses the node's cancel; this is a fresh sub-context
-		_ = ctx
-		// For runtime toggling, re-derive a context from the node's lifecycle.
-		// This is a Phase 2 enhancement; for now the miner is started at boot.
+		n.minerCancel = cancel
+		if err := n.startMiner(ctx); err != nil {
+			logging.L.Error("failed to start miner", "error", err)
+			cancel()
+			n.minerCancel = nil
+			return
+		}
+		logging.L.Info("mining enabled at runtime", "component", "node")
+	} else {
+		if n.minerCancel != nil {
+			n.minerCancel()
+			n.minerCancel = nil
+		}
+		n.miner = nil
+		logging.L.Info("mining disabled at runtime", "component", "node")
 	}
+}
+
+// IsMining returns true if the miner is currently running.
+func (n *Node) IsMining() bool {
+	return n.miner != nil && n.minerCancel != nil
+}
+
+// GetHashrate returns the current mining hashrate in hashes/sec.
+func (n *Node) GetHashrate() uint64 {
+	if n.miner == nil {
+		return 0
+	}
+	return n.miner.Hashrate()
+}
+
+// HashrateReady returns true once the miner has enough samples for a
+// meaningful hashrate average.
+func (n *Node) HashrateReady() bool {
+	if n.miner == nil {
+		return false
+	}
+	return n.miner.HashrateReady()
 }
 
 // Stop performs a graceful shutdown: persist mempool, dump peers, close stores.
 func (n *Node) Stop() error {
 	log := logging.L
+
+	if n.minerCancel != nil {
+		n.minerCancel()
+		n.minerCancel = nil
+	}
 
 	if n.cancel != nil {
 		n.cancel()

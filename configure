@@ -15,6 +15,7 @@ set -euo pipefail
 WITH_QT="auto"
 WITH_WALLET=1
 WITH_MINING=1
+DEFAULT_NETWORK="testnet"
 PREFIX="/usr/local"
 MIN_NODE_MAJOR=20
 
@@ -27,6 +28,7 @@ for arg in "$@"; do
         --without-wallet) WITH_WALLET=0 ;;
         --with-mining)   WITH_MINING=1 ;;
         --without-mining) WITH_MINING=0 ;;
+        --network=*)     DEFAULT_NETWORK="${arg#--network=}" ;;
         --prefix=*)      PREFIX="${arg#--prefix=}" ;;
         --help|-h)
             echo "Usage: ./configure [OPTIONS]"
@@ -38,6 +40,7 @@ for arg in "$@"; do
             echo "  --without-wallet   Disable wallet support"
             echo "  --with-mining      Enable built-in miner (default: on)"
             echo "  --without-mining   Disable built-in miner"
+            echo "  --network=NAME     Default network for QT wallet: testnet, regtest, mainnet (default: testnet)"
             echo "  --prefix=PATH      Installation prefix (default: /usr/local)"
             echo "  --help             Show this help"
             exit 0
@@ -338,6 +341,7 @@ NODE := $NODE
 WITH_QT := $QT_ENABLED
 WITH_WALLET := $WITH_WALLET
 WITH_MINING := $WITH_MINING
+DEFAULT_NETWORK := $DEFAULT_NETWORK
 
 # WebKit build tag (webkit2_41 for 4.1, empty for 4.0)
 WEBKIT_TAG := $WEBKIT_TAG
@@ -365,6 +369,7 @@ echo "  Mining support:        $([ "$WITH_MINING" = "1" ] && echo "YES" || echo 
 if [ "$QT_ENABLED" = "1" ] && [ -n "$WEBKIT_TAG" ]; then
     echo "  WebKit build tag:      $WEBKIT_TAG"
 fi
+echo "  Default network:       $DEFAULT_NETWORK"
 echo "  Install prefix:        $PREFIX"
 echo ""
 echo "Configuration written to $CONFIG_MK"

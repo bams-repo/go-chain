@@ -14,12 +14,20 @@ export function ConnectIRC() {
   return window['go']['main']['App']['ConnectIRC']();
 }
 
+export function ExecuteRPC(arg1, arg2) {
+  return window['go']['main']['App']['ExecuteRPC'](arg1, arg2);
+}
+
 export function GetBalance() {
   return window['go']['main']['App']['GetBalance']();
 }
 
 export function GetBlockchainInfo() {
   return window['go']['main']['App']['GetBlockchainInfo']();
+}
+
+export function GetDebugInfo() {
+  return window['go']['main']['App']['GetDebugInfo']();
 }
 
 export function GetIRCMessages() {
@@ -34,16 +42,40 @@ export function GetIRCUsers() {
   return window['go']['main']['App']['GetIRCUsers']();
 }
 
+export function GetMiningStatus() {
+  return window['go']['main']['App']['GetMiningStatus']();
+}
+
+export function GetNetworkTotals() {
+  return window['go']['main']['App']['GetNetworkTotals']();
+}
+
 export function GetPeerCount() {
   return window['go']['main']['App']['GetPeerCount']();
+}
+
+export function GetPeerList() {
+  return window['go']['main']['App']['GetPeerList']();
 }
 
 export function GetSyncProgress() {
   return window['go']['main']['App']['GetSyncProgress']();
 }
 
+export function GetSyncStatus() {
+  return window['go']['main']['App']['GetSyncStatus']();
+}
+
 export function GetWalletAddress() {
   return window['go']['main']['App']['GetWalletAddress']();
+}
+
+export function ListRPCMethods() {
+  return window['go']['main']['App']['ListRPCMethods']();
+}
+
+export function RescanBlockchain() {
+  return window['go']['main']['App']['RescanBlockchain']();
 }
 
 export function SendIRCMessage(arg1) {
@@ -52,4 +84,8 @@ export function SendIRCMessage(arg1) {
 
 export function SetMining(arg1) {
   return window['go']['main']['App']['SetMining'](arg1);
+}
+
+export function ToggleMining() {
+  return window['go']['main']['App']['ToggleMining']();
 }

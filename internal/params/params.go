@@ -17,7 +17,7 @@ import (
 type ChainParams struct {
 	// Network identity
 	Name         string     // Human-readable network name.
-	DataDirName  string     // Subdirectory under the root data dir (e.g. "testnet2"). Empty = root.
+	DataDirName  string     // Subdirectory under the root data dir (e.g. "testnet3"). Empty = root.
 	NetworkMagic [4]byte    // Wire protocol magic bytes for message framing.
 	DefaultPort  uint16     // Default TCP listen port.
 	AddressPrefix byte      // Future: address version byte for base58/bech32.

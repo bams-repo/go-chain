@@ -198,7 +198,7 @@ For local testing/regtest, you can disable auth entirely with `-norpcauth`.
   .lock                          # Instance lock file
   fairchain.conf                 # Optional config
 
-  testnet2/                      # Testnet subdirectory
+  testnet3/                      # Testnet subdirectory
     blocks/
     chainstate/
     wallet/

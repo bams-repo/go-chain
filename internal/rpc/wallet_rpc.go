@@ -746,6 +746,25 @@ func (s *Server) handleGetTransaction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleListSinceBlock(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
+		return
+	}
+	result, rpcErr := s.rpcListSinceBlock(nil)
+	if rpcErr != nil {
+		writeError(w, http.StatusInternalServerError, rpcErr.Message)
+		return
+	}
+	writeJSON(w, result)
+}
+
+func (s *Server) handleSendMany(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
+		return
+	}
+	writeError(w, http.StatusBadRequest, "sendmany is only available via JSON-RPC")
+}
+
 // --- Bitcoin Core parity: wallet encryption RPCs ---
 
 func (s *Server) handleEncryptWallet(w http.ResponseWriter, r *http.Request) {

@@ -55,6 +55,12 @@ type Peer struct {
 	syncedHeaders atomic.Int32
 	syncedBlocks  atomic.Int32
 
+	// BIP 130: peer prefers block announcements via headers instead of inv.
+	prefersHeaders int32 // atomic: 1 = peer sent sendheaders
+
+	// Total headers received from this peer (DoS tracking).
+	headersReceived int32 // atomic counter
+
 	// Misbehavior scoring (Bitcoin Core parity: ban at 100).
 	banScore int32 // atomic-style but guarded by mu for compound ops
 
@@ -64,6 +70,9 @@ type Peer struct {
 
 	// Address gossip: Bitcoin Core only responds to one getaddr per connection.
 	getaddrResponded bool
+
+	// Per-peer getheaders throttle: max 1 response per 2 seconds.
+	lastGetHeadersResp time.Time
 
 	// Inventory deduplication — bounded FIFO to prevent unbounded growth.
 	knownInv  *boundedHashSet
@@ -256,6 +265,31 @@ func (p *Peer) SetSyncedHeaders(h int32) { p.syncedHeaders.Store(h) }
 // SetSyncedBlocks records the last common block height with this peer.
 func (p *Peer) SetSyncedBlocks(h int32) { p.syncedBlocks.Store(h) }
 
+// SetPrefersHeaders marks whether this peer prefers header announcements (BIP 130).
+func (p *Peer) SetPrefersHeaders(v bool) {
+	if v {
+		atomic.StoreInt32(&p.prefersHeaders, 1)
+	} else {
+		atomic.StoreInt32(&p.prefersHeaders, 0)
+	}
+}
+
+// PrefersHeaders returns true if the peer sent sendheaders (BIP 130).
+func (p *Peer) PrefersHeaders() bool {
+	return atomic.LoadInt32(&p.prefersHeaders) == 1
+}
+
+// AddHeadersReceived atomically increments the headers-received counter
+// and returns the new total.
+func (p *Peer) AddHeadersReceived(n int32) int32 {
+	return atomic.AddInt32(&p.headersReceived, n)
+}
+
+// HeadersReceived returns the total number of headers received from this peer.
+func (p *Peer) HeadersReceived() int32 {
+	return atomic.LoadInt32(&p.headersReceived)
+}
+
 // --- Misbehavior scoring ---
 
 // AddBanScore increases the peer's misbehavior score. Returns the new score.
@@ -300,6 +334,18 @@ func (p *Peer) MarkGetAddrResponded() bool {
 		return false
 	}
 	p.getaddrResponded = true
+	return true
+}
+
+// CheckGetHeadersThrottle returns true if enough time has passed since the
+// last getheaders response to this peer. Updates the timestamp on success.
+func (p *Peer) CheckGetHeadersThrottle() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Since(p.lastGetHeadersResp) < 2*time.Second {
+		return false
+	}
+	p.lastGetHeadersResp = time.Now()
 	return true
 }
 
@@ -472,6 +518,7 @@ type PeerInfo struct {
 	SyncedHeaders   int32   `json:"synced_headers"`
 	SyncedBlocks    int32   `json:"synced_blocks"`
 	BanScore        int32   `json:"banscore"`
+	PrefersHeaders  bool    `json:"prefers_headers"`
 	ConnectionType  string  `json:"connection_type"`
 }
 
@@ -490,6 +537,7 @@ func (p *Peer) Info() PeerInfo {
 		ConnTime:        p.connectedAt.Unix(),
 		SyncedHeaders:   p.syncedHeaders.Load(),
 		SyncedBlocks:    p.syncedBlocks.Load(),
+		PrefersHeaders:  p.PrefersHeaders(),
 		ConnectionType:  p.connType,
 		Inbound:         p.inbound,
 	}

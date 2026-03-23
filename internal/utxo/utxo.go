@@ -194,6 +194,13 @@ func (s *Set) Remove(txHash types.Hash, index uint32) *UtxoEntry {
 	return entry
 }
 
+// Clear removes all entries from the UTXO set.
+func (s *Set) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = make(map[[36]byte]*UtxoEntry)
+}
+
 // Count returns the number of UTXOs in the set.
 func (s *Set) Count() int {
 	s.mu.RLock()

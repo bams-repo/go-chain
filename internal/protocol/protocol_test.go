@@ -163,6 +163,225 @@ func TestMessageHeaderEncodeDecode(t *testing.T) {
 	}
 }
 
+func TestGetHeadersMsgRoundtrip(t *testing.T) {
+	msg := GetHeadersMsg{
+		Version:            2,
+		BlockLocatorHashes: []types.Hash{{0xAA}, {0xBB}},
+		HashStop:           types.Hash{0xCC},
+	}
+
+	var buf bytes.Buffer
+	if err := msg.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	var msg2 GetHeadersMsg
+	if err := msg2.Decode(&buf); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+
+	if msg2.Version != 2 || len(msg2.BlockLocatorHashes) != 2 || msg2.HashStop != msg.HashStop {
+		t.Fatal("GetHeadersMsg roundtrip mismatch")
+	}
+	if msg2.BlockLocatorHashes[0] != msg.BlockLocatorHashes[0] ||
+		msg2.BlockLocatorHashes[1] != msg.BlockLocatorHashes[1] {
+		t.Fatal("GetHeadersMsg locator hash mismatch")
+	}
+}
+
+func TestGetHeadersMsgWireCompatibility(t *testing.T) {
+	msg := GetBlocksMsg{
+		Version:            2,
+		BlockLocatorHashes: []types.Hash{{0x01}, {0x02}},
+		HashStop:           types.Hash{0xFF},
+	}
+
+	var bufBlocks bytes.Buffer
+	if err := msg.Encode(&bufBlocks); err != nil {
+		t.Fatalf("Encode GetBlocksMsg: %v", err)
+	}
+
+	hdrMsg := GetHeadersMsg{
+		Version:            2,
+		BlockLocatorHashes: []types.Hash{{0x01}, {0x02}},
+		HashStop:           types.Hash{0xFF},
+	}
+
+	var bufHeaders bytes.Buffer
+	if err := hdrMsg.Encode(&bufHeaders); err != nil {
+		t.Fatalf("Encode GetHeadersMsg: %v", err)
+	}
+
+	if !bytes.Equal(bufBlocks.Bytes(), bufHeaders.Bytes()) {
+		t.Fatal("GetHeadersMsg wire format differs from GetBlocksMsg")
+	}
+}
+
+func TestHeadersMsgRoundtripEmpty(t *testing.T) {
+	msg := HeadersMsg{Headers: nil}
+
+	var buf bytes.Buffer
+	if err := msg.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	var msg2 HeadersMsg
+	if err := msg2.Decode(&buf); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+
+	if len(msg2.Headers) != 0 {
+		t.Fatalf("expected 0 headers, got %d", len(msg2.Headers))
+	}
+}
+
+func TestHeadersMsgRoundtripSingle(t *testing.T) {
+	hdr := types.BlockHeader{
+		Version:    1,
+		PrevBlock:  types.Hash{0x01},
+		MerkleRoot: types.Hash{0x02},
+		Timestamp:  1700000000,
+		Bits:       0x1d00ffff,
+		Nonce:      42,
+	}
+	msg := HeadersMsg{Headers: []types.BlockHeader{hdr}}
+
+	var buf bytes.Buffer
+	if err := msg.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	var msg2 HeadersMsg
+	if err := msg2.Decode(&buf); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+
+	if len(msg2.Headers) != 1 {
+		t.Fatalf("expected 1 header, got %d", len(msg2.Headers))
+	}
+	got := msg2.Headers[0]
+	if got.Version != hdr.Version || got.PrevBlock != hdr.PrevBlock ||
+		got.MerkleRoot != hdr.MerkleRoot || got.Timestamp != hdr.Timestamp ||
+		got.Bits != hdr.Bits || got.Nonce != hdr.Nonce {
+		t.Fatal("HeadersMsg single header roundtrip mismatch")
+	}
+}
+
+func TestHeadersMsgRoundtripMax(t *testing.T) {
+	headers := make([]types.BlockHeader, MaxHeadersPerMsg)
+	for i := range headers {
+		headers[i] = types.BlockHeader{
+			Version:   1,
+			Timestamp: uint32(1700000000 + i),
+			Bits:      0x1d00ffff,
+			Nonce:     uint32(i),
+		}
+	}
+	msg := HeadersMsg{Headers: headers}
+
+	var buf bytes.Buffer
+	if err := msg.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	var msg2 HeadersMsg
+	if err := msg2.Decode(&buf); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+
+	if len(msg2.Headers) != MaxHeadersPerMsg {
+		t.Fatalf("expected %d headers, got %d", MaxHeadersPerMsg, len(msg2.Headers))
+	}
+	if msg2.Headers[0].Nonce != 0 || msg2.Headers[MaxHeadersPerMsg-1].Nonce != uint32(MaxHeadersPerMsg-1) {
+		t.Fatal("HeadersMsg max roundtrip nonce mismatch")
+	}
+}
+
+func TestHeadersMsgDecodeExceedsMax(t *testing.T) {
+	var buf bytes.Buffer
+	if err := types.WriteVarInt(&buf, uint64(MaxHeadersPerMsg+1)); err != nil {
+		t.Fatalf("WriteVarInt: %v", err)
+	}
+
+	var msg HeadersMsg
+	err := msg.Decode(&buf)
+	if err == nil {
+		t.Fatal("expected error for headers count exceeding max")
+	}
+}
+
+func TestHeadersMsgTxCountZero(t *testing.T) {
+	hdr := types.BlockHeader{
+		Version:   1,
+		Timestamp: 1700000000,
+		Bits:      0x1d00ffff,
+		Nonce:     1,
+	}
+
+	var buf bytes.Buffer
+	if err := types.WriteVarInt(&buf, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := hdr.Serialize(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := types.WriteVarInt(&buf, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var msg HeadersMsg
+	if err := msg.Decode(&buf); err != nil {
+		t.Fatalf("Decode with txcount=0: %v", err)
+	}
+	if len(msg.Headers) != 1 {
+		t.Fatalf("expected 1 header, got %d", len(msg.Headers))
+	}
+}
+
+func TestHeadersMsgNonZeroTxCountRejected(t *testing.T) {
+	hdr := types.BlockHeader{
+		Version:   1,
+		Timestamp: 1700000000,
+		Bits:      0x1d00ffff,
+		Nonce:     1,
+	}
+
+	var buf bytes.Buffer
+	if err := types.WriteVarInt(&buf, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := hdr.Serialize(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := types.WriteVarInt(&buf, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	var msg HeadersMsg
+	err := msg.Decode(&buf)
+	if err == nil {
+		t.Fatal("expected error for non-zero tx count in headers message")
+	}
+}
+
+func TestSendHeadersMsgRoundtrip(t *testing.T) {
+	msg := SendHeadersMsg{}
+
+	var buf bytes.Buffer
+	if err := msg.Encode(&buf); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	if buf.Len() != 0 {
+		t.Fatalf("expected empty payload, got %d bytes", buf.Len())
+	}
+
+	var msg2 SendHeadersMsg
+	if err := msg2.Decode(&buf); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+}
+
 func TestMessageEncodingDeterministic(t *testing.T) {
 	msg := VersionMsg{
 		Version: 1, Services: 1, Timestamp: 1700000000,

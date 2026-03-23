@@ -43,6 +43,12 @@ jobs:
       - name: Show Go version
         run: go version
 
+      - name: Clone vendored Wails (go.mod replace directive)
+        run: git clone --depth 1 --branch v2.11.0 https://github.com/wailsapp/wails.git depends/wails
+
+      - name: Create QT frontend stub (embed directive needs dist/)
+        run: mkdir -p cmd/qt/frontend/dist && touch cmd/qt/frontend/dist/.gitkeep
+
       - name: Download modules
         run: go mod download
 

@@ -12,7 +12,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
+	"sort"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/crypto"
@@ -91,6 +94,7 @@ func (s *Server) buildMethodMap() map[string]rpcHandler {
 
 		// Wallet
 		"validateaddress":  s.rpcValidateAddress,
+		"getaddressinfo":   s.rpcGetAddressInfo,
 		"getnewaddress":    s.rpcGetNewAddress,
 		"getbalance":       s.rpcGetBalance,
 		"getwalletinfo":    s.rpcGetWalletInfo,
@@ -99,7 +103,14 @@ func (s *Server) buildMethodMap() map[string]rpcHandler {
 		"importprivkey":    s.rpcImportPrivKey,
 		"settxfee":         s.rpcSetTxFee,
 		"sendtoaddress":    s.rpcSendToAddress,
+		"sendmany":         s.rpcSendMany,
+		"gettransaction":   s.rpcGetTransaction,
+		"listtransactions": s.rpcListTransactions,
+		"listsinceblock":   s.rpcListSinceBlock,
+		"walletpassphrase": s.rpcWalletPassphrase,
+		"walletlock":       s.rpcWalletLock,
 		"getrawchangeaddress": s.rpcGetRawChangeAddress,
+		"decoderawtransaction": s.rpcDecodeRawTransaction,
 
 		// Control
 		"getinfo": s.rpcGetInfo,
@@ -202,6 +213,27 @@ func (s *Server) dispatchJSONRPC(req jsonRPCRequest) jsonRPCResponse {
 	return resp
 }
 
+// DispatchRPC executes a JSON-RPC method by name with raw JSON params,
+// returning the result and error as generic values for in-process callers
+// (e.g. the QT wallet console).
+func (s *Server) DispatchRPC(method string, params []json.RawMessage) (interface{}, *jsonRPCError) {
+	handler, ok := s.methodMap[method]
+	if !ok {
+		return nil, newRPCError(rpcErrMethodNotFound, fmt.Sprintf("method %q not found", method))
+	}
+	return handler(params)
+}
+
+// ListMethods returns all registered JSON-RPC method names.
+func (s *Server) ListMethods() []string {
+	names := make([]string, 0, len(s.methodMap))
+	for name := range s.methodMap {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func writeJSONRPCError(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
 	resp := jsonRPCResponse{
 		ID:    id,
@@ -290,9 +322,15 @@ func (s *Server) rpcGetBlock(params []json.RawMessage) (interface{}, *jsonRPCErr
 	if heightErr == nil {
 		confirmations = int64(tipHeight) - int64(blockHeight) + 1
 	}
-	return map[string]interface{}{
+	blockSize := 0
+	if blockBytes, serErr := block.SerializeToBytes(); serErr == nil {
+		blockSize = len(blockBytes)
+	}
+	resp := map[string]interface{}{
 		"hash":              blockHash.ReverseString(),
 		"confirmations":     confirmations,
+		"size":              blockSize,
+		"weight":            blockSize * 4,
 		"height":            blockHeight,
 		"version":           block.Header.Version,
 		"merkleroot":        block.Header.MerkleRoot.ReverseString(),
@@ -300,9 +338,18 @@ func (s *Server) rpcGetBlock(params []json.RawMessage) (interface{}, *jsonRPCErr
 		"time":              block.Header.Timestamp,
 		"nonce":             block.Header.Nonce,
 		"bits":              fmt.Sprintf("%08x", block.Header.Bits),
+		"difficulty":        s.compactToDifficulty(block.Header.Bits),
 		"previousblockhash": block.Header.PrevBlock.ReverseString(),
 		"nTx":               len(block.Transactions),
-	}, nil
+	}
+	if heightErr == nil && blockHeight < tipHeight {
+		nextHeader, nextErr := s.chain.GetHeaderByHeight(blockHeight + 1)
+		if nextErr == nil {
+			nextHash := crypto.HashBlockHeader(nextHeader)
+			resp["nextblockhash"] = nextHash.ReverseString()
+		}
+	}
+	return resp, nil
 }
 
 func (s *Server) rpcGetDifficulty(_ []json.RawMessage) (interface{}, *jsonRPCError) {
@@ -418,6 +465,10 @@ func (s *Server) rpcGetTxOutSetInfo(_ []json.RawMessage) (interface{}, *jsonRPCE
 func (s *Server) rpcGetInfo(_ []json.RawMessage) (interface{}, *jsonRPCError) {
 	tipHash, tipHeight := s.chain.Tip()
 	info := s.chain.GetChainInfo()
+	var balance uint64
+	if s.wallet != nil {
+		balance = s.wallet.GetBalance(s.makeUtxoIterator(), tipHeight, 1, s.params.CoinbaseMaturity)
+	}
 	return map[string]interface{}{
 		"version":         version.ProtocolVersion,
 		"protocolversion": version.ProtocolVersion,
@@ -427,6 +478,9 @@ func (s *Server) rpcGetInfo(_ []json.RawMessage) (interface{}, *jsonRPCError) {
 		"connections":     s.p2p.PeerCount(),
 		"network":         s.params.Name,
 		"mempool_size":    s.mempool.Count(),
+		"balance":         balance,
+		"paytxfee":        s.feePerByte.Load(),
+		"errors":          "",
 	}, nil
 }
 
@@ -856,4 +910,552 @@ func (s *Server) rpcGetRawChangeAddress(_ []json.RawMessage) (interface{}, *json
 		return nil, newRPCError(rpcErrInternal, err.Error())
 	}
 	return addr, nil
+}
+
+// rpcSendMany implements Bitcoin Core's sendmany RPC for batch payouts.
+// Params: ["" (ignored account), {"addr":amount,...}, minconf, "comment", ["subtractfeefrom"]]
+func (s *Server) rpcSendMany(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+	if err := s.wallet.RequireUnlocked(); err != nil {
+		return nil, newRPCError(rpcErrMisc, err.Error())
+	}
+	if len(params) < 2 {
+		return nil, newRPCError(rpcErrInvalidParams, "sendmany requires at least 2 parameters")
+	}
+
+	var amounts map[string]uint64
+	if err := json.Unmarshal(params[1], &amounts); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid amounts object: "+err.Error())
+	}
+	if len(amounts) == 0 {
+		return nil, newRPCError(rpcErrInvalidParams, "amounts object is empty")
+	}
+
+	var outputs []types.TxOutput
+	var totalSend uint64
+	for addr, amount := range amounts {
+		if amount == 0 {
+			return nil, newRPCError(rpcErrInvalidParams, fmt.Sprintf("amount for %s must be > 0", addr))
+		}
+		addrVer, destPKH, err := crypto.AddressToPubKeyHash(addr)
+		if err != nil {
+			return nil, newRPCError(rpcErrInvalidParams, fmt.Sprintf("invalid address %s: %v", addr, err))
+		}
+		if s.wallet != nil {
+			dk := s.wallet.GetKeyForAddress(addr)
+			_ = dk
+			if addrVer != s.wallet.AddressVersion() {
+				return nil, newRPCError(rpcErrInvalidParams, fmt.Sprintf("address %s: wrong network", addr))
+			}
+		}
+		outputs = append(outputs, types.TxOutput{
+			Value:    amount,
+			PkScript: crypto.MakeP2PKHScript(destPKH),
+		})
+		totalSend += amount
+	}
+
+	_, tipHeight := s.chain.Tip()
+	utxos := s.wallet.FindUnspent(s.makeUtxoIterator(), tipHeight)
+
+	spendable := filterSpendableUTXOs(utxos, s.params.CoinbaseMaturity, tipHeight)
+	if len(spendable) == 0 {
+		return nil, newRPCError(rpcErrMisc, "no spendable UTXOs available")
+	}
+
+	feeRate := s.feePerByte.Load()
+	selected, totalIn := selectCoinsForAmount(spendable, totalSend, feeRate, len(outputs))
+	if selected == nil {
+		return nil, newRPCError(rpcErrMisc, fmt.Sprintf("insufficient funds: need %d, available in wallet", totalSend))
+	}
+
+	tx := &types.Transaction{Version: 1, LockTime: tipHeight}
+	for _, u := range selected {
+		tx.Inputs = append(tx.Inputs, types.TxInput{
+			PreviousOutPoint: types.OutPoint{Hash: u.TxHash, Index: u.Index},
+			Sequence:         0xFFFFFFFF,
+		})
+	}
+	tx.Outputs = outputs
+
+	const estimatedInputSize = 148
+	const estimatedOutputSize = 34
+	const txOverhead = 10
+	estimatedSize := txOverhead + len(selected)*estimatedInputSize + len(tx.Outputs)*estimatedOutputSize
+	fee := uint64(estimatedSize) * feeRate
+	if fee < 1 {
+		fee = 1
+	}
+
+	if totalIn < totalSend+fee {
+		return nil, newRPCError(rpcErrMisc, fmt.Sprintf("insufficient funds for fee: need %d + %d fee", totalSend, fee))
+	}
+
+	change := totalIn - totalSend - fee
+	const dustThreshold = 546
+	if change > dustThreshold {
+		changeAddr, err := s.wallet.GetChangeAddress()
+		if err != nil {
+			return nil, newRPCError(rpcErrInternal, "derive change address: "+err.Error())
+		}
+		_, changePKH, err := crypto.AddressToPubKeyHash(changeAddr)
+		if err != nil {
+			return nil, newRPCError(rpcErrInternal, "decode change address: "+err.Error())
+		}
+		tx.Outputs = append(tx.Outputs, types.TxOutput{
+			Value:    change,
+			PkScript: crypto.MakeP2PKHScript(changePKH),
+		})
+		estimatedSize = txOverhead + len(selected)*estimatedInputSize + len(tx.Outputs)*estimatedOutputSize
+		fee = uint64(estimatedSize) * feeRate
+		if fee < 1 {
+			fee = 1
+		}
+		newChange := totalIn - totalSend - fee
+		if newChange > dustThreshold {
+			tx.Outputs[len(tx.Outputs)-1].Value = newChange
+		} else {
+			tx.Outputs = tx.Outputs[:len(tx.Outputs)-1]
+		}
+	}
+
+	for i, u := range selected {
+		dk := s.wallet.KeyForScript(u.PkScript)
+		if dk == nil {
+			return nil, newRPCError(rpcErrMisc, fmt.Sprintf("no private key for input %d", i))
+		}
+		sigScript, err := crypto.SignInput(tx, i, u.PkScript, dk.PrivKey)
+		if err != nil {
+			return nil, newRPCError(rpcErrMisc, fmt.Sprintf("sign input %d: %v", i, err))
+		}
+		tx.Inputs[i].SignatureScript = sigScript
+	}
+
+	txHash, err := s.submitTxToMempool(tx)
+	if err != nil {
+		return nil, newRPCError(rpcErrMisc, "mempool rejection: "+err.Error())
+	}
+	return txHash.ReverseString(), nil
+}
+
+// rpcGetTransaction returns wallet transaction details via JSON-RPC.
+// Params: ["txid", include_watchonly]
+func (s *Server) rpcGetTransaction(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if len(params) < 1 {
+		return nil, newRPCError(rpcErrInvalidParams, "missing txid parameter")
+	}
+	var txidStr string
+	if err := json.Unmarshal(params[0], &txidStr); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid txid: "+err.Error())
+	}
+	txHash, err := types.HashFromReverseHex(txidStr)
+	if err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid txid hex: "+err.Error())
+	}
+
+	if entry, ok := s.mempool.GetTxEntry(txHash); ok {
+		var txBuf bytes.Buffer
+		if serErr := entry.Tx.Serialize(&txBuf); serErr != nil {
+			return nil, newRPCError(rpcErrInternal, "serialize tx: "+serErr.Error())
+		}
+		now := time.Now().Unix()
+		return map[string]interface{}{
+			"txid":          txidStr,
+			"amount":        int64(0),
+			"confirmations": 0,
+			"hex":           hex.EncodeToString(txBuf.Bytes()),
+			"fee":           entry.Fee,
+			"time":          now,
+			"timereceived":  now,
+			"details":       []interface{}{},
+		}, nil
+	}
+
+	_, tipHeight := s.chain.Tip()
+	utxoSet := s.chain.UtxoSet()
+	var details []map[string]interface{}
+	var totalValue uint64
+	var blockHeight uint32
+	var isCoinbase bool
+	found := false
+
+	utxoSet.ForEach(func(hash types.Hash, index uint32, entry *utxo.UtxoEntry) {
+		if hash != txHash {
+			return
+		}
+		found = true
+		blockHeight = entry.Height
+		totalValue += entry.Value
+		if entry.IsCoinbase {
+			isCoinbase = true
+		}
+
+		addr := ""
+		hashBytes := crypto.ExtractP2PKHHash(entry.PkScript)
+		if hashBytes != nil {
+			var pkh [crypto.PubKeyHashSize]byte
+			copy(pkh[:], hashBytes)
+			if s.wallet != nil {
+				addr = crypto.PubKeyHashToAddress(pkh, s.wallet.AddressVersion())
+			}
+		}
+
+		confs := uint32(0)
+		if tipHeight >= entry.Height {
+			confs = tipHeight - entry.Height + 1
+		}
+
+		category := "receive"
+		if entry.IsCoinbase {
+			if confs >= s.params.CoinbaseMaturity {
+				category = "generate"
+			} else {
+				category = "immature"
+			}
+		}
+
+		details = append(details, map[string]interface{}{
+			"address":  addr,
+			"vout":     index,
+			"amount":   entry.Value,
+			"category": category,
+		})
+	})
+
+	if !found {
+		return nil, newRPCError(rpcErrMisc, "Invalid or non-wallet transaction id")
+	}
+
+	confs := uint32(0)
+	if tipHeight >= blockHeight {
+		confs = tipHeight - blockHeight + 1
+	}
+
+	result := map[string]interface{}{
+		"txid":          txidStr,
+		"amount":        totalValue,
+		"confirmations": confs,
+		"generated":     isCoinbase,
+		"details":       details,
+		"time":          int64(0),
+		"timereceived":  int64(0),
+	}
+
+	block, _, blkErr := s.chain.GetBlockByHeight(blockHeight)
+	if blkErr == nil {
+		blkHash := crypto.HashBlockHeader(&block.Header)
+		result["blockhash"] = blkHash.ReverseString()
+		result["blockheight"] = blockHeight
+		result["blocktime"] = block.Header.Timestamp
+		result["time"] = int64(block.Header.Timestamp)
+		result["timereceived"] = int64(block.Header.Timestamp)
+
+		for i := range block.Transactions {
+			h, _ := crypto.HashTransaction(&block.Transactions[i])
+			if h == txHash {
+				var txBuf bytes.Buffer
+				if serErr := block.Transactions[i].Serialize(&txBuf); serErr == nil {
+					result["hex"] = hex.EncodeToString(txBuf.Bytes())
+				}
+				break
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// rpcListSinceBlock implements Bitcoin Core's listsinceblock RPC.
+// Params: ["blockhash", target_confirmations, include_watchonly]
+func (s *Server) rpcListSinceBlock(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+
+	sinceHeight := uint32(0)
+	if len(params) > 0 {
+		var hashStr string
+		if err := json.Unmarshal(params[0], &hashStr); err == nil && hashStr != "" {
+			blockHash, err := types.HashFromReverseHex(hashStr)
+			if err != nil {
+				return nil, newRPCError(rpcErrInvalidParams, "invalid blockhash: "+err.Error())
+			}
+			height, err := s.chain.GetBlockHeight(blockHash)
+			if err != nil {
+				return nil, newRPCError(rpcErrMisc, "block not found")
+			}
+			sinceHeight = height
+		}
+	}
+
+	tipHash, tipHeight := s.chain.Tip()
+	utxoSet := s.chain.UtxoSet()
+	var txns []map[string]interface{}
+
+	utxoSet.ForEach(func(hash types.Hash, index uint32, entry *utxo.UtxoEntry) {
+		if entry.Height <= sinceHeight {
+			return
+		}
+		if !s.wallet.IsOurScript(entry.PkScript) {
+			return
+		}
+
+		confs := uint32(0)
+		if tipHeight >= entry.Height {
+			confs = tipHeight - entry.Height + 1
+		}
+
+		category := "receive"
+		if entry.IsCoinbase {
+			if confs >= s.params.CoinbaseMaturity {
+				category = "generate"
+			} else {
+				category = "immature"
+			}
+		}
+
+		addr := ""
+		hashBytes := crypto.ExtractP2PKHHash(entry.PkScript)
+		if hashBytes != nil {
+			var pkh [crypto.PubKeyHashSize]byte
+			copy(pkh[:], hashBytes)
+			addr = crypto.PubKeyHashToAddress(pkh, s.wallet.AddressVersion())
+		}
+
+		txEntry := map[string]interface{}{
+			"address":       addr,
+			"category":      category,
+			"amount":        entry.Value,
+			"vout":          index,
+			"confirmations": confs,
+			"txid":          hash.ReverseString(),
+			"blockheight":   entry.Height,
+		}
+
+		block, _, blkErr := s.chain.GetBlockByHeight(entry.Height)
+		if blkErr == nil {
+			blkHash := crypto.HashBlockHeader(&block.Header)
+			txEntry["blockhash"] = blkHash.ReverseString()
+			txEntry["blocktime"] = block.Header.Timestamp
+			txEntry["time"] = int64(block.Header.Timestamp)
+			txEntry["timereceived"] = int64(block.Header.Timestamp)
+		}
+
+		txns = append(txns, txEntry)
+	})
+
+	if txns == nil {
+		txns = make([]map[string]interface{}, 0)
+	}
+
+	return map[string]interface{}{
+		"transactions": txns,
+		"lastblock":    tipHash.ReverseString(),
+	}, nil
+}
+
+// rpcGetAddressInfo mirrors validateaddress for Miningcore compatibility.
+func (s *Server) rpcGetAddressInfo(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if len(params) < 1 {
+		return nil, newRPCError(rpcErrInvalidParams, "missing address parameter")
+	}
+	var addr string
+	if err := json.Unmarshal(params[0], &addr); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid address: "+err.Error())
+	}
+	ver, pkh, err := crypto.AddressToPubKeyHash(addr)
+	if err != nil {
+		return map[string]interface{}{
+			"isvalid": false,
+			"address": addr,
+		}, nil
+	}
+	isMine := false
+	if s.wallet != nil {
+		dk := s.wallet.GetKeyForAddress(addr)
+		isMine = dk != nil
+	}
+	return map[string]interface{}{
+		"isvalid":      true,
+		"address":      addr,
+		"scriptPubKey": hex.EncodeToString(crypto.MakeP2PKHScript(pkh)),
+		"ismine":       isMine,
+		"iswatchonly":  false,
+		"isscript":     false,
+		"iswitness":    false,
+		"version":      ver,
+	}, nil
+}
+
+// rpcDecodeRawTransaction decodes a hex-encoded transaction.
+func (s *Server) rpcDecodeRawTransaction(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if len(params) < 1 {
+		return nil, newRPCError(rpcErrInvalidParams, "missing hex parameter")
+	}
+	var hexStr string
+	if err := json.Unmarshal(params[0], &hexStr); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid hex parameter: "+err.Error())
+	}
+	txBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid hex encoding: "+err.Error())
+	}
+	var tx types.Transaction
+	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid transaction: "+err.Error())
+	}
+	txHash, _ := crypto.HashTransaction(&tx)
+	return s.buildVerboseTx(&tx, txHash, hexStr, 0, types.ZeroHash), nil
+}
+
+// rpcWalletPassphrase unlocks the wallet for the given duration.
+func (s *Server) rpcWalletPassphrase(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+	if len(params) < 2 {
+		return nil, newRPCError(rpcErrInvalidParams, "walletpassphrase requires passphrase and timeout")
+	}
+	var passphrase string
+	if err := json.Unmarshal(params[0], &passphrase); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid passphrase: "+err.Error())
+	}
+	var timeout int64
+	if err := json.Unmarshal(params[1], &timeout); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid timeout: "+err.Error())
+	}
+	if err := s.wallet.WalletPassphrase(passphrase, timeout); err != nil {
+		return nil, newRPCError(rpcErrMisc, err.Error())
+	}
+	return nil, nil
+}
+
+// rpcWalletLock locks the wallet.
+func (s *Server) rpcWalletLock(_ []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+	if err := s.wallet.WalletLock(); err != nil {
+		return nil, newRPCError(rpcErrMisc, err.Error())
+	}
+	return nil, nil
+}
+
+// rpcListTransactions returns recent wallet transactions via JSON-RPC.
+// Params: ["label", count, skip]
+func (s *Server) rpcListTransactions(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+
+	count := 10
+	skip := 0
+	if len(params) > 1 {
+		var c int
+		if err := json.Unmarshal(params[1], &c); err == nil && c > 0 {
+			count = c
+		}
+	}
+	if len(params) > 2 {
+		var sk int
+		if err := json.Unmarshal(params[2], &sk); err == nil && sk >= 0 {
+			skip = sk
+		}
+	}
+
+	_, tipHeight := s.chain.Tip()
+	utxos := s.wallet.FindUnspent(s.makeUtxoIterator(), tipHeight)
+
+	var results []map[string]interface{}
+	for _, u := range utxos {
+		txHashType := types.Hash(u.TxHash)
+		category := "receive"
+		if u.IsCoinbase {
+			if u.Confirmations >= s.params.CoinbaseMaturity {
+				category = "generate"
+			} else {
+				category = "immature"
+			}
+		}
+		results = append(results, map[string]interface{}{
+			"address":       u.Address,
+			"category":      category,
+			"amount":        u.Value,
+			"confirmations": u.Confirmations,
+			"txid":          txHashType.ReverseString(),
+			"vout":          u.Index,
+			"blockheight":   u.Height,
+		})
+	}
+
+	if skip < len(results) {
+		results = results[skip:]
+	} else {
+		results = nil
+	}
+	if len(results) > count {
+		results = results[len(results)-count:]
+	}
+	if results == nil {
+		results = make([]map[string]interface{}, 0)
+	}
+	return results, nil
+}
+
+// filterSpendableUTXOs filters wallet UTXOs for coin selection.
+func filterSpendableUTXOs(utxos []wallet.UnspentOutput, coinbaseMaturity uint32, tipHeight uint32) []wallet.UnspentOutput {
+	var result []wallet.UnspentOutput
+	for _, u := range utxos {
+		if u.Confirmations < 1 {
+			continue
+		}
+		if u.IsCoinbase && u.Confirmations < coinbaseMaturity {
+			continue
+		}
+		result = append(result, u)
+	}
+	return result
+}
+
+// selectCoinsForAmount selects UTXOs to cover the target amount plus estimated fee.
+func selectCoinsForAmount(utxos []wallet.UnspentOutput, targetAmount uint64, feePerByte uint64, numOutputs int) ([]wallet.UnspentOutput, uint64) {
+	sort.Slice(utxos, func(i, j int) bool {
+		return utxos[i].Value > utxos[j].Value
+	})
+
+	const estimatedInputSize = 148
+	const estimatedOutputSize = 34
+	const txOverhead = 10
+
+	var selected []wallet.UnspentOutput
+	var totalIn uint64
+	for _, u := range utxos {
+		selected = append(selected, u)
+		totalIn += u.Value
+		estimatedSize := txOverhead + len(selected)*estimatedInputSize + (numOutputs+1)*estimatedOutputSize
+		fee := uint64(estimatedSize) * feePerByte
+		if fee < 1 {
+			fee = 1
+		}
+		if totalIn >= targetAmount+fee {
+			return selected, totalIn
+		}
+	}
+	return nil, 0
+}
+
+// compactToDifficulty computes difficulty from compact target bits using the
+// same formula as chain.GetChainInfo: genesisTarget / blockTarget.
+func (s *Server) compactToDifficulty(bits uint32) float64 {
+	target := crypto.CompactToBig(bits)
+	if target.Sign() <= 0 {
+		return 0
+	}
+	genesisTarget := crypto.CompactToBig(s.params.InitialBits)
+	fDiff := new(big.Float).SetInt(genesisTarget)
+	fDiff.Quo(fDiff, new(big.Float).SetInt(target))
+	diff, _ := fDiff.Float64()
+	return diff
 }

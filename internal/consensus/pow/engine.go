@@ -96,6 +96,22 @@ func (e *Engine) SealHeader(header *types.BlockHeader, target types.Hash, maxIte
 	return false, nil
 }
 
+// SealHeaderCounted is like SealHeader but also returns the number of hashes
+// actually computed, for accurate hashrate measurement.
+func (e *Engine) SealHeaderCounted(header *types.BlockHeader, target types.Hash, maxIterations uint64) (found bool, hashes uint64, err error) {
+	for i := uint64(0); i < maxIterations; i++ {
+		hash := e.hasher.PoWHash(header.SerializeToBytes())
+		if hash.LessOrEqual(target) {
+			return true, i + 1, nil
+		}
+		header.Nonce++
+		if header.Nonce == 0 {
+			return false, i + 1, nil
+		}
+	}
+	return false, maxIterations, nil
+}
+
 // MineGenesis mines a genesis block by iterating the nonce until the PoW hash
 // is below the target defined by the block's Bits field.
 func (e *Engine) MineGenesis(block *types.Block) error {

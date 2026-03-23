@@ -24,7 +24,7 @@ const (
 
 	// ProtocolVersion is the peer-to-peer wire protocol version.
 	// Increment when the wire format changes in a backward-incompatible way.
-	ProtocolVersion uint32 = 1
+	ProtocolVersion uint32 = 3
 
 	// ClientName identifies this implementation.
 	ClientName = coinparams.NameLower

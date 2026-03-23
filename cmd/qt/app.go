@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/bams-repo/fairchain/internal/config"
 	"github.com/bams-repo/fairchain/internal/logging"
 	"github.com/bams-repo/fairchain/internal/node"
+	"github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/types"
 	"github.com/bams-repo/fairchain/internal/utxo"
 	"github.com/bams-repo/fairchain/internal/version"
@@ -27,10 +29,11 @@ import (
 // App is the Go struct bound to the Wails frontend. All public methods are
 // callable from JavaScript via the generated bindings.
 type App struct {
-	ctx     context.Context
-	node    *node.Node
-	irc     *ircClient
-	trayEnd func()
+	ctx         context.Context
+	node        *node.Node
+	irc         *ircClient
+	trayEnd     func()
+	startupTime time.Time
 }
 
 func NewApp() *App {
@@ -39,11 +42,17 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	a.startupTime = time.Now()
 
 	logging.Init("info", "text")
 
 	cfg := config.DefaultConfig()
-	cfg.Network = "regtest"
+	cfg.Network = networkForBuild()
+
+	if netParams := params.NetworkByName(cfg.Network); netParams != nil {
+		cfg.ListenAddr = fmt.Sprintf("0.0.0.0:%d", netParams.DefaultPort)
+		cfg.RPCAddr = fmt.Sprintf("127.0.0.1:%d", netParams.DefaultPort+1)
+	}
 
 	opts := node.Options{
 		NoRPCAuth: true,
@@ -118,6 +127,7 @@ func (a *App) CoinInfo() map[string]interface{} {
 		"displayUnitName": coinparams.DisplayUnitName,
 		"version":         version.String(),
 		"copyright":       coinparams.CopyrightHolder,
+		"network":         networkForBuild(),
 	}
 }
 
@@ -189,6 +199,185 @@ func (a *App) GetSyncProgress() (float64, error) {
 	return float64(ourHeight) / float64(bestPeer), nil
 }
 
+// GetSyncStatus returns detailed sync state for the sync overlay modal.
+// Mirrors the information shown by Bitcoin Core's modal sync dialog.
+func (a *App) GetSyncStatus() (map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+
+	bc := a.node.Chain()
+	p2p := a.node.P2PMgr()
+
+	_, blockHeight := bc.Tip()
+	bestPeerHeight := p2p.BestPeerHeight()
+	headerHeight := p2p.HeaderSyncHeight()
+	syncState := p2p.GetSyncState()
+	peers := p2p.PeerCount()
+
+	var progress float64
+	if bestPeerHeight == 0 || blockHeight >= bestPeerHeight {
+		progress = 1.0
+	} else {
+		progress = float64(blockHeight) / float64(bestPeerHeight)
+	}
+
+	var lastBlockTime int64
+	if tipHeader, err := bc.TipHeader(); err == nil {
+		lastBlockTime = int64(tipHeader.Timestamp)
+	}
+
+	return map[string]interface{}{
+		"syncState":      syncState,
+		"headerHeight":   headerHeight,
+		"blockHeight":    blockHeight,
+		"bestPeerHeight": bestPeerHeight,
+		"peers":          peers,
+		"progress":       progress,
+		"lastBlockTime":  lastBlockTime,
+	}, nil
+}
+
+// GetDebugInfo returns comprehensive node information for the debug window.
+func (a *App) GetDebugInfo() (map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	bc := a.node.Chain()
+	p2p := a.node.P2PMgr()
+	mp := a.node.Mempool()
+	cfg := a.node.Config()
+	tipHash, tipHeight := bc.Tip()
+	inbound, outbound := p2p.ConnectionCounts()
+
+	var lastBlockTime string
+	if h, err := bc.TipHeader(); err == nil {
+		lastBlockTime = time.Unix(int64(h.Timestamp), 0).Format("Mon Jan 02 15:04:05 2006")
+	}
+
+	return map[string]interface{}{
+		"clientVersion": version.String(),
+		"userAgent":     version.UserAgent(),
+		"datadir":       cfg.NetworkDataDir(),
+		"startupTime":   a.startupTime.Format("Mon Jan 02 15:04:05 2006"),
+		"network":       cfg.Network,
+		"connections":   p2p.PeerCount(),
+		"inbound":       inbound,
+		"outbound":      outbound,
+		"blocks":        tipHeight,
+		"bestHash":      tipHash.ReverseString(),
+		"lastBlockTime": lastBlockTime,
+		"mempoolTx":     mp.Count(),
+		"mempoolBytes":  mp.TotalSize(),
+	}, nil
+}
+
+// GetPeerList returns detailed info about all connected peers.
+func (a *App) GetPeerList() ([]map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	infos := a.node.P2PMgr().PeerInfos()
+	result := make([]map[string]interface{}, len(infos))
+	for i, p := range infos {
+		result[i] = map[string]interface{}{
+			"addr":      p.Addr,
+			"addrLocal": p.AddrLocal,
+			"subver":    p.SubVer,
+			"version":   p.Version,
+			"inbound":   p.Inbound,
+			"connTime":  p.ConnTime,
+			"lastSend":  p.LastSend,
+			"lastRecv":  p.LastRecv,
+			"bytesSent": p.BytesSent,
+			"bytesRecv": p.BytesRecv,
+			"pingTime":  p.PingTime,
+			"startingHeight": p.StartingHeight,
+			"banScore":  p.BanScore,
+		}
+	}
+	return result, nil
+}
+
+// ExecuteRPC runs a JSON-RPC command from the debug console.
+// Accepts a method name and a JSON-encoded array of params.
+func (a *App) ExecuteRPC(method string, paramsJSON string) (map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	rpcSrv := a.node.RPCServer()
+	if rpcSrv == nil {
+		return nil, fmt.Errorf("RPC server not running")
+	}
+
+	var params []json.RawMessage
+	if paramsJSON != "" && paramsJSON != "[]" {
+		if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
+			return map[string]interface{}{
+				"error": fmt.Sprintf("invalid params: %v", err),
+			}, nil
+		}
+	}
+
+	result, rpcErr := rpcSrv.DispatchRPC(method, params)
+	if rpcErr != nil {
+		return map[string]interface{}{
+			"error": rpcErr.Message,
+		}, nil
+	}
+
+	jsonBytes, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return map[string]interface{}{
+			"error": fmt.Sprintf("marshal result: %v", err),
+		}, nil
+	}
+	return map[string]interface{}{
+		"result": string(jsonBytes),
+	}, nil
+}
+
+// ListRPCMethods returns all available JSON-RPC method names.
+func (a *App) ListRPCMethods() ([]string, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	rpcSrv := a.node.RPCServer()
+	if rpcSrv == nil {
+		return nil, fmt.Errorf("RPC server not running")
+	}
+	return rpcSrv.ListMethods(), nil
+}
+
+// GetNetworkTotals returns cumulative bytes sent/received across all peers.
+func (a *App) GetNetworkTotals() (map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	infos := a.node.P2PMgr().PeerInfos()
+	var totalSent, totalRecv int64
+	for _, p := range infos {
+		totalSent += p.BytesSent
+		totalRecv += p.BytesRecv
+	}
+	return map[string]interface{}{
+		"totalBytesSent": totalSent,
+		"totalBytesRecv": totalRecv,
+		"peers":          len(infos),
+	}, nil
+}
+
+// RescanBlockchain triggers a UTXO set rebuild from the stored blocks.
+func (a *App) RescanBlockchain() (string, error) {
+	if a.node == nil {
+		return "", fmt.Errorf("node not initialized")
+	}
+	if err := a.node.Chain().RescanUTXOSet(); err != nil {
+		return "", fmt.Errorf("rescan failed: %w", err)
+	}
+	return "Rescan complete", nil
+}
+
 // SetMining toggles the built-in miner at runtime.
 func (a *App) SetMining(enabled bool) error {
 	if a.node == nil {
@@ -196,6 +385,35 @@ func (a *App) SetMining(enabled bool) error {
 	}
 	a.node.SetMining(enabled)
 	return nil
+}
+
+// GetMiningStatus returns the current mining state and hashrate.
+func (a *App) GetMiningStatus() map[string]interface{} {
+	if a.node == nil {
+		return map[string]interface{}{
+			"mining":        false,
+			"hashrate":      0,
+			"hashrateReady": false,
+		}
+	}
+	return map[string]interface{}{
+		"mining":        a.node.IsMining(),
+		"hashrate":      a.node.GetHashrate(),
+		"hashrateReady": a.node.HashrateReady(),
+	}
+}
+
+// ToggleMining flips mining on/off and returns the new state.
+func (a *App) ToggleMining() (map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	newState := !a.node.IsMining()
+	a.node.SetMining(newState)
+	return map[string]interface{}{
+		"mining":   a.node.IsMining(),
+		"hashrate": a.node.GetHashrate(),
+	}, nil
 }
 
 // ConnectIRC manually attempts to connect to the configured IRC network.
