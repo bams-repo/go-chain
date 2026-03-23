@@ -61,12 +61,18 @@ export function Overview() {
       });
       GetPeerCount().then(setPeers);
       GetSyncProgress().then(setSyncProgress);
+      if (!address) {
+        GetWalletAddress()
+          .then((a) => {
+            if (a) setAddress(a);
+          })
+          .catch(() => {});
+      }
     };
-    GetWalletAddress().then(setAddress);
     poll();
     const id = setInterval(poll, 3000);
     return () => clearInterval(id);
-  }, []);
+  }, [address]);
 
   const synced = syncProgress >= 0.999;
 
