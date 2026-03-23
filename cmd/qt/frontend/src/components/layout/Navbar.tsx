@@ -26,7 +26,15 @@ import {
 } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 
-type Page = "overview" | "social" | "send" | "receive" | "transactions" | "network" | "mining" | "console";
+type Page =
+  | "overview"
+  | "social"
+  | "send"
+  | "receive"
+  | "transactions"
+  | "network"
+  | "mining"
+  | "console";
 
 type NavItem = {
   id: Page;
@@ -44,7 +52,13 @@ const primaryNav: NavItem[] = [
 const upcomingNav: NavItem[] = [
   { id: "send", label: "Send", enabled: false, to: "/send", icon: ArrowUpFromLine },
   { id: "receive", label: "Receive", enabled: false, to: "/receive", icon: ArrowDownToLine },
-  { id: "transactions", label: "Transactions", enabled: false, to: "/transactions", icon: ScrollText },
+  {
+    id: "transactions",
+    label: "Transactions",
+    enabled: false,
+    to: "/transactions",
+    icon: ScrollText,
+  },
   { id: "network", label: "Network", enabled: false, to: "/network", icon: Globe2 },
   { id: "mining", label: "Mining", enabled: false, to: "/mining", icon: Pickaxe },
   { id: "console", label: "Console", enabled: false, to: "/console", icon: Terminal },
@@ -88,7 +102,15 @@ function navButtonClass(active: boolean, enabled: boolean): string {
   );
 }
 
-function NavIcon({ Icon, active, enabled }: { Icon: LucideIcon; active: boolean; enabled: boolean }) {
+function NavIcon({
+  Icon,
+  active,
+  enabled,
+}: {
+  Icon: LucideIcon;
+  active: boolean;
+  enabled: boolean;
+}) {
   return (
     <Icon
       className={cn(
@@ -148,10 +170,16 @@ export function Navbar() {
                   {brandInitial}
                 </span>
                 <div className="grid min-w-0 flex-1 leading-tight group-data-[collapsible=icon]:hidden group-data-[collapsible=icon]:w-0 group-data-[collapsible=icon]:min-w-0 group-data-[collapsible=icon]:flex-none group-data-[collapsible=icon]:overflow-hidden group-data-[collapsible=icon]:p-0">
-                  <span className="truncate text-[14px] font-semibold tracking-tight" style={{ color: "var(--color-btc-text)" }}>
+                  <span
+                    className="truncate text-[14px] font-semibold tracking-tight"
+                    style={{ color: "var(--color-btc-text)" }}
+                  >
                     {coinInfo.name}
                   </span>
-                  <span className="truncate text-[11px] font-normal tabular-nums" style={{ color: "var(--color-btc-text-dim)" }}>
+                  <span
+                    className="truncate text-[11px] font-normal tabular-nums"
+                    style={{ color: "var(--color-btc-text-dim)" }}
+                  >
                     v{coinInfo.version}
                   </span>
                 </div>
@@ -220,7 +248,11 @@ export function Navbar() {
                   key={item.id}
                   className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:justify-center"
                 >
-                  <SidebarMenuButton disabled tooltip={`${item.label} — coming soon`} className={navButtonClass(false, false)}>
+                  <SidebarMenuButton
+                    disabled
+                    tooltip={`${item.label} — coming soon`}
+                    className={navButtonClass(false, false)}
+                  >
                     <NavIcon Icon={item.icon} active={false} enabled={false} />
                     <span className="group-data-[collapsible=icon]:hidden">{item.label}</span>
                   </SidebarMenuButton>

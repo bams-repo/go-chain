@@ -100,29 +100,63 @@ function formatTimestamp(unix: number): string {
 // ─── Information Tab ───
 
 function InformationTab({ info }: { info: DebugInfo | null }) {
-  if (!info) return <div style={{ color: "var(--color-btc-text-muted)", fontSize: 12, padding: 16 }}>Loading...</div>;
+  if (!info)
+    return (
+      <div style={{ color: "var(--color-btc-text-muted)", fontSize: 12, padding: 16 }}>
+        Loading...
+      </div>
+    );
   return (
     <div style={{ padding: "8px 16px", overflow: "auto", height: "100%" }}>
       <div style={sectionTitle}>General</div>
-      <div style={rowStyle}><span style={labelStyle}>Client version</span><span>{info.clientVersion}</span></div>
-      <div style={rowStyle}><span style={{ ...labelStyle, paddingLeft: 16 }}>User Agent</span><span>{info.userAgent}</span></div>
-      <div style={rowStyle}><span style={labelStyle}>Datadir</span><span style={{ fontFamily: "monospace", fontSize: 11 }}>{info.datadir}</span></div>
-      <div style={rowStyle}><span style={labelStyle}>Startup time</span><span>{info.startupTime}</span></div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Client version</span>
+        <span>{info.clientVersion}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={{ ...labelStyle, paddingLeft: 16 }}>User Agent</span>
+        <span>{info.userAgent}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Datadir</span>
+        <span style={{ fontFamily: "monospace", fontSize: 11 }}>{info.datadir}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Startup time</span>
+        <span>{info.startupTime}</span>
+      </div>
 
       <div style={sectionTitle}>Network</div>
-      <div style={rowStyle}><span style={labelStyle}>Name</span><span>{info.network}</span></div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Name</span>
+        <span>{info.network}</span>
+      </div>
       <div style={rowStyle}>
         <span style={labelStyle}>Number of connections</span>
-        <span>{info.connections} (In: {info.inbound} / Out: {info.outbound})</span>
+        <span>
+          {info.connections} (In: {info.inbound} / Out: {info.outbound})
+        </span>
       </div>
 
       <div style={sectionTitle}>Block chain</div>
-      <div style={rowStyle}><span style={labelStyle}>Current number of blocks</span><span>{info.blocks.toLocaleString()}</span></div>
-      <div style={rowStyle}><span style={labelStyle}>Last block time</span><span>{info.lastBlockTime || "—"}</span></div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Current number of blocks</span>
+        <span>{info.blocks.toLocaleString()}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Last block time</span>
+        <span>{info.lastBlockTime || "—"}</span>
+      </div>
 
       <div style={sectionTitle}>Memory Pool</div>
-      <div style={rowStyle}><span style={labelStyle}>Current number of transactions</span><span>{info.mempoolTx}</span></div>
-      <div style={rowStyle}><span style={labelStyle}>Memory usage</span><span>{formatBytes(info.mempoolBytes)}</span></div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Current number of transactions</span>
+        <span>{info.mempoolTx}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Memory usage</span>
+        <span>{formatBytes(info.mempoolBytes)}</span>
+      </div>
     </div>
   );
 }
@@ -153,7 +187,9 @@ function ConsoleTab() {
   const wrapperRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    ListRPCMethods().then((m) => setMethods(m || [])).catch(() => {});
+    ListRPCMethods()
+      .then((m) => setMethods(m || []))
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -214,7 +250,8 @@ function ConsoleTab() {
         if (p === "true" || p === "false") return p;
         if (/^-?\d+$/.test(p)) return p;
         if (/^-?\d+\.\d+$/.test(p)) return p;
-        if ((p.startsWith("{") && p.endsWith("}")) || (p.startsWith("[") && p.endsWith("]"))) return p;
+        if ((p.startsWith("{") && p.endsWith("}")) || (p.startsWith("[") && p.endsWith("]")))
+          return p;
         return JSON.stringify(p);
       });
       paramsJSON = "[" + rawParams.join(",") + "]";
@@ -294,8 +331,20 @@ function ConsoleTab() {
   const showDropdown = acMatches.length > 0 && !hasArgs && commandWord.length > 0;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }} onClick={() => inputRef.current?.focus()}>
-      <div ref={scrollRef} style={{ flex: 1, overflow: "auto", padding: "8px 12px", fontFamily: "monospace", fontSize: 11 }}>
+    <div
+      style={{ display: "flex", flexDirection: "column", height: "100%" }}
+      onClick={() => inputRef.current?.focus()}
+    >
+      <div
+        ref={scrollRef}
+        style={{
+          flex: 1,
+          overflow: "auto",
+          padding: "8px 12px",
+          fontFamily: "monospace",
+          fontSize: 11,
+        }}
+      >
         {history.map((entry, i) => (
           <div
             key={i}
@@ -364,7 +413,16 @@ function ConsoleTab() {
             background: "var(--color-btc-surface)",
           }}
         >
-          <span style={{ color: "var(--color-btc-gold)", fontFamily: "monospace", fontSize: 12, marginRight: 6 }}>&gt;</span>
+          <span
+            style={{
+              color: "var(--color-btc-gold)",
+              fontFamily: "monospace",
+              fontSize: 12,
+              marginRight: 6,
+            }}
+          >
+            &gt;
+          </span>
           <input
             ref={inputRef}
             value={input}
@@ -413,7 +471,10 @@ function NetworkTrafficTab() {
             if (dt > 0) {
               const sentRate = (nt.totalBytesSent - prevRef.current.sent) / dt;
               const recvRate = (nt.totalBytesRecv - prevRef.current.recv) / dt;
-              setSnapshots((prev) => [...prev.slice(-59), { time: now, sent: sentRate, recv: recvRate }]);
+              setSnapshots((prev) => [
+                ...prev.slice(-59),
+                { time: now, sent: sentRate, recv: recvRate },
+              ]);
             }
           }
           prevRef.current = { sent: nt.totalBytesSent, recv: nt.totalBytesRecv, time: now };
@@ -434,16 +495,57 @@ function NetworkTrafficTab() {
       <div style={sectionTitle}>Totals</div>
       {totals && (
         <>
-          <div style={rowStyle}><span style={labelStyle}>Total bytes sent</span><span>{formatBytes(totals.totalBytesSent)}</span></div>
-          <div style={rowStyle}><span style={labelStyle}>Total bytes received</span><span>{formatBytes(totals.totalBytesRecv)}</span></div>
-          <div style={rowStyle}><span style={labelStyle}>Connected peers</span><span>{totals.peers}</span></div>
+          <div style={rowStyle}>
+            <span style={labelStyle}>Total bytes sent</span>
+            <span>{formatBytes(totals.totalBytesSent)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={labelStyle}>Total bytes received</span>
+            <span>{formatBytes(totals.totalBytesRecv)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={labelStyle}>Connected peers</span>
+            <span>{totals.peers}</span>
+          </div>
         </>
       )}
 
       <div style={{ ...sectionTitle, marginTop: 12 }}>Traffic Rate (bytes/sec)</div>
-      <div style={{ display: "flex", gap: 16, fontSize: 11, color: "var(--color-btc-text-dim)", marginBottom: 6 }}>
-        <span><span style={{ display: "inline-block", width: 10, height: 10, background: "var(--color-btc-green)", marginRight: 4, borderRadius: 2 }} />Sent</span>
-        <span><span style={{ display: "inline-block", width: 10, height: 10, background: "var(--color-btc-gold)", marginRight: 4, borderRadius: 2 }} />Received</span>
+      <div
+        style={{
+          display: "flex",
+          gap: 16,
+          fontSize: 11,
+          color: "var(--color-btc-text-dim)",
+          marginBottom: 6,
+        }}
+      >
+        <span>
+          <span
+            style={{
+              display: "inline-block",
+              width: 10,
+              height: 10,
+              background: "var(--color-btc-green)",
+              marginRight: 4,
+              borderRadius: 2,
+            }}
+          />
+          Sent
+        </span>
+        <span>
+          <span
+            style={{
+              display: "inline-block",
+              width: 10,
+              height: 10,
+              background: "var(--color-btc-gold)",
+              marginRight: 4,
+              borderRadius: 2,
+            }}
+          />
+          Received
+        </span>
       </div>
       <div
         style={{
@@ -459,8 +561,26 @@ function NetworkTrafficTab() {
         }}
       >
         {snapshots.map((s, i) => (
-          <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", width: barW, flexShrink: 0, gap: 1 }}>
-            <div style={{ width: "100%", display: "flex", gap: 1, alignItems: "flex-end", height: chartH - 8 }}>
+          <div
+            key={i}
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              width: barW,
+              flexShrink: 0,
+              gap: 1,
+            }}
+          >
+            <div
+              style={{
+                width: "100%",
+                display: "flex",
+                gap: 1,
+                alignItems: "flex-end",
+                height: chartH - 8,
+              }}
+            >
               <div
                 style={{
                   flex: 1,
@@ -483,12 +603,28 @@ function NetworkTrafficTab() {
           </div>
         ))}
         {snapshots.length === 0 && (
-          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--color-btc-text-dim)", fontSize: 11 }}>
+          <div
+            style={{
+              flex: 1,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              color: "var(--color-btc-text-dim)",
+              fontSize: 11,
+            }}
+          >
             Collecting data...
           </div>
         )}
       </div>
-      <div style={{ textAlign: "right", fontSize: 10, color: "var(--color-btc-text-dim)", marginTop: 4 }}>
+      <div
+        style={{
+          textAlign: "right",
+          fontSize: 10,
+          color: "var(--color-btc-text-dim)",
+          marginTop: 4,
+        }}
+      >
         Peak: {formatBytes(Math.round(maxRate))}/s
       </div>
     </div>
@@ -504,9 +640,26 @@ function PeersTab({ peers }: { peers: PeerEntry[] }) {
       <div style={{ flex: 1, overflow: "auto", borderBottom: "1px solid var(--color-btc-border)" }}>
         <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
           <thead>
-            <tr style={{ position: "sticky", top: 0, background: "var(--color-btc-surface)", borderBottom: "1px solid var(--color-btc-border)" }}>
+            <tr
+              style={{
+                position: "sticky",
+                top: 0,
+                background: "var(--color-btc-surface)",
+                borderBottom: "1px solid var(--color-btc-border)",
+              }}
+            >
               {["Address", "Type", "User Agent", "Ping", "Sent", "Received", "Height"].map((h) => (
-                <th key={h} style={{ textAlign: "left", padding: "6px 8px", color: "var(--color-btc-text-dim)", fontWeight: 600 }}>{h}</th>
+                <th
+                  key={h}
+                  style={{
+                    textAlign: "left",
+                    padding: "6px 8px",
+                    color: "var(--color-btc-text-dim)",
+                    fontWeight: 600,
+                  }}
+                >
+                  {h}
+                </th>
               ))}
             </tr>
           </thead>
@@ -521,33 +674,96 @@ function PeersTab({ peers }: { peers: PeerEntry[] }) {
                   borderBottom: "1px solid var(--color-btc-border)",
                 }}
               >
-                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)", fontFamily: "monospace" }}>{p.addr}</td>
-                <td style={{ padding: "4px 8px", color: p.inbound ? "var(--color-btc-text-dim)" : "var(--color-btc-green)" }}>
+                <td
+                  style={{
+                    padding: "4px 8px",
+                    color: "var(--color-btc-text-muted)",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  {p.addr}
+                </td>
+                <td
+                  style={{
+                    padding: "4px 8px",
+                    color: p.inbound ? "var(--color-btc-text-dim)" : "var(--color-btc-green)",
+                  }}
+                >
                   {p.inbound ? "In" : "Out"}
                 </td>
-                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)" }}>{p.subver}</td>
-                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)", fontFamily: "monospace" }}>
+                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)" }}>
+                  {p.subver}
+                </td>
+                <td
+                  style={{
+                    padding: "4px 8px",
+                    color: "var(--color-btc-text-muted)",
+                    fontFamily: "monospace",
+                  }}
+                >
                   {(p.pingTime * 1000).toFixed(0)}ms
                 </td>
-                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)" }}>{formatBytes(p.bytesSent)}</td>
-                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)" }}>{formatBytes(p.bytesRecv)}</td>
-                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)", fontFamily: "monospace" }}>{p.startingHeight}</td>
+                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)" }}>
+                  {formatBytes(p.bytesSent)}
+                </td>
+                <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)" }}>
+                  {formatBytes(p.bytesRecv)}
+                </td>
+                <td
+                  style={{
+                    padding: "4px 8px",
+                    color: "var(--color-btc-text-muted)",
+                    fontFamily: "monospace",
+                  }}
+                >
+                  {p.startingHeight}
+                </td>
               </tr>
             ))}
             {peers.length === 0 && (
-              <tr><td colSpan={7} style={{ padding: 16, textAlign: "center", color: "var(--color-btc-text-dim)", fontSize: 12 }}>No peers connected</td></tr>
+              <tr>
+                <td
+                  colSpan={7}
+                  style={{
+                    padding: 16,
+                    textAlign: "center",
+                    color: "var(--color-btc-text-dim)",
+                    fontSize: 12,
+                  }}
+                >
+                  No peers connected
+                </td>
+              </tr>
             )}
           </tbody>
         </table>
       </div>
       {selected !== null && peers[selected] && (
         <div style={{ padding: "8px 16px", fontSize: 11, color: "var(--color-btc-text-muted)" }}>
-          <div style={rowStyle}><span style={{ ...labelStyle, width: 140 }}>Address</span><span style={{ fontFamily: "monospace" }}>{peers[selected].addr}</span></div>
-          <div style={rowStyle}><span style={{ ...labelStyle, width: 140 }}>Local address</span><span style={{ fontFamily: "monospace" }}>{peers[selected].addrLocal}</span></div>
-          <div style={rowStyle}><span style={{ ...labelStyle, width: 140 }}>Connected since</span><span>{formatTimestamp(peers[selected].connTime)}</span></div>
-          <div style={rowStyle}><span style={{ ...labelStyle, width: 140 }}>Last send</span><span>{formatTimestamp(peers[selected].lastSend)}</span></div>
-          <div style={rowStyle}><span style={{ ...labelStyle, width: 140 }}>Last receive</span><span>{formatTimestamp(peers[selected].lastRecv)}</span></div>
-          <div style={rowStyle}><span style={{ ...labelStyle, width: 140 }}>Ban score</span><span>{peers[selected].banScore}</span></div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Address</span>
+            <span style={{ fontFamily: "monospace" }}>{peers[selected].addr}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Local address</span>
+            <span style={{ fontFamily: "monospace" }}>{peers[selected].addrLocal}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Connected since</span>
+            <span>{formatTimestamp(peers[selected].connTime)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Last send</span>
+            <span>{formatTimestamp(peers[selected].lastSend)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Last receive</span>
+            <span>{formatTimestamp(peers[selected].lastRecv)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Ban score</span>
+            <span>{peers[selected].banScore}</span>
+          </div>
         </div>
       )}
     </div>
@@ -587,9 +803,16 @@ function WalletRepairTab() {
 
   return (
     <div style={{ padding: "16px", overflow: "auto", height: "100%" }}>
-      <div style={{ fontSize: 12, color: "var(--color-btc-text-muted)", marginBottom: 16, lineHeight: 1.6 }}>
-        These options can be used to repair your wallet or rescan the blockchain.
-        Use with caution — some operations may take a long time.
+      <div
+        style={{
+          fontSize: 12,
+          color: "var(--color-btc-text-muted)",
+          marginBottom: 16,
+          lineHeight: 1.6,
+        }}
+      >
+        These options can be used to repair your wallet or rescan the blockchain. Use with caution —
+        some operations may take a long time.
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -658,8 +881,12 @@ export function DebugWindow({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     const poll = () => {
-      GetDebugInfo().then((d) => setInfo(d as unknown as DebugInfo)).catch(() => {});
-      GetPeerList().then((p) => setPeers((p || []) as unknown as PeerEntry[])).catch(() => {});
+      GetDebugInfo()
+        .then((d) => setInfo(d as unknown as DebugInfo))
+        .catch(() => {});
+      GetPeerList()
+        .then((p) => setPeers((p || []) as unknown as PeerEntry[]))
+        .catch(() => {});
     };
     poll();
     const id = setInterval(poll, 2000);
@@ -685,7 +912,9 @@ export function DebugWindow({ onClose }: { onClose: () => void }) {
         justifyContent: "center",
         background: "rgba(0,0,0,0.6)",
       }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
       <div
         style={{
@@ -710,7 +939,9 @@ export function DebugWindow({ onClose }: { onClose: () => void }) {
             background: "var(--color-btc-surface)",
           }}
         >
-          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--color-btc-text)" }}>Debug window</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "var(--color-btc-text)" }}>
+            Debug window
+          </span>
           <button
             onClick={onClose}
             style={{

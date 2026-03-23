@@ -6,7 +6,8 @@ import { DebugWindow } from "@/components/DebugWindow";
 import { useWalletChrome } from "@/hooks/useWalletChrome";
 
 export default function WalletShell() {
-  const { showSyncOverlay, onHideSyncOverlay, showDebug, onCloseDebug, handleSyncOverlay } = useWalletChrome();
+  const { showSyncOverlay, onHideSyncOverlay, showDebug, onCloseDebug, handleSyncOverlay } =
+    useWalletChrome();
 
   return (
     <TooltipProvider>

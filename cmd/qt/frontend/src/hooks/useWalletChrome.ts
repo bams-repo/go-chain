@@ -47,11 +47,14 @@ export function useWalletChrome() {
     if (syncing) setSyncDismissed(false);
   }, [syncing]);
 
-  return useMemo(() => ({
-    showSyncOverlay: syncing && !syncDismissed,
-    onHideSyncOverlay,
-    showDebug,
-    onCloseDebug,
-    handleSyncOverlay,
-  }), [syncing, syncDismissed, onHideSyncOverlay, showDebug, onCloseDebug, handleSyncOverlay]);
+  return useMemo(
+    () => ({
+      showSyncOverlay: syncing && !syncDismissed,
+      onHideSyncOverlay,
+      showDebug,
+      onCloseDebug,
+      handleSyncOverlay,
+    }),
+    [syncing, syncDismissed, onHideSyncOverlay, showDebug, onCloseDebug, handleSyncOverlay],
+  );
 }

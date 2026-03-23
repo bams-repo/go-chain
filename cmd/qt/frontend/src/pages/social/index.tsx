@@ -48,7 +48,10 @@ export function Social() {
     };
     poll();
     const id = setInterval(poll, 1500);
-    return () => { mounted = false; clearInterval(id); };
+    return () => {
+      mounted = false;
+      clearInterval(id);
+    };
   }, []);
 
   useEffect(() => {
@@ -70,17 +73,27 @@ export function Social() {
     setTimeout(() => nickInputRef.current?.focus(), 0);
   };
 
-  const onCancelNickEdit = () => { setEditingNick(false); setNickDraft(""); };
+  const onCancelNickEdit = () => {
+    setEditingNick(false);
+    setNickDraft("");
+  };
 
   const onSubmitNick = () => {
     const nick = nickDraft.trim();
-    if (!nick || nick === status.nick) { onCancelNickEdit(); return; }
+    if (!nick || nick === status.nick) {
+      onCancelNickEdit();
+      return;
+    }
     setBusy(true);
     setError("");
     ChangeIRCNick(nick)
       .then(() => GetIRCStatus().then((next) => setStatus((next as IRCStatus) || {})))
       .catch((e: unknown) => setError(e instanceof Error ? e.message : "Failed to change nickname"))
-      .finally(() => { setBusy(false); setEditingNick(false); setNickDraft(""); });
+      .finally(() => {
+        setBusy(false);
+        setEditingNick(false);
+        setNickDraft("");
+      });
   };
 
   const onSend = (e: FormEvent) => {
@@ -96,7 +109,9 @@ export function Social() {
           setMessages(Array.isArray(next) ? (next as IRCMessage[]) : []);
         });
       })
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : "Unable to send message"))
+      .catch((err: unknown) =>
+        setError(err instanceof Error ? err.message : "Unable to send message"),
+      )
       .finally(() => setBusy(false));
   };
 
@@ -106,19 +121,24 @@ export function Social() {
       <div
         className="btc-noise btc-glow relative shrink-0 overflow-hidden rounded-xl px-5 py-3"
         style={{
-          background: 'linear-gradient(135deg, var(--color-btc-card) 0%, var(--color-btc-surface) 100%)',
-          border: '1px solid var(--color-btc-border)',
+          background:
+            "linear-gradient(135deg, var(--color-btc-card) 0%, var(--color-btc-surface) 100%)",
+          border: "1px solid var(--color-btc-border)",
         }}
       >
         <div className="relative z-10 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-sm font-semibold" style={{ color: 'var(--color-btc-text)' }}>Social Chat</h3>
-            <p className="text-xs" style={{ color: 'var(--color-btc-text-muted)' }}>
+            <h3 className="text-sm font-semibold" style={{ color: "var(--color-btc-text)" }}>
+              Social Chat
+            </h3>
+            <p className="text-xs" style={{ color: "var(--color-btc-text-muted)" }}>
               {status.server || "irc.libera.chat:6697"}{" "}
-              <span style={{ color: 'var(--color-btc-gold)' }}>{status.channel || "#test112221"}</span>
+              <span style={{ color: "var(--color-btc-gold)" }}>
+                {status.channel || "#test112221"}
+              </span>
             </p>
             {status.topic && status.topic.trim() && (
-              <p className="mt-0.5 text-xs italic" style={{ color: 'var(--color-btc-text-dim)' }}>
+              <p className="mt-0.5 text-xs italic" style={{ color: "var(--color-btc-text-dim)" }}>
                 {status.topic}
               </p>
             )}
@@ -127,14 +147,16 @@ export function Social() {
             <span
               className="flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-medium"
               style={{
-                background: connected ? 'rgba(63, 185, 80, 0.1)' : 'rgba(248, 81, 73, 0.1)',
-                color: connected ? 'var(--color-btc-green)' : 'var(--color-btc-red)',
-                border: `1px solid ${connected ? 'rgba(63, 185, 80, 0.25)' : 'rgba(248, 81, 73, 0.25)'}`,
+                background: connected ? "rgba(63, 185, 80, 0.1)" : "rgba(248, 81, 73, 0.1)",
+                color: connected ? "var(--color-btc-green)" : "var(--color-btc-red)",
+                border: `1px solid ${connected ? "rgba(63, 185, 80, 0.25)" : "rgba(248, 81, 73, 0.25)"}`,
               }}
             >
               <div
                 className="h-1.5 w-1.5 rounded-full"
-                style={{ background: connected ? 'var(--color-btc-green)' : 'var(--color-btc-red)' }}
+                style={{
+                  background: connected ? "var(--color-btc-green)" : "var(--color-btc-red)",
+                }}
               />
               {connectionLabel}
             </span>
@@ -154,40 +176,67 @@ export function Social() {
                   disabled={busy}
                   className="w-28 rounded-lg px-2 py-1 text-xs outline-none"
                   style={{
-                    background: 'var(--color-btc-deep)',
-                    color: 'var(--color-btc-text)',
-                    border: '1px solid var(--color-btc-gold)',
-                    boxShadow: '0 0 8px rgba(247, 147, 26, 0.15)',
+                    background: "var(--color-btc-deep)",
+                    color: "var(--color-btc-text)",
+                    border: "1px solid var(--color-btc-gold)",
+                    boxShadow: "0 0 8px rgba(247, 147, 26, 0.15)",
                   }}
                 />
-                <button type="button" onClick={onSubmitNick} disabled={busy || !nickDraft.trim()}
+                <button
+                  type="button"
+                  onClick={onSubmitNick}
+                  disabled={busy || !nickDraft.trim()}
                   className="rounded-lg px-2.5 py-1 text-[11px] font-semibold transition-all disabled:opacity-40"
-                  style={{ background: 'var(--color-btc-gold)', color: '#000' }}>
+                  style={{ background: "var(--color-btc-gold)", color: "#000" }}
+                >
                   Save
                 </button>
-                <button type="button" onClick={onCancelNickEdit} disabled={busy}
+                <button
+                  type="button"
+                  onClick={onCancelNickEdit}
+                  disabled={busy}
                   className="rounded-lg px-2 py-1 text-[11px] font-medium transition-colors"
-                  style={{ color: 'var(--color-btc-text-muted)' }}>
+                  style={{ color: "var(--color-btc-text-muted)" }}
+                >
                   Cancel
                 </button>
               </span>
             ) : (
-              <button type="button" onClick={onStartNickEdit} disabled={!connected}
+              <button
+                type="button"
+                onClick={onStartNickEdit}
+                disabled={!connected}
                 title={connected ? "Click to change nickname" : "Connect to change nickname"}
                 className="text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-                style={{ color: 'var(--color-btc-text-muted)' }}>
-                {status.nick ? <><span style={{ color: 'var(--color-btc-text-dim)' }}>nick:</span> <span style={{ color: 'var(--color-btc-gold-light)' }}>{status.nick}</span></> : "nick pending"}
+                style={{ color: "var(--color-btc-text-muted)" }}
+              >
+                {status.nick ? (
+                  <>
+                    <span style={{ color: "var(--color-btc-text-dim)" }}>nick:</span>{" "}
+                    <span style={{ color: "var(--color-btc-gold-light)" }}>{status.nick}</span>
+                  </>
+                ) : (
+                  "nick pending"
+                )}
               </button>
             )}
 
-            <span className="text-xs" style={{ color: 'var(--color-btc-text-dim)' }}>
+            <span className="text-xs" style={{ color: "var(--color-btc-text-dim)" }}>
               {users.length} user{users.length === 1 ? "" : "s"}
             </span>
 
             {!connected && (
-              <button type="button" onClick={onReconnect} disabled={busy}
+              <button
+                type="button"
+                onClick={onReconnect}
+                disabled={busy}
                 className="rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-all disabled:opacity-40"
-                style={{ background: 'linear-gradient(135deg, var(--color-btc-gold) 0%, var(--color-btc-gold-dark) 100%)', color: '#000' }}>
+                style={{
+                  background:
+                    "linear-gradient(135deg, var(--color-btc-gold) 0%, var(--color-btc-gold-dark) 100%)",
+                  color: "#000",
+                }}
+              >
                 Reconnect
               </button>
             )}
@@ -197,9 +246,9 @@ export function Social() {
           <p
             className="relative z-10 mt-2 rounded-lg px-3 py-1.5 text-xs"
             style={{
-              background: 'rgba(248, 81, 73, 0.08)',
-              color: 'var(--color-btc-red)',
-              border: '1px solid rgba(248, 81, 73, 0.2)',
+              background: "rgba(248, 81, 73, 0.08)",
+              color: "var(--color-btc-red)",
+              border: "1px solid rgba(248, 81, 73, 0.2)",
             }}
           >
             {status.error || error}
@@ -213,8 +262,8 @@ export function Social() {
         <div
           className="btc-noise relative min-h-0 flex-1 overflow-hidden rounded-xl"
           style={{
-            background: 'var(--color-btc-deep)',
-            border: '1px solid var(--color-btc-border)',
+            background: "var(--color-btc-deep)",
+            border: "1px solid var(--color-btc-border)",
           }}
         >
           <div className="relative z-10 h-full overflow-y-auto px-4 py-3">
@@ -222,10 +271,20 @@ export function Social() {
               {messages.length === 0 && (
                 <div
                   className="rounded-xl px-4 py-8 text-center text-sm"
-                  style={{ color: 'var(--color-btc-text-dim)' }}
+                  style={{ color: "var(--color-btc-text-dim)" }}
                 >
-                  <svg className="mx-auto mb-3 h-10 w-10 opacity-20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                  <svg
+                    className="mx-auto mb-3 h-10 w-10 opacity-20"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={1}
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+                    />
                   </svg>
                   Waiting for messages from {status.channel || "#test112221"}...
                 </div>
@@ -235,7 +294,11 @@ export function Social() {
                 const key = `${m.time || "t"}-${m.sender || "s"}-${idx}`;
                 if (m.system) {
                   return (
-                    <div key={key} className="text-center text-[11px]" style={{ color: 'var(--color-btc-text-dim)' }}>
+                    <div
+                      key={key}
+                      className="text-center text-[11px]"
+                      style={{ color: "var(--color-btc-text-dim)" }}
+                    >
                       {m.text}
                     </div>
                   );
@@ -247,26 +310,30 @@ export function Social() {
                       className="max-w-[80%] rounded-xl px-3.5 py-2.5"
                       style={{
                         background: own
-                          ? 'linear-gradient(135deg, var(--color-btc-gold) 0%, var(--color-btc-gold-dark) 100%)'
-                          : 'var(--color-btc-card)',
-                        border: own ? 'none' : '1px solid var(--color-btc-border)',
-                        boxShadow: own ? '0 2px 12px rgba(247, 147, 26, 0.2)' : '0 1px 4px rgba(0,0,0,0.3)',
+                          ? "linear-gradient(135deg, var(--color-btc-gold) 0%, var(--color-btc-gold-dark) 100%)"
+                          : "var(--color-btc-card)",
+                        border: own ? "none" : "1px solid var(--color-btc-border)",
+                        boxShadow: own
+                          ? "0 2px 12px rgba(247, 147, 26, 0.2)"
+                          : "0 1px 4px rgba(0,0,0,0.3)",
                       }}
                     >
                       <div className="mb-0.5 flex items-center gap-2 text-[11px]">
                         <span
                           className="font-semibold"
-                          style={{ color: own ? 'rgba(0,0,0,0.7)' : 'var(--color-btc-gold)' }}
+                          style={{ color: own ? "rgba(0,0,0,0.7)" : "var(--color-btc-gold)" }}
                         >
                           {m.sender || "unknown"}
                         </span>
-                        <span style={{ color: own ? 'rgba(0,0,0,0.4)' : 'var(--color-btc-text-dim)' }}>
+                        <span
+                          style={{ color: own ? "rgba(0,0,0,0.4)" : "var(--color-btc-text-dim)" }}
+                        >
                           {timeLabel(m.time)}
                         </span>
                       </div>
                       <p
                         className="whitespace-pre-wrap wrap-break-word text-sm leading-relaxed"
-                        style={{ color: own ? '#000' : 'var(--color-btc-text)' }}
+                        style={{ color: own ? "#000" : "var(--color-btc-text)" }}
                       >
                         {m.text}
                       </p>
@@ -283,17 +350,27 @@ export function Social() {
         <div
           className="btc-glow flex w-44 shrink-0 flex-col overflow-hidden rounded-xl"
           style={{
-            background: 'var(--color-btc-card)',
-            border: '1px solid var(--color-btc-border)',
+            background: "var(--color-btc-card)",
+            border: "1px solid var(--color-btc-border)",
           }}
         >
-          <div className="px-3 py-2.5" style={{ borderBottom: '1px solid var(--color-btc-border)' }}>
-            <h4 className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-btc-text-dim)' }}>Users</h4>
+          <div
+            className="px-3 py-2.5"
+            style={{ borderBottom: "1px solid var(--color-btc-border)" }}
+          >
+            <h4
+              className="text-[11px] font-semibold uppercase tracking-wider"
+              style={{ color: "var(--color-btc-text-dim)" }}
+            >
+              Users
+            </h4>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
             <div className="space-y-0.5">
               {users.length === 0 && (
-                <p className="px-2 py-1 text-xs" style={{ color: 'var(--color-btc-text-dim)' }}>No users visible.</p>
+                <p className="px-2 py-1 text-xs" style={{ color: "var(--color-btc-text-dim)" }}>
+                  No users visible.
+                </p>
               )}
               {users.map((u) => {
                 const isSelf = status.nick === u;
@@ -302,13 +379,18 @@ export function Social() {
                     key={u}
                     className="flex items-center justify-between rounded-lg px-2.5 py-1.5 text-xs transition-colors"
                     style={{
-                      background: isSelf ? 'rgba(247, 147, 26, 0.08)' : 'transparent',
-                      color: isSelf ? 'var(--color-btc-gold-light)' : 'var(--color-btc-text-muted)',
+                      background: isSelf ? "rgba(247, 147, 26, 0.08)" : "transparent",
+                      color: isSelf ? "var(--color-btc-gold-light)" : "var(--color-btc-text-muted)",
                     }}
                   >
                     <span className="truncate">{u}</span>
                     {isSelf && (
-                      <span className="text-[10px] uppercase tracking-wide" style={{ color: 'var(--color-btc-gold)', opacity: 0.6 }}>you</span>
+                      <span
+                        className="text-[10px] uppercase tracking-wide"
+                        style={{ color: "var(--color-btc-gold)", opacity: 0.6 }}
+                      >
+                        you
+                      </span>
                     )}
                   </div>
                 );
@@ -323,8 +405,8 @@ export function Social() {
         onSubmit={onSend}
         className="btc-glow shrink-0 rounded-xl p-3"
         style={{
-          background: 'var(--color-btc-card)',
-          border: '1px solid var(--color-btc-border)',
+          background: "var(--color-btc-card)",
+          border: "1px solid var(--color-btc-border)",
         }}
       >
         <div className="flex items-stretch gap-3">
@@ -339,13 +421,17 @@ export function Social() {
             }}
             rows={2}
             maxLength={400}
-            placeholder={connected ? `Message ${status.channel || "#test112221"}...` : "Connect to start chatting..."}
+            placeholder={
+              connected
+                ? `Message ${status.channel || "#test112221"}...`
+                : "Connect to start chatting..."
+            }
             disabled={!connected || busy}
             className="flex-1 resize-none rounded-lg px-3 py-2.5 text-sm outline-none transition disabled:cursor-not-allowed disabled:opacity-40"
             style={{
-              background: 'var(--color-btc-deep)',
-              color: 'var(--color-btc-text)',
-              border: '1px solid var(--color-btc-border)',
+              background: "var(--color-btc-deep)",
+              color: "var(--color-btc-text)",
+              border: "1px solid var(--color-btc-border)",
             }}
           />
           <button
@@ -353,8 +439,9 @@ export function Social() {
             disabled={!connected || busy || draft.trim().length === 0}
             className="rounded-lg px-5 text-sm font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-30"
             style={{
-              background: 'linear-gradient(135deg, var(--color-btc-gold) 0%, var(--color-btc-gold-dark) 100%)',
-              color: '#000',
+              background:
+                "linear-gradient(135deg, var(--color-btc-gold) 0%, var(--color-btc-gold-dark) 100%)",
+              color: "#000",
             }}
           >
             Send
