@@ -59,18 +59,21 @@ export function StatusBar() {
     return () => clearInterval(id);
   }, []);
 
-  const synced = syncState === "SYNCED";
   let syncLabel: string;
-  if (synced) {
+  let isSynced: boolean;
+  if (syncState === "SYNCED") {
     syncLabel = "Synced";
+    isSynced = true;
   } else if (syncState === "HEADER_SYNC") {
     syncLabel = "Syncing Headers...";
+    isSynced = false;
   } else if (syncState === "BLOCK_SYNC") {
     syncLabel = `Syncing Blocks (${(syncProgress * 100).toFixed(1)}%)`;
+    isSynced = false;
   } else {
-    syncLabel = peers > 0 ? "Synced" : "Connecting...";
+    syncLabel = peers > 0 ? "Connecting..." : "Connecting...";
+    isSynced = false;
   }
-  const isSynced = synced || (syncState === "INITIAL" && peers > 0);
 
   return (
     <div

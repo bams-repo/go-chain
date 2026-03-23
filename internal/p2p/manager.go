@@ -106,6 +106,10 @@ type Manager struct {
 	blockSyncLastProgress time.Time
 	blockSyncLastHeight   uint32
 
+	// Bitcoin Core parity: once IBD finishes, it latches and never reverts
+	// to true until the process restarts (m_cached_finished_ibd).
+	finishedIBD bool
+
 	ctx      context.Context
 	listener net.Listener
 }
@@ -2196,13 +2200,30 @@ func (m *Manager) syncLoop(ctx context.Context) {
 	}
 }
 
-// handleSyncInitial checks if any connected peer is ahead and transitions
-// to HEADER_SYNC (if v2 peers available) or uses legacy sync.
+// isInitialBlockDownload mirrors Bitcoin Core's IsInitialBlockDownload().
+// IBD is true when the chain tip timestamp is older than maxTipAge.
+// Once IBD latches to false it stays false until the process restarts.
+func (m *Manager) isInitialBlockDownload() bool {
+	if m.finishedIBD {
+		return false
+	}
+	if m.chain.IsTipStale() {
+		return true
+	}
+	m.finishedIBD = true
+	return false
+}
+
+// handleSyncInitial checks if the node needs to catch up with the network.
+// Bitcoin Core parity: use tip timestamp age as the primary IBD signal,
+// not raw peer height comparison. A node whose tip is recent is "synced"
+// even if a peer is a few blocks ahead (normal propagation delay).
 func (m *Manager) handleSyncInitial() {
 	_, ourHeight := m.chain.Tip()
 
 	m.mu.RLock()
 	var bestHeight uint32
+	peerCount := len(m.peers)
 	for _, p := range m.peers {
 		ph := p.BestHeight()
 		if ph > bestHeight {
@@ -2211,6 +2232,18 @@ func (m *Manager) handleSyncInitial() {
 	}
 	m.mu.RUnlock()
 
+	// No peers yet — stay in INITIAL (shows "Connecting...").
+	if peerCount == 0 {
+		return
+	}
+
+	// Tip is recent — we're not in IBD. Transition to SYNCED.
+	if !m.isInitialBlockDownload() {
+		m.transitionSyncState(SyncStateSynced)
+		return
+	}
+
+	// Tip is stale but no peer is ahead — we're the best chain we know of.
 	if bestHeight <= ourHeight {
 		m.transitionSyncState(SyncStateSynced)
 		return
@@ -2481,7 +2514,11 @@ func (m *Manager) handleLegacyBlockSync() {
 	m.requestBlocks(bestPeer)
 }
 
-// handleSyncedTick checks if any peer is significantly ahead and re-enters sync.
+// handleSyncedTick monitors the chain while synced. Bitcoin Core parity:
+// once IBD has latched off it does not re-enter. We only fall back to
+// INITIAL if the tip becomes genuinely stale (timestamp-based) AND peers
+// report a meaningfully higher chain. Normal 1-2 block propagation delay
+// does not trigger re-sync.
 func (m *Manager) handleSyncedTick() {
 	_, ourHeight := m.chain.Tip()
 
@@ -2495,10 +2532,13 @@ func (m *Manager) handleSyncedTick() {
 	}
 	m.mu.RUnlock()
 
-	if bestHeight > ourHeight+5 {
+	// Only re-enter sync if tip is stale AND a peer is significantly ahead.
+	// This prevents flip-flopping during normal mining/propagation.
+	if m.chain.IsTipStale() && bestHeight > ourHeight+5 {
 		m.mu.Lock()
 		m.bestPeerHeight = bestHeight
 		m.mu.Unlock()
+		m.finishedIBD = false
 		m.transitionSyncState(SyncStateInitial)
 		return
 	}
