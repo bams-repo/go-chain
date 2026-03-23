@@ -144,7 +144,7 @@ jobs:
         run: |
           cd cmd/qt
           wails build -platform darwin/${{ matrix.goarch }} -ldflags "-X main.defaultNetwork=testnet"
-          cp build/bin/${GUI_NAME}.app ../../staging/${GUI_NAME}.app -r 2>/dev/null || cp build/bin/${GUI_NAME} ../../staging/${GUI_NAME}
+          cp -r build/bin/${GUI_NAME}.app ../../staging/${GUI_NAME}.app
 
       - name: Build QT wallet (Windows)
         if: matrix.build_gui && runner.os == 'Windows'
