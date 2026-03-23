@@ -47,7 +47,7 @@ jobs:
           echo "cli_name=$CLI_NAME" >> "$GITHUB_OUTPUT"
           echo "gui_name=$GUI_NAME" >> "$GITHUB_OUTPUT"
 
-  # ── Build daemon + CLI for each platform ─────────────────────────────────
+  # ── Build daemon + CLI + QT wallet for each platform ───────────────────
   build:
     needs: params
     strategy:
@@ -58,27 +58,33 @@ jobs:
             goos: linux
             goarch: amd64
             label: linux-amd64
+            build_gui: true
           - runner: ubuntu-latest
             goos: linux
             goarch: arm64
             label: linux-arm64
+            build_gui: false
           - runner: macos-latest
             goos: darwin
             goarch: amd64
             label: macos-amd64
+            build_gui: true
           - runner: macos-latest
             goos: darwin
             goarch: arm64
             label: macos-arm64
+            build_gui: true
           - runner: windows-latest
             goos: windows
             goarch: amd64
             label: windows-amd64
+            build_gui: true
 
     runs-on: ${{ matrix.runner }}
     env:
       DAEMON_NAME: ${{ needs.params.outputs.daemon_name }}
       CLI_NAME: ${{ needs.params.outputs.cli_name }}
+      GUI_NAME: ${{ needs.params.outputs.gui_name }}
       COIN_NAME_LOWER: ${{ needs.params.outputs.coin_name_lower }}
 
     steps:
@@ -90,10 +96,26 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - name: Set up Node.js
+        if: matrix.build_gui
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Clone vendored Wails (go.mod replace directive)
         run: git clone --depth 1 --branch v2.11.0 https://github.com/wailsapp/wails.git depends/wails
 
-      - name: Build binaries
+      - name: Install Linux GUI dependencies
+        if: matrix.build_gui && runner.os == 'Linux'
+        run: |
+          sudo apt-get -yq update
+          sudo apt-get -yq install libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Install Wails CLI
+        if: matrix.build_gui
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+
+      - name: Build daemon and CLI
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
@@ -108,8 +130,29 @@ jobs:
           go build -trimpath -ldflags="-s -w" -o "staging/${DAEMON_NAME}${EXT}" ./cmd/node
           go build -trimpath -ldflags="-s -w" -o "staging/${CLI_NAME}${EXT}" ./cmd/cli
 
-          # Include chaos test script.
-          cp scripts/chaos_test.py staging/
+      - name: Build QT wallet (Linux)
+        if: matrix.build_gui && runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd cmd/qt
+          wails build -tags webkit2_41 -ldflags "-X main.defaultNetwork=testnet"
+          cp build/bin/${GUI_NAME} ../../staging/${GUI_NAME}
+
+      - name: Build QT wallet (macOS)
+        if: matrix.build_gui && runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd cmd/qt
+          wails build -platform darwin/${{ matrix.goarch }} -ldflags "-X main.defaultNetwork=testnet"
+          cp build/bin/${GUI_NAME}.app ../../staging/${GUI_NAME}.app -r 2>/dev/null || cp build/bin/${GUI_NAME} ../../staging/${GUI_NAME}
+
+      - name: Build QT wallet (Windows)
+        if: matrix.build_gui && runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd cmd/qt
+          wails build -webview2 embed -ldflags "-X main.defaultNetwork=testnet"
+          cp build/bin/${GUI_NAME}.exe ../../staging/${GUI_NAME}.exe
 
       - name: Package (tar.gz for Unix)
         if: matrix.goos != 'windows'
@@ -184,15 +227,17 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           ## ${COIN_NAME} — ${{ inputs.title }}
 
+          Each archive contains the full node daemon, CLI client, and GUI wallet.
+
           ### Downloads
 
-          | Platform | Architecture | Archive |
-          |----------|-------------|---------|
-          | Linux | x86_64 | \`${COIN_NAME_LOWER}-linux-amd64.tar.gz\` |
-          | Linux | ARM64 | \`${COIN_NAME_LOWER}-linux-arm64.tar.gz\` |
-          | macOS | x86_64 (Intel) | \`${COIN_NAME_LOWER}-macos-amd64.tar.gz\` |
-          | macOS | ARM64 (Apple Silicon) | \`${COIN_NAME_LOWER}-macos-arm64.tar.gz\` |
-          | Windows | x86_64 | \`${COIN_NAME_LOWER}-windows-amd64.zip\` |
+          | Platform | Architecture | Archive | GUI Wallet |
+          |----------|-------------|---------|------------|
+          | Linux | x86_64 | \`${COIN_NAME_LOWER}-linux-amd64.tar.gz\` | Included |
+          | Linux | ARM64 | \`${COIN_NAME_LOWER}-linux-arm64.tar.gz\` | CLI only |
+          | macOS | x86_64 (Intel) | \`${COIN_NAME_LOWER}-macos-amd64.tar.gz\` | Included |
+          | macOS | ARM64 (Apple Silicon) | \`${COIN_NAME_LOWER}-macos-arm64.tar.gz\` | Included |
+          | Windows | x86_64 | \`${COIN_NAME_LOWER}-windows-amd64.zip\` | Included |
 
           ### Verify downloads
 
@@ -206,7 +251,10 @@ jobs:
           # Extract
           tar xzf ${COIN_NAME_LOWER}-linux-amd64.tar.gz
 
-          # Run daemon
+          # Run the GUI wallet
+          ./${COIN_NAME_LOWER}-qt
+
+          # Or run the daemon
           ./${COIN_NAME_LOWER}d -network testnet -mine
 
           # Check status (in another terminal)
