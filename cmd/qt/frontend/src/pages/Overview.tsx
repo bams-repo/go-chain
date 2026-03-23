@@ -24,12 +24,14 @@ export function Overview() {
         setHeight(info.height as number);
         setBestHash(info.bestHash as string);
       });
+      if (!address) {
+        GetWalletAddress().then((a) => { if (a) setAddress(a); }).catch(() => {});
+      }
     };
-    GetWalletAddress().then(setAddress);
     poll();
     const id = setInterval(poll, 3000);
     return () => clearInterval(id);
-  }, []);
+  }, [address]);
 
   return (
     <div className="flex h-full flex-col gap-4">

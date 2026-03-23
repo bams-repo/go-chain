@@ -289,7 +289,11 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, target types.Hash, txs []types.Transaction, tipHash types.Hash) (*types.Block, bool) {
 	numWorkers := m.workers
 	rangeSize := uint64(0x100000000) / uint64(numWorkers)
-	const batchSize = uint64(100000)
+	// Keep batches tiny for memory-hard PoW. sha256mem runs at ~1 H/s
+	// per core, so even a batch of 128 delays stale-work detection by
+	// minutes. With 5-second block targets we must check for new tips
+	// after every few hashes to avoid mining on a stale parent.
+	const batchSize = uint64(4)
 
 	type result struct {
 		header types.BlockHeader
@@ -389,8 +393,14 @@ func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, 
 		Transactions: txs,
 	}
 	blockHash := crypto.HashBlockHeader(&block.Header)
-	_, tipH := m.chain.Tip()
-	logging.L.Info("found block", "component", "miner", "hash", blockHash.ReverseString(), "height", tipH+1, "nonce", res.header.Nonce)
+	currentTip, currentHeight := m.chain.Tip()
+	if currentTip != tipHash {
+		logging.L.Debug("discarding stale block (tip moved during mining)",
+			"component", "miner", "hash", blockHash.ReverseString(),
+			"built_on_height", currentHeight)
+		return nil, false
+	}
+	logging.L.Info("found block", "component", "miner", "hash", blockHash.ReverseString(), "height", currentHeight+1, "nonce", res.header.Nonce)
 	return block, true
 }
 
