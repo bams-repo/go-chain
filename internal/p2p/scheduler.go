@@ -18,9 +18,9 @@ import (
 
 const (
 	DefaultMaxInFlightPerPeer = 16
-	DefaultMaxGlobalInFlight  = 128
-	DefaultMaxStagingSize     = 512
-	DefaultRequestTimeout     = 30 * time.Second
+	DefaultMaxGlobalInFlight  = 512
+	DefaultMaxStagingSize     = 1024
+	DefaultRequestTimeout     = 60 * time.Second
 )
 
 // BlockScheduler coordinates parallel block body downloads from multiple peers

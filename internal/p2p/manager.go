@@ -797,10 +797,6 @@ func (m *Manager) maybeEvictInbound() {
 
 // --- Connection loops ---
 
-// maxInboundPerIP limits inbound connections from a single IP address.
-// Bitcoin Core defaults to 1 per IP for inbound connections.
-const maxInboundPerIP = 1
-
 func (m *Manager) acceptLoop(ctx context.Context) {
 	for {
 		conn, err := m.listener.Accept()
@@ -820,34 +816,18 @@ func (m *Manager) acceptLoop(ctx context.Context) {
 			continue
 		}
 
-		remoteIP, _, _ := net.SplitHostPort(remoteAddr)
-		isLoopback := net.ParseIP(remoteIP) != nil && net.ParseIP(remoteIP).IsLoopback()
-
 		m.mu.Lock()
 		inboundCount := 0
-		ipCount := 0
 		for _, p := range m.peers {
 			if p.IsInbound() {
 				inboundCount++
-				peerIP, _, _ := net.SplitHostPort(p.Addr())
-				if peerIP == remoteIP {
-					ipCount++
-				}
 			}
 		}
 		m.mu.Unlock()
 
-		// Per-IP inbound limit: Bitcoin Core enforces 1 inbound per IP to resist
-		// Sybil attacks. Loopback is exempt because multiple local nodes (testnet,
-		// regtest, chaos tests) legitimately share 127.0.0.1.
-		if !isLoopback && ipCount >= maxInboundPerIP {
-			if logging.DebugMode {
-				logging.L.Debug("[dbg] acceptLoop: per-IP inbound limit reached", "ip", remoteIP, "count", ipCount)
-			}
-			conn.Close()
-			continue
-		}
-
+		// Bitcoin Core does not enforce a per-IP inbound limit. Multiple
+		// nodes behind NAT legitimately share the same public IP. Sybil
+		// resistance is handled by the eviction logic when slots are full.
 		if inboundCount >= m.maxInbound {
 			m.maybeEvictInbound()
 			time.Sleep(50 * time.Millisecond)
@@ -1175,21 +1155,17 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 			return
 		}
 
-		// During IBD the sync peer legitimately floods us with blocks and
-		// headers; penalizing that traffic would ban the very peer we need.
-		// Block and headers messages from the active sync peer are exempt.
+		// Rate-limit only unsolicited traffic. Request messages (getheaders,
+		// getdata, getblocks) and their responses (headers, block) are
+		// legitimate during sync on both sides of the connection. Bitcoin
+		// Core does not rate-limit these.
 		if !peer.CheckRateLimit() {
-			isSyncPeerExempt := false
-			if m.IsSyncing() {
-				cmd := hdr.CommandString()
-				m.syncPeerAddrMu.RLock()
-				isSyncPeer := peer.Addr() == m.syncPeerAddr
-				m.syncPeerAddrMu.RUnlock()
-				if isSyncPeer && (cmd == protocol.CmdBlock || cmd == protocol.CmdHeaders) {
-					isSyncPeerExempt = true
-				}
-			}
-			if !isSyncPeerExempt {
+			cmd := hdr.CommandString()
+			exempt := cmd == protocol.CmdBlock || cmd == protocol.CmdHeaders ||
+				cmd == protocol.CmdGetHeaders || cmd == protocol.CmdGetData ||
+				cmd == protocol.CmdGetBlocks || cmd == protocol.CmdPing ||
+				cmd == protocol.CmdPong
+			if !exempt {
 				m.addMisbehavior(peer, 10, "message rate limit exceeded")
 				if peer.BanScore() >= BanThreshold {
 					return
@@ -1548,6 +1524,15 @@ func (m *Manager) handleMessage(ctx context.Context, peer *Peer, hdr *protocol.M
 }
 
 func (m *Manager) handleInv(peer *Peer, inv *protocol.InvMsg) {
+	// Bitcoin Core skips ALL inventory during IBD (fBlocksOnly + IBD check).
+	// Block INVs conflict with the header-first pipeline.
+	// Tx INVs waste bandwidth — mempool entries will be immediately
+	// superseded by blocks being connected.
+	isIBD := m.IsSyncing()
+	if isIBD {
+		return
+	}
+
 	var needed []protocol.InvVector
 	var alreadyHaveBlocks, alreadyHaveTxs int
 	for _, iv := range inv.Inventory {
@@ -1583,7 +1568,8 @@ func (m *Manager) handleInv(peer *Peer, inv *protocol.InvMsg) {
 			"need_blocks", neededBlocks,
 			"need_txs", neededTxs,
 			"already_blocks", alreadyHaveBlocks,
-			"already_txs", alreadyHaveTxs)
+			"already_txs", alreadyHaveTxs,
+			"ibd_skip_blocks", isIBD)
 	}
 
 	if len(needed) > 0 {
@@ -1680,6 +1666,20 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 
 	if state == SyncStateBlockSync && m.blockScheduler != nil {
 		if m.blockScheduler.BlockReceived(blockHash, block, peer.Addr()) {
+			// Bitcoin Core parity: FindNextBlocksToDownload is called on
+			// every block receipt. Immediately assign new work to the
+			// delivering peer to eliminate idle gaps between requests.
+			hashes := m.blockScheduler.AssignWork(peer.Addr(), DefaultMaxInFlightPerPeer)
+			if len(hashes) > 0 {
+				var invVecs []protocol.InvVector
+				for _, h := range hashes {
+					invVecs = append(invVecs, protocol.InvVector{Type: protocol.InvTypeBlock, Hash: h})
+				}
+				getData := protocol.GetDataMsg{Inventory: invVecs}
+				var buf bytes.Buffer
+				getData.Encode(&buf)
+				peer.SendMessage(protocol.CmdGetData, buf.Bytes())
+			}
 			return
 		}
 	}
@@ -1690,6 +1690,13 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 		if peer.BestHeight() > 0 {
 			m.requestBlocks(peer)
 		}
+		return
+	}
+
+	// During header sync, unsolicited blocks would create orphan cascades
+	// since we don't have their parents yet. Drop them silently — the block
+	// scheduler will fetch them in order once headers are complete.
+	if state == SyncStateHeaderSync {
 		return
 	}
 
@@ -1730,7 +1737,7 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 			"hash", blockHash.ReverseString(), "addr", peer.Addr(), "error", err)
 		if strings.Contains(errStr, "proof of work") || strings.Contains(errStr, "merkle") || strings.Contains(errStr, "bits mismatch") {
 			m.addMisbehavior(peer, 100, "invalid block: "+errStr)
-		} else {
+		} else if !m.IsSyncing() {
 			m.addMisbehavior(peer, 10, "rejected block: "+errStr)
 		}
 		return
@@ -2102,8 +2109,6 @@ func (m *Manager) processIBDBlock(item *ibdBlockItem) {
 			"hash", blockHash.ReverseString(), "addr", peer.Addr(), "error", err)
 		if strings.Contains(errStr, "proof of work") || strings.Contains(errStr, "merkle") || strings.Contains(errStr, "bits mismatch") {
 			m.addMisbehavior(peer, 100, "invalid block: "+errStr)
-		} else {
-			m.addMisbehavior(peer, 10, "rejected block: "+errStr)
 		}
 		return
 	}
@@ -2159,8 +2164,7 @@ func (m *Manager) transitionSyncState(newState SyncState) {
 
 func (m *Manager) syncLoop(ctx context.Context) {
 	wasIBD := false
-
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -2189,10 +2193,12 @@ func (m *Manager) syncLoop(ctx context.Context) {
 			isIBD := state == SyncStateHeaderSync || state == SyncStateBlockSync
 			if isIBD && !wasIBD {
 				m.chain.SetIBDMode(true)
+				ticker.Reset(100 * time.Millisecond)
 				logging.L.Info("entering IBD mode", "component", "p2p", "state", state.String())
 			} else if !isIBD && wasIBD {
 				m.drainIBDQueue()
 				m.chain.SetIBDMode(false)
+				ticker.Reset(2 * time.Second)
 				logging.L.Info("exiting IBD mode", "component", "p2p")
 			}
 			wasIBD = isIBD
@@ -2333,7 +2339,10 @@ func (m *Manager) handleHeaderSyncTick() {
 		m.headerSyncSince = time.Now()
 
 		if m.headerSyncStalls >= maxStallsBeforeBan {
-			m.addMisbehavior(syncPeer, 20, "header sync stall")
+			logging.L.Warn("disconnecting header sync peer due to excessive stalls",
+				"component", "p2p", "peer", syncPeer.Addr(),
+				"stalls", m.headerSyncStalls)
+			syncPeer.Close()
 			m.headerSyncPeerAddr = ""
 			return
 		}
@@ -2389,7 +2398,7 @@ func (m *Manager) handleBlockSyncTick() {
 			"hash", entry.Hash.ReverseString(), "peer", entry.PeerAddr)
 	}
 
-	// 2. Drain ready blocks and connect them.
+	// 2. Drain ready blocks and connect them in order.
 	ready := m.blockScheduler.DrainReady()
 	for _, staged := range ready {
 		block := staged.Block
@@ -2399,6 +2408,10 @@ func (m *Manager) handleBlockSyncTick() {
 			if errors.Is(err, chain.ErrSideChain) {
 				continue
 			}
+			errStr := err.Error()
+			if strings.Contains(errStr, "already in chain") {
+				continue
+			}
 			logging.L.Error("block from scheduler failed validation", "component", "p2p",
 				"hash", blockHash.ReverseString(), "peer", staged.PeerAddr, "error", err)
 			m.blockScheduler.RequeueBlock(blockHash, 0)
@@ -2406,11 +2419,8 @@ func (m *Manager) handleBlockSyncTick() {
 			m.mu.RLock()
 			if badPeer, ok := m.peers[staged.PeerAddr]; ok {
 				m.mu.RUnlock()
-				errStr := err.Error()
 				if strings.Contains(errStr, "proof of work") || strings.Contains(errStr, "merkle") || strings.Contains(errStr, "bits mismatch") {
 					m.addMisbehavior(badPeer, 100, "invalid block body: "+errStr)
-				} else {
-					m.addMisbehavior(badPeer, 20, "rejected block body: "+errStr)
 				}
 			} else {
 				m.mu.RUnlock()
@@ -2418,7 +2428,6 @@ func (m *Manager) handleBlockSyncTick() {
 			continue
 		}
 		m.blockScheduler.UpdateNextConnectHeight(height)
-
 		var confirmedHashes []types.Hash
 		for _, tx := range block.Transactions {
 			txHash, hashErr := crypto.HashTransaction(&tx)
@@ -2637,11 +2646,16 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 		return
 	}
 
-	// Bitcoin Core checks that the first header connects to a known header
-	// before processing the batch. This prevents wasting CPU on disconnected
-	// batches from malicious peers.
+	// If the first header doesn't connect to any known header, ignore the
+	// batch. This is normal during initial sync when peers announce headers
+	// we can't yet connect. Bitcoin Core silently drops these — no penalty.
 	if !m.headerIndex.HasHeader(msg.Headers[0].PrevBlock) {
-		m.addMisbehavior(peer, 20, "headers batch does not connect to known chain")
+		if logging.DebugMode {
+			logging.L.Debug("ignoring unconnectable headers batch",
+				"component", "p2p", "peer", peer.Addr(),
+				"prev", msg.Headers[0].PrevBlock.ReverseString()[:16],
+				"count", len(msg.Headers))
+		}
 		return
 	}
 
@@ -2662,12 +2676,11 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 		if added == 0 {
 			errStr := err.Error()
 			if strings.Contains(errStr, "proof of work") || strings.Contains(errStr, "bits mismatch") || strings.Contains(errStr, "difficulty") {
+				// Invalid PoW is always malicious — ban immediately.
 				m.addMisbehavior(peer, 100, "invalid header: "+errStr)
-			} else if strings.Contains(errStr, "parent not found") {
-				m.addMisbehavior(peer, 20, "orphan header")
-			} else {
-				m.addMisbehavior(peer, 20, "invalid headers: "+errStr)
 			}
+			// "parent not found" and other non-PoW errors are normal during
+			// sync (e.g. out-of-order delivery). No penalty — just ignore.
 		}
 	}
 
@@ -2710,7 +2723,9 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 }
 
 func (m *Manager) handleGetHeaders(peer *Peer, msg *protocol.GetHeadersMsg) {
-	if !peer.CheckGetHeadersThrottle() {
+	// Only throttle when synced. During IBD, peers legitimately need rapid
+	// header responses. Bitcoin Core does not throttle getheaders responses.
+	if !m.IsSyncing() && !peer.CheckGetHeadersThrottle() {
 		return
 	}
 

@@ -176,16 +176,27 @@ func (idx *HeaderIndex) addHeaderLocked(header *types.BlockHeader, nowUnix uint3
 	if cumulativeWork.Cmp(idx.bestHeader.Work) > 0 {
 		idx.bestHeader = node
 		idx.rebuildHeightIndex()
-		idx.pruneStaleForks()
+		if node.Height%100 == 0 {
+			idx.pruneStaleForks()
+		}
 	}
 
 	return node, nil
 }
 
-// rebuildHeightIndex rebuilds the bestChainByHeight slice from the current
-// bestHeader by walking back to genesis.
+// rebuildHeightIndex updates the bestChainByHeight slice. For the common case
+// of a direct chain extension (linear sync), it appends in O(1). Falls back
+// to a full rebuild for forks or gaps.
 func (idx *HeaderIndex) rebuildHeightIndex() {
 	height := idx.bestHeader.Height
+
+	if int(height) == len(idx.bestChainByHeight) &&
+		height > 0 &&
+		idx.bestChainByHeight[height-1] == idx.bestHeader.Parent {
+		idx.bestChainByHeight = append(idx.bestChainByHeight, idx.bestHeader)
+		return
+	}
+
 	index := make([]*HeaderNode, height+1)
 	node := idx.bestHeader
 	for node != nil {
@@ -374,9 +385,18 @@ func (idx *HeaderIndex) addRejectedLocked(hash types.Hash) {
 }
 
 // buildAncestorLookup returns a function that looks up a header at a given
-// height by walking the parent chain from the given node.
+// height. Uses the bestChainByHeight slice for O(1) lookups when the parent
+// is on the best chain (always true during linear sync). Falls back to
+// walking parent pointers for fork cases.
 func (idx *HeaderIndex) buildAncestorLookup(parentNode *HeaderNode) func(uint32) *types.BlockHeader {
 	return func(height uint32) *types.BlockHeader {
+		if height < uint32(len(idx.bestChainByHeight)) {
+			node := idx.bestChainByHeight[height]
+			if node != nil {
+				h := node.Header
+				return &h
+			}
+		}
 		node := parentNode
 		for node != nil && node.Height > height {
 			node = node.Parent
