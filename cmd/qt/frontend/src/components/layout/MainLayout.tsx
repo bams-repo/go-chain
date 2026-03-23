@@ -1,4 +1,4 @@
-import { useLocation } from "react-router-dom";
+import { Outlet, useLocation } from "react-router-dom";
 import { useCoinInfo } from "@/hooks/useCoinInfo";
 import type { CoinInfo } from "@/lib/types";
 import { Navbar } from "./Navbar";
@@ -47,7 +47,7 @@ function viewMeta(pathname: string): { title: string; subtitle: string } {
   return { title: "Wallet", subtitle: "Fairchain" };
 }
 
-export default function MainLayout({ children }: { children: React.ReactNode }) {
+export default function MainLayout() {
   const { pathname } = useLocation();
   const { title, subtitle } = viewMeta(pathname);
   const coinInfo = useCoinInfo();
@@ -89,7 +89,7 @@ export default function MainLayout({ children }: { children: React.ReactNode }) 
               <NetworkPill network={coinInfo.network} />
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain p-5 md:p-6">
-              {children}
+              <Outlet />
             </div>
           </div>
         </SidebarInset>
