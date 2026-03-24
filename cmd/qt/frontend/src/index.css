@@ -3,21 +3,21 @@
 @import "@fontsource-variable/geist";
 
 @theme inline {
-  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
-  --color-btc-gold: #F7931A;
-  --color-btc-gold-light: #FFB347;
-  --color-btc-gold-dark: #C67200;
-  --color-btc-deep: #0D1117;
-  --color-btc-surface: #161B22;
-  --color-btc-card: #1C2128;
-  --color-btc-border: #30363D;
-  --color-btc-border-light: #484F58;
-  --color-btc-text: #E6EDF3;
-  --color-btc-text-muted: #8B949E;
-  --color-btc-text-dim: #484F58;
-  --color-btc-green: #3FB950;
-  --color-btc-red: #F85149;
-  --color-btc-blue: #58A6FF;
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --color-btc-gold: #f7931a;
+  --color-btc-gold-light: #ffb347;
+  --color-btc-gold-dark: #c67200;
+  --color-btc-deep: #0d1117;
+  --color-btc-surface: #161b22;
+  --color-btc-card: #1c2128;
+  --color-btc-border: #30363d;
+  --color-btc-border-light: #484f58;
+  --color-btc-text: #e6edf3;
+  --color-btc-text-muted: #8b949e;
+  --color-btc-text-dim: #484f58;
+  --color-btc-green: #3fb950;
+  --color-btc-red: #f85149;
+  --color-btc-blue: #58a6ff;
 
   /*
    * Dark-chrome overlays: single source for white-on-dark hover/selection.
@@ -55,7 +55,9 @@
   * {
     box-sizing: border-box;
   }
-  html, body, #root {
+  html,
+  body,
+  #root {
     height: 100%;
     margin: 0;
     overflow: hidden;
@@ -73,7 +75,11 @@
 [data-slot="sidebar-inner"],
 [data-slot="sidebar"][data-mobile="true"] {
   position: relative;
-  background: linear-gradient(180deg, var(--color-btc-surface) 0%, var(--color-btc-deep) 100%) !important;
+  background: linear-gradient(
+    180deg,
+    var(--color-btc-surface) 0%,
+    var(--color-btc-deep) 100%
+  ) !important;
 }
 /* Desktop: fixed sidebar ends above app status bar (StatusBar is full-width below main + nav) */
 @media (min-width: 768px) {
@@ -97,7 +103,7 @@
 
 /* Subtle noise texture overlay for depth */
 .btc-noise::before {
-  content: '';
+  content: "";
   position: absolute;
   inset: 0;
   opacity: 0.015;
@@ -123,12 +129,19 @@
 }
 
 @keyframes pulse-glow {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }
 
 @keyframes spin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Scrollbar styling */

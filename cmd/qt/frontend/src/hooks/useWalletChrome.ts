@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GetSyncStatus, ToggleMining } from "../../wailsjs/go/main/App";
 import { EventsOn } from "../../wailsjs/runtime/runtime";
 
@@ -43,10 +43,18 @@ export function useWalletChrome() {
 
   const onCloseDebug = useCallback(() => setShowDebug(false), []);
 
-  return {
-    showSyncOverlay: syncing && !syncDismissed,
-    onHideSyncOverlay,
-    showDebug,
-    onCloseDebug,
-  };
+  const handleSyncOverlay = useCallback(() => {
+    if (syncing) setSyncDismissed(false);
+  }, [syncing]);
+
+  return useMemo(
+    () => ({
+      showSyncOverlay: syncing && !syncDismissed,
+      onHideSyncOverlay,
+      showDebug,
+      onCloseDebug,
+      handleSyncOverlay,
+    }),
+    [syncing, syncDismissed, onHideSyncOverlay, showDebug, onCloseDebug, handleSyncOverlay],
+  );
 }

@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
-import { GetMiningStatus, GetBlockchainInfo, GetPeerCount, GetSyncStatus } from "../../wailsjs/go/main/App";
+import {
+  GetMiningStatus,
+  GetBlockchainInfo,
+  GetPeerCount,
+  GetSyncStatus,
+} from "../../wailsjs/go/main/App";
 
 interface MiningStatus {
   mining: boolean;
@@ -20,7 +25,14 @@ function SignalBars({ peers }: { peers: number }) {
   const gold = "var(--color-btc-gold)";
   const dim = "rgba(255,255,255,0.15)";
   return (
-    <svg width="14" height="12" viewBox="0 0 24 20" fill="none" strokeWidth={3} strokeLinecap="round">
+    <svg
+      width="14"
+      height="12"
+      viewBox="0 0 24 20"
+      fill="none"
+      strokeWidth={3}
+      strokeLinecap="round"
+    >
       <line x1="4" y1="18" x2="4" y2="15" stroke={bars >= 1 ? gold : dim} />
       <line x1="9" y1="18" x2="9" y2="12" stroke={bars >= 2 ? gold : dim} />
       <line x1="14" y1="18" x2="14" y2="8" stroke={bars >= 3 ? gold : dim} />
@@ -29,8 +41,12 @@ function SignalBars({ peers }: { peers: number }) {
   );
 }
 
-export function StatusBar() {
-  const [mining, setMining] = useState<MiningStatus>({ mining: false, hashrate: 0, hashrateReady: false });
+export function StatusBar({ handleSyncOverlay }: { handleSyncOverlay: () => void }) {
+  const [mining, setMining] = useState<MiningStatus>({
+    mining: false,
+    hashrate: 0,
+    hashrateReady: false,
+  });
   const [height, setHeight] = useState(0);
   const [peers, setPeers] = useState(0);
   const [syncState, setSyncState] = useState("INITIAL");
@@ -46,7 +62,9 @@ export function StatusBar() {
           setHeight(info.height as number);
         })
         .catch(() => {});
-      GetPeerCount().then(setPeers).catch(() => {});
+      GetPeerCount()
+        .then(setPeers)
+        .catch(() => {});
       GetSyncStatus()
         .then((s) => {
           setSyncState(s.syncState as string);
@@ -92,6 +110,7 @@ export function StatusBar() {
         position: "relative",
         zIndex: 20,
       }}
+      onClick={handleSyncOverlay}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
@@ -101,13 +120,20 @@ export function StatusBar() {
           </span>
         </div>
 
-        <span style={{ fontFamily: "monospace" }}>
-          Block: {height.toLocaleString()}
-        </span>
+        <span style={{ fontFamily: "monospace" }}>Block: {height.toLocaleString()}</span>
 
         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
           {isSynced ? (
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--color-btc-green)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--color-btc-green)"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               <polyline points="20 6 9 17 4 12" />
             </svg>
           ) : (
@@ -151,9 +177,7 @@ export function StatusBar() {
                 </span>
               </>
             ) : (
-              <span style={{ color: "var(--color-btc-gold)" }}>
-                Mining Initializing...
-              </span>
+              <span style={{ color: "var(--color-btc-gold)" }}>Mining Initializing...</span>
             )}
           </div>
         ) : (

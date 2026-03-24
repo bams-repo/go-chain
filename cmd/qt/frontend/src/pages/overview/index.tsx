@@ -13,7 +13,13 @@ function NetworkIcon({ peers }: { peers: number }) {
   const gold = "var(--color-btc-gold)";
   const dim = "var(--color-btc-text-dim)";
   return (
-    <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" strokeWidth={2.5} strokeLinecap="round">
+    <svg
+      className="h-5 w-5"
+      viewBox="0 0 24 24"
+      fill="none"
+      strokeWidth={2.5}
+      strokeLinecap="round"
+    >
       <line x1="6" y1="20" x2="6" y2="17" stroke={bars >= 1 ? gold : dim} />
       <line x1="10" y1="20" x2="10" y2="14" stroke={bars >= 2 ? gold : dim} />
       <line x1="14" y1="20" x2="14" y2="10" stroke={bars >= 3 ? gold : dim} />
@@ -26,14 +32,30 @@ function SyncIcon({ progress }: { progress: number }) {
   const synced = progress >= 0.999;
   if (synced) {
     return (
-      <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="var(--color-btc-green)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+      <svg
+        className="h-5 w-5"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="var(--color-btc-green)"
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
         <path d="M22 11.08V12a10 10 0 11-5.93-9.14" />
         <polyline points="22 4 12 14.01 9 11.01" />
       </svg>
     );
   }
   return (
-    <svg className="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="var(--color-btc-gold)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      className="h-5 w-5 animate-spin"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="var(--color-btc-gold)"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M21 12a9 9 0 11-6.219-8.56" />
     </svg>
   );
@@ -82,13 +104,20 @@ export function Overview() {
       <div
         className="btc-noise btc-glow-active relative overflow-hidden rounded-xl p-6"
         style={{
-          background: "linear-gradient(135deg, var(--color-btc-card) 0%, var(--color-btc-surface) 100%)",
+          background:
+            "linear-gradient(135deg, var(--color-btc-card) 0%, var(--color-btc-surface) 100%)",
           border: "1px solid var(--color-btc-border)",
         }}
       >
-        <div className="absolute -right-8 -top-8 h-32 w-32 rounded-full opacity-[0.04]" style={{ background: "var(--color-btc-gold)" }} />
+        <div
+          className="absolute -right-8 -top-8 h-32 w-32 rounded-full opacity-[0.04]"
+          style={{ background: "var(--color-btc-gold)" }}
+        />
         <div className="relative z-10">
-          <h3 className="mb-1 text-xs font-medium uppercase tracking-wider" style={{ color: "var(--color-btc-text-dim)" }}>
+          <h3
+            className="mb-1 text-xs font-medium uppercase tracking-wider"
+            style={{ color: "var(--color-btc-text-dim)" }}
+          >
             Balance
           </h3>
           <p className="text-3xl font-bold" style={{ color: "var(--color-btc-text)" }}>
@@ -113,7 +142,10 @@ export function Overview() {
           border: "1px solid var(--color-btc-border)",
         }}
       >
-        <h3 className="mb-2 text-xs font-medium uppercase tracking-wider" style={{ color: "var(--color-btc-text-dim)" }}>
+        <h3
+          className="mb-2 text-xs font-medium uppercase tracking-wider"
+          style={{ color: "var(--color-btc-text-dim)" }}
+        >
           Default Address
         </h3>
         <code
@@ -136,7 +168,10 @@ export function Overview() {
           border: "1px solid var(--color-btc-border)",
         }}
       >
-        <h3 className="mb-3 text-xs font-medium uppercase tracking-wider" style={{ color: "var(--color-btc-text-dim)" }}>
+        <h3
+          className="mb-3 text-xs font-medium uppercase tracking-wider"
+          style={{ color: "var(--color-btc-text-dim)" }}
+        >
           Chain Status
         </h3>
         <dl className="grid grid-cols-2 gap-4 text-sm">
@@ -152,7 +187,11 @@ export function Overview() {
             <dt style={{ color: "var(--color-btc-text-muted)" }} className="text-xs">
               Best Block
             </dt>
-            <dd className="truncate font-mono font-medium" style={{ color: "var(--color-btc-text)" }} title={bestHash}>
+            <dd
+              className="truncate font-mono font-medium"
+              style={{ color: "var(--color-btc-text)" }}
+              title={bestHash}
+            >
               {bestHash ? bestHash.slice(0, 16) + "\u2026" : "\u2014"}
             </dd>
           </div>
@@ -176,7 +215,13 @@ export function Overview() {
               {peers} peer{peers !== 1 ? "s" : ""}
             </p>
             <p style={{ color: "var(--color-btc-text-dim)" }}>
-              {peers >= 8 ? "Excellent" : peers >= 4 ? "Good" : peers >= 1 ? "Low" : "No connections"}
+              {peers >= 8
+                ? "Excellent"
+                : peers >= 4
+                  ? "Good"
+                  : peers >= 1
+                    ? "Low"
+                    : "No connections"}
             </p>
           </div>
         </div>
@@ -187,7 +232,9 @@ export function Overview() {
             <p className="font-medium" style={{ color: "var(--color-btc-text)" }}>
               {synced ? "Synced" : `Syncing ${(syncProgress * 100).toFixed(1)}%`}
             </p>
-            <p style={{ color: "var(--color-btc-text-dim)" }}>{synced ? "Up to date" : "Downloading blocks\u2026"}</p>
+            <p style={{ color: "var(--color-btc-text-dim)" }}>
+              {synced ? "Up to date" : "Downloading blocks\u2026"}
+            </p>
           </div>
         </div>
       </div>

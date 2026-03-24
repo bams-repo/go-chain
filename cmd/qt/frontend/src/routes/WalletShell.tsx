@@ -6,7 +6,8 @@ import { DebugWindow } from "@/components/DebugWindow";
 import { useWalletChrome } from "@/hooks/useWalletChrome";
 
 export default function WalletShell() {
-  const { showSyncOverlay, onHideSyncOverlay, showDebug, onCloseDebug } = useWalletChrome();
+  const { showSyncOverlay, onHideSyncOverlay, showDebug, onCloseDebug, handleSyncOverlay } =
+    useWalletChrome();
 
   return (
     <TooltipProvider>
@@ -14,7 +15,7 @@ export default function WalletShell() {
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <MainLayout />
         </div>
-        <StatusBar />
+        <StatusBar handleSyncOverlay={handleSyncOverlay} />
         {showSyncOverlay && <SyncOverlay onHide={onHideSyncOverlay} />}
         {showDebug && <DebugWindow onClose={onCloseDebug} />}
       </div>

@@ -134,18 +134,27 @@ export function SyncOverlay({ onHide }: { onHide: () => void }) {
         </svg>
         <div style={{ fontSize: 13, lineHeight: 1.5, color: "var(--color-btc-text)" }}>
           <p>
-            Recent transactions may not yet be visible, and therefore your wallet's balance might be incorrect.
-            This information will be correct once your wallet has finished synchronizing with the {coinInfo.name} network,
-            as detailed below.
+            Recent transactions may not yet be visible, and therefore your wallet's balance might be
+            incorrect. This information will be correct once your wallet has finished synchronizing
+            with the {coinInfo.name} network, as detailed below.
           </p>
           <p style={{ fontWeight: 600, marginTop: 4 }}>
-            Attempting to spend {coinInfo.nameLower} that are affected by not-yet-displayed transactions will not be accepted by the network.
+            Attempting to spend {coinInfo.nameLower} that are affected by not-yet-displayed
+            transactions will not be accepted by the network.
           </p>
         </div>
       </div>
 
       {/* Sync detail table */}
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: 32 }}>
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 32,
+        }}
+      >
         <div style={{ width: "100%", maxWidth: 520 }}>
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <tbody>
@@ -196,15 +205,10 @@ export function SyncOverlay({ onHide }: { onHide: () => void }) {
               <Row
                 label="Progress increase per hour"
                 value={
-                  ratePerHour != null
-                    ? `${(ratePerHour * 100).toFixed(2)}%`
-                    : "calculating..."
+                  ratePerHour != null ? `${(ratePerHour * 100).toFixed(2)}%` : "calculating..."
                 }
               />
-              <Row
-                label="Estimated time left until synced"
-                value={eta}
-              />
+              <Row label="Estimated time left until synced" value={eta} />
             </tbody>
           </table>
         </div>
