@@ -183,7 +183,7 @@ export function SyncOverlay({ onHide }: { onHide: () => void }) {
       style={{
         position: "absolute",
         inset: 0,
-        zIndex: 50,
+        zIndex: 1000,
         background: "var(--color-btc-deep)",
         display: "flex",
         flexDirection: "column",

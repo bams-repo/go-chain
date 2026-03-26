@@ -44,6 +44,9 @@ function viewMeta(pathname: string): { title: string; subtitle: string } {
   if (p === "/social" || p.startsWith("/social/")) {
     return { title: "Social", subtitle: "Wallet IRC — community channel" };
   }
+  if (p === "/node-map" || p.startsWith("/node-map/")) {
+    return { title: "Node Map", subtitle: "View the node map for the Fairchain network" };
+  }
   return { title: "Wallet", subtitle: "Fairchain" };
 }
 

@@ -8,6 +8,7 @@ import {
   Pickaxe,
   ScrollText,
   Terminal,
+  Map,
 } from "lucide-react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useCoinInfo } from "@/hooks/useCoinInfo";
@@ -34,7 +35,8 @@ type Page =
   | "transactions"
   | "network"
   | "mining"
-  | "console";
+  | "console"
+  | "node-map";
 
 type NavItem = {
   id: Page;
@@ -47,6 +49,7 @@ type NavItem = {
 const primaryNav: NavItem[] = [
   { id: "overview", label: "Overview", enabled: true, to: "/", icon: LayoutDashboard },
   { id: "social", label: "Social", enabled: true, to: "/social", icon: MessagesSquare },
+  { id: "node-map", label: "Node Map", enabled: true, to: "/node-map", icon: Map },
 ];
 
 const upcomingNav: NavItem[] = [
