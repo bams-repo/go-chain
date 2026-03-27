@@ -7,7 +7,6 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
@@ -77,11 +76,7 @@ export function loadGeoCache(): Record<string, GeoPoint> {
 }
 
 export async function resolveSelfGeo(): Promise<GeoPoint | null> {
-  const providers = [
-    "https://ipwho.is/",
-    "https://ipapi.co/json/",
-    "https://ipinfo.io/json",
-  ];
+  const providers = ["https://ipwho.is/", "https://ipapi.co/json/", "https://ipinfo.io/json"];
   for (const url of providers) {
     try {
       const res = await fetch(url);

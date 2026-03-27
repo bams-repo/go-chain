@@ -12,7 +12,13 @@ import {
 import { GetDebugInfo, GetPeerList } from "../../../wailsjs/go/main/App";
 import { DebugInfo, PeerEntry, GeoPoint, PeerWithGeo } from "@/lib/types";
 import { globals as g } from "@/lib/globals";
-import { loadGeoCache, resolveSelfGeo, extractIpFromAddr, isPublicRoutableIp, formatBytes } from "@/lib/utils";
+import {
+  loadGeoCache,
+  resolveSelfGeo,
+  extractIpFromAddr,
+  isPublicRoutableIp,
+  formatBytes,
+} from "@/lib/utils";
 const LeafletPeerMap = lazy(() => import("./leaflet-peer-map"));
 
 export function NodeMap() {
@@ -211,7 +217,8 @@ export function NodeMap() {
               </div>
             </div>
             <CardDescription>
-              Dot size tracks peer traffic volume; color indicates inbound vs outbound. Geolocation is cached locally for 24h.
+              Dot size tracks peer traffic volume; color indicates inbound vs outbound. Geolocation
+              is cached locally for 24h.
             </CardDescription>
           </CardHeader>
           <CardContent className="relative min-h-0 flex-1 p-0">
@@ -251,7 +258,10 @@ export function NodeMap() {
                     <TableBody>
                       {points.length === 0 ? (
                         <TableRow className="border-(--color-btc-border)">
-                          <TableCell className="px-3 py-4 text-(--color-btc-text-muted)" colSpan={6}>
+                          <TableCell
+                            className="px-3 py-4 text-(--color-btc-text-muted)"
+                            colSpan={6}
+                          >
                             No mapped peers yet.
                           </TableCell>
                         </TableRow>

@@ -50,7 +50,16 @@ function StageIndicator({ syncState }: { syncState: string }) {
   const currentIdx = stages.findIndex((s) => s.key === syncState);
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 0, width: "100%", maxWidth: 400, margin: "0 auto" }}>
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 0,
+        width: "100%",
+        maxWidth: 400,
+        margin: "0 auto",
+      }}
+    >
       {stages.map((stage, i) => {
         const isActive = i === currentIdx;
         const isDone = i < currentIdx;
@@ -62,7 +71,14 @@ function StageIndicator({ syncState }: { syncState: string }) {
 
         return (
           <div key={stage.key} style={{ display: "flex", alignItems: "center", flex: 1 }}>
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: 48 }}>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                minWidth: 48,
+              }}
+            >
               <div
                 style={{
                   width: 24,
@@ -80,7 +96,16 @@ function StageIndicator({ syncState }: { syncState: string }) {
                 }}
               >
                 {isDone ? (
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                  <svg
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
                     <polyline points="20 6 9 17 4 12" />
                   </svg>
                 ) : isActive ? (
@@ -262,7 +287,14 @@ export function SyncOverlay({ onHide }: { onHide: () => void }) {
               <span style={{ fontSize: 12, fontWeight: 600, color: "var(--color-btc-text)" }}>
                 Overall Progress
               </span>
-              <span style={{ fontSize: 12, fontWeight: 700, color: "var(--color-btc-gold)", fontFamily: "monospace" }}>
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 700,
+                  color: "var(--color-btc-gold)",
+                  fontFamily: "monospace",
+                }}
+              >
                 {progressPct}%
               </span>
             </div>
@@ -338,10 +370,7 @@ export function SyncOverlay({ onHide }: { onHide: () => void }) {
                     : "..."
                 }
               />
-              <Row
-                label="Connected peers"
-                value={status ? `${status.peers}` : "0"}
-              />
+              <Row label="Connected peers" value={status ? `${status.peers}` : "0"} />
               <Row
                 label="Last block time"
                 value={status ? formatBlockTime(status.lastBlockTime) : "Unknown"}

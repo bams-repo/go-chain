@@ -95,7 +95,11 @@ export default function LeafletPeerMap({
               center={[geo.lat, geo.lon]}
               radius={radius}
               pathOptions={{
-                color: isSelf ? "rgb(63 185 80)" : peer.inbound ? "rgb(88 166 255)" : "rgb(247 147 26)",
+                color: isSelf
+                  ? "rgb(63 185 80)"
+                  : peer.inbound
+                    ? "rgb(88 166 255)"
+                    : "rgb(247 147 26)",
                 fillOpacity: isSelf ? 0.8 : 0.55,
                 weight: isSelf ? 2.5 : 1.5,
               }}
@@ -106,7 +110,8 @@ export default function LeafletPeerMap({
                     <strong>{isSelf ? `This node (${peer.addr})` : peer.addr}</strong>
                   </div>
                   <div>
-                    {[geo.city, geo.region, geo.country].filter(Boolean).join(", ") || "Unknown location"}
+                    {[geo.city, geo.region, geo.country].filter(Boolean).join(", ") ||
+                      "Unknown location"}
                   </div>
                   <div>{peer.inbound ? "Inbound" : "Outbound"}</div>
                   <div>Version: {peer.subver || peer.version}</div>
