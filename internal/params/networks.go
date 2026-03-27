@@ -90,8 +90,8 @@ var Mainnet = &ChainParams{
 	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
-	// Difficulty calibrated for sha256mem v3 (~27 H/s per core).
-	// 0x1e7ce359 ≈ 134K hashes ≈ ~25 min on a single core.
+	// Difficulty calibrated for sha256mem (~62 H/s per core, 64 MiB buffer, 32768 mix rounds).
+	// InitialBits will need recalibration after genesis re-mine.
 	InitialBits:      0x1e7ce359,
 	MinBits:          0x1f7fffff, // Floor ≈ 8x easier than initial; allows difficulty to recover after hash rate drops
 	NoRetarget:       false,

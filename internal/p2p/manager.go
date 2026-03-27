@@ -95,10 +95,11 @@ type Manager struct {
 	syncState       SyncState
 	syncStateMu     sync.RWMutex
 
-	headerSyncPeerAddr string
-	headerSyncSince    time.Time
-	lastHeaderHeight   uint32
-	headerSyncStalls   int
+	headerSyncPeerAddr  string
+	headerSyncSince     time.Time
+	lastHeaderHeight    uint32
+	headerSyncStalls    int
+	headerSyncCaughtUp  bool
 
 	headerIndex    *chain.HeaderIndex
 	blockScheduler *BlockScheduler
@@ -2407,6 +2408,7 @@ func (m *Manager) handleSyncInitial() {
 		m.headerSyncSince = time.Now()
 		m.lastHeaderHeight = m.headerIndex.BestHeaderHeight()
 		m.headerSyncStalls = 0
+		m.headerSyncCaughtUp = false
 
 		m.syncPeerAddrMu.Lock()
 		m.syncPeerAddr = peer.Addr()
@@ -2480,6 +2482,7 @@ func (m *Manager) handleHeaderSyncTick() {
 		m.headerSyncSince = time.Now()
 		m.lastHeaderHeight = m.headerIndex.BestHeaderHeight()
 		m.headerSyncStalls = 0
+		m.headerSyncCaughtUp = false
 
 		m.syncPeerAddrMu.Lock()
 		m.syncPeerAddr = peer.Addr()
@@ -2528,6 +2531,8 @@ func (m *Manager) handleHeaderSyncTick() {
 		return
 	}
 
+	syncPeerHeight := syncPeer.BestHeight()
+
 	m.mu.RLock()
 	var bestHeight uint32
 	for _, p := range m.peers {
@@ -2546,11 +2551,22 @@ func (m *Manager) handleHeaderSyncTick() {
 			"current_header_height", currentHeight,
 			"best_peer_height", bestHeight,
 			"sync_peer", syncPeer.Addr(),
+			"sync_peer_height", syncPeerHeight,
 			"stalls", m.headerSyncStalls,
 			"since_last_progress", time.Since(m.headerSyncSince).String())
 	}
 
-	if currentHeight >= bestHeight {
+	// Transition to block sync when we have caught up with headers.
+	// Three conditions can trigger this:
+	// 1. We have headers >= the best v2+ peer height (normal case)
+	// 2. We have headers >= our sync peer's claimed height
+	// 3. The sync peer sent a partial batch, meaning it has no more headers
+	// Conditions 2 and 3 protect against rogue peers that claim inflated heights.
+	headersDone := currentHeight >= bestHeight ||
+		currentHeight >= syncPeerHeight ||
+		(m.headerSyncCaughtUp && currentHeight > 0)
+
+	if headersDone {
 		_, tipH := m.chain.Tip()
 		m.blockSyncLastProgress = time.Now()
 		m.blockSyncLastHeight = tipH
@@ -2770,6 +2786,8 @@ func (m *Manager) handleLegacyBlockSync() {
 // selectFastSyncPeer picks the best peer for fast (sequential) block download.
 // Prefers the peer with the highest chain and lowest latency.
 func (m *Manager) selectFastSyncPeer() *Peer {
+	headerHeight := m.headerIndex.BestHeaderHeight()
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -2783,6 +2801,13 @@ func (m *Manager) selectFastSyncPeer() *Peer {
 			continue
 		}
 		h := p.BestHeight()
+
+		// Skip peers claiming heights far beyond our validated header chain.
+		// Such peers are either rogue or on a different fork.
+		if h > headerHeight+500 {
+			continue
+		}
+
 		ping := p.PingLatency()
 		if ping == 0 {
 			ping = 500 * time.Millisecond
@@ -3113,12 +3138,20 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 					"added", added)
 			}
 			m.requestHeaders(peer)
-		} else if logging.DebugMode {
-			logging.L.Debug("[dbg] handleHeaders: not requesting more",
-				"peer", peer.Addr(),
-				"batch_size", len(msg.Headers),
-				"max_per_msg", protocol.MaxHeadersPerMsg,
-				"added", added)
+		} else {
+			if peer.Addr() == m.headerSyncPeerAddr {
+				m.headerSyncCaughtUp = true
+				logging.L.Info("header sync peer delivered all headers",
+					"component", "p2p", "peer", peer.Addr(),
+					"batch_size", len(msg.Headers), "best_header", bestH)
+			}
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] handleHeaders: not requesting more",
+					"peer", peer.Addr(),
+					"batch_size", len(msg.Headers),
+					"max_per_msg", protocol.MaxHeadersPerMsg,
+					"added", added)
+			}
 		}
 
 		// Bitcoin Core header-first relay: when synced and a new header

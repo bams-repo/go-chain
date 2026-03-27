@@ -28,6 +28,10 @@ validate_gpu: validate_gpu.c sha256mem_gpu.cl
 gpu_miner: gpu_miner.c sha256mem_gpu_fast.cl
 	$(CC) -O2 -o $@ gpu_miner.c -lOpenCL -lcrypto -lcurl -lm
 
+# sha256mem v4 GPU benchmark (ChaCha20 fill + XOR-rotate mix)
+gpu_v4: bench_gpu_v4.c sha256mem_v4_gpu.cl
+	$(CC) -O2 -o bench_gpu_v4 bench_gpu_v4.c $(CL_FLAGS)
+
 gpu: gpu_fast
 
 vectors: gen_vectors.go
@@ -38,6 +42,6 @@ test: vectors test_sha256mem
 	./test_sha256mem test_vectors.txt
 
 clean:
-	rm -f test_sha256mem test_vectors.txt sha256mem_gpu sha256mem_gpu_fast sha256mem_bench bench_cpu validate_gpu gpu_miner
+	rm -f test_sha256mem test_vectors.txt sha256mem_gpu sha256mem_gpu_fast sha256mem_bench bench_cpu validate_gpu gpu_miner bench_gpu_v4
 
-.PHONY: all vectors test clean gpu gpu_naive gpu_fast bench_cpu gpu_miner
+.PHONY: all vectors test clean gpu gpu_naive gpu_fast gpu_v4 bench_cpu gpu_miner

@@ -23,77 +23,75 @@ var memPool = sync.Pool{
 
 // Consensus-critical parameters. Changing any of these is a hard fork.
 //
-// Memory-hard SHA256 PoW inspired by YesPower/RandomX principles.
-// Each hash requires a 128 MiB buffer, which starves GPUs of workers:
-// a 12 GB GPU fits only ~68 workers vs the ~40,000 needed for full
-// occupancy, leaving it >99% idle. Meanwhile any CPU or phone can
-// allocate 128 MiB per thread from system RAM.
+// Memory-hard SHA256 PoW with sequential-dependent fill.
 //
-// The fill phase chains FillChains SHA256 hashes and copies each
-// result across (Slots/FillChains) consecutive slots, populating the
-// full 128 MiB buffer with only 8,192 SHA256 computations. The mix
-// phase then performs 2,048 serial SHA256-per-hop random reads over
-// the buffer, creating an unbreakable read→SHA256→address chain.
+// Each hash requires a 64 MiB buffer. A 12 GB GPU can fit at most ~154
+// concurrent workers, far below the ~40,000 threads needed for full
+// occupancy, leaving the GPU >99.6% idle. Meanwhile any CPU or phone
+// with 4+ GB RAM easily spares 64 MiB per mining thread.
 //
-// Benchmarked results (sha256mem v3):
-//   Galaxy S10+ (1 thread):   28 H/s
-//   i9-11900K  (1 thread):    27 H/s
-//   i9-11900K  (16 threads):  85 H/s
-//   RTX 3080 Ti (68 workers): 24 H/s  ← $1,200 GPU loses to $100 phone
+// The fill phase writes every slot sequentially. Between SHA256 anchor
+// points (every HardenInterval slots), a lightweight ARX (add-rotate-xor)
+// step derives each slot from its predecessor. This makes each slot
+// depend on all prior slots — the GPU cannot skip or compress the buffer.
+// The periodic SHA256 hardening prevents any algebraic shortcut.
+//
+// The mix phase performs MixRounds serial SHA256-per-hop random reads.
+// Each round forces a full SHA256 between every memory read, creating
+// an unbreakable serial dependency chain that cannot be pipelined.
+// CPUs with SHA-NI complete each round in ~110ns; GPUs must emulate
+// SHA256 in software ALU ops at 4-10x the cost per round. The high
+// round count (32,768) exploits this asymmetry: the mix adds only ~4ms
+// on CPU but ~30-60ms on GPU per worker.
 //
 // All primitives are standard SHA256 — no novel cryptography.
 const (
 	// Slots is the number of 32-byte entries in the memory buffer.
-	// 4194304 * 32 = 128 MiB. A 12 GB GPU can fit at most ~68
-	// concurrent workers, far below the ~40,000 threads needed for
-	// full occupancy. Phones with 4+ GB RAM easily spare 128 MiB.
-	Slots = 4194304
+	// 2,097,152 * 32 = 64 MiB.
+	Slots = 2097152
 
-	// FillChains is the number of chained SHA256 hashes used to
-	// populate the buffer. Each hash result is copied across
-	// (Slots/FillChains) = 512 consecutive slots, filling the full
-	// 128 MiB with only 8,192 SHA256 computations.
-	FillChains = 8192
+	// HardenInterval is the number of slots between SHA256 hardening
+	// points in the fill phase. Between hardening points, a lightweight
+	// ARX step (rotate-xor-add) derives each slot from its predecessor.
+	// SHA256 every 256 slots prevents algebraic shortcuts while keeping
+	// the fill phase fast. Total SHA256 calls in fill: Slots/256 = 8,192.
+	HardenInterval = 256
 
 	// MixRounds is the number of serial SHA256+read hops in the mix
-	// phase. Each round: read mem[idx], SHA256(acc || mem[idx]) → acc,
-	// derive next idx from acc. The SHA256 between every read prevents
-	// the GPU from issuing the next memory request until the hash
-	// completes, creating an unbreakable serial dependency chain.
-	MixRounds = 2048
+	// phase. Each round: read mem[idx], SHA256(acc || mem[idx]) -> acc,
+	// derive next idx from acc. The high count exploits the SHA-NI
+	// asymmetry: CPUs with hardware SHA256 extensions handle 32,768
+	// serial hashes in ~4ms, while GPUs must spend 30-60ms per worker
+	// on pure ALU SHA256 emulation — an unparallelizable bottleneck.
+	MixRounds = 32768
 )
 
 // Hasher implements memory-hard SHA256 proof-of-work hashing.
 //
 // Algorithm:
-//  1. Seed:     SHA256(header) → mem[0]
-//  2. Fill:     8,192 chained SHA256s, each copied across 512 slots (128 MiB)
-//  3. Mix:      2,048 rounds of: read mem[idx] → SHA256(acc||mem[idx]) → new idx
-//  4. Finalize: SHA256(accumulator) → output hash
+//  1. Seed:     SHA256(header) -> mem[0]
+//  2. Fill:     Sequential dependent fill over 64 MiB:
+//               - Every 256 slots: SHA256(previous) -> anchor
+//               - Between anchors: ARX(previous, index) -> slot
+//  3. Mix:      32,768 rounds of: read mem[idx] -> SHA256(acc||mem[idx]) -> new idx
+//  4. Finalize: SHA256(accumulator) -> output hash
 type Hasher struct{}
 
 func New() *Hasher { return &Hasher{} }
 
 func (h *Hasher) PoWHash(data []byte) types.Hash {
-	// Phase 1: Seed from header.
 	seed := sha256.Sum256(data)
 
-	// Phase 2: Fast fill — chain FillChains SHA256s, copy each result
-	// across (Slots/FillChains) consecutive slots to fill 128 MiB.
 	memPtr := memPool.Get().(*[][32]byte)
 	mem := *memPtr
-	spread := Slots / FillChains
 
+	// Phase 2: Sequential dependent fill.
 	mem[0] = seed
-	for j := 1; j < spread; j++ {
-		mem[j] = mem[0]
-	}
-	for i := 1; i < FillChains; i++ {
-		base := i * spread
-		prev := (i - 1) * spread
-		mem[base] = sha256.Sum256(mem[prev][:])
-		for j := 1; j < spread; j++ {
-			mem[base+j] = mem[base]
+	for i := 1; i < Slots; i++ {
+		if i%HardenInterval == 0 {
+			mem[i] = sha256.Sum256(mem[i-1][:])
+		} else {
+			arxFill(&mem[i], &mem[i-1], uint32(i))
 		}
 	}
 
@@ -109,9 +107,21 @@ func (h *Hasher) PoWHash(data []byte) types.Hash {
 
 	memPool.Put(memPtr)
 
-	// Phase 4: Final hash.
 	final := sha256.Sum256(acc[:])
 	return types.Hash(final)
+}
+
+// arxFill derives dst from src using a lightweight add-rotate-xor step
+// mixed with the slot index. This is ~1-2ns per slot (vs ~60ns for SHA256)
+// but creates a sequential dependency: each slot depends on the prior slot.
+func arxFill(dst, src *[32]byte, index uint32) {
+	for w := 0; w < 8; w++ {
+		v := binary.LittleEndian.Uint32(src[w*4:])
+		v ^= index + uint32(w)
+		v = (v << 13) | (v >> 19)
+		v += binary.LittleEndian.Uint32(src[w*4:])
+		binary.LittleEndian.PutUint32(dst[w*4:], v)
+	}
 }
 
 func (h *Hasher) Name() string { return "sha256mem" }

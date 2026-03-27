@@ -8,6 +8,7 @@ package sha256mem
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 
 	"github.com/bams-repo/fairchain/internal/types"
@@ -66,19 +67,41 @@ func TestPoWHashNotPlainSHA256(t *testing.T) {
 func TestPoWHashKnownVector(t *testing.T) {
 	h := New()
 
-	// Lock down the output for a fixed input so any accidental change
-	// to parameters or logic is caught immediately.
+	// Locked known vector. Any change to constants, fill, mix, or
+	// finalize logic will break this test.
 	input := []byte{}
-	reference := h.PoWHash(input)
+	want, _ := hex.DecodeString("adbe5df9a2107338e151d667fa705293d59ac3518d0a9ee1e3b5db4976b505d7")
+	var expected types.Hash
+	copy(expected[:], want)
 
-	// Run 10 more times to confirm bitwise reproducibility.
+	got := h.PoWHash(input)
+	if got != expected {
+		t.Fatalf("known vector mismatch\n  expected %x\n  got      %x", expected, got)
+	}
+
+	// Confirm bitwise reproducibility over many iterations.
 	for i := 0; i < 10; i++ {
 		got := h.PoWHash(input)
-		if got != reference {
-			t.Fatalf("iteration %d: hash changed\n  expected %x\n  got      %x", i, reference, got)
+		if got != expected {
+			t.Fatalf("iteration %d: hash changed\n  expected %x\n  got      %x", i, expected, got)
 		}
 	}
-	t.Logf("sha256mem empty-input hash: %x", reference)
+}
+
+func TestPoWHashFillAndMixContribute(t *testing.T) {
+	h := New()
+	input := []byte("sha256mem dependency test")
+	got := h.PoWHash(input)
+
+	// The output must differ from a naive SHA256 chain that skips
+	// the memory fill and mix phases entirely.
+	seed := sha256.Sum256(input)
+	chain1 := sha256.Sum256(seed[:])
+	chain2 := sha256.Sum256(chain1[:])
+
+	if types.Hash(chain2) == got {
+		t.Fatal("output matches naive SHA256 chain — fill/mix has no effect")
+	}
 }
 
 func TestName(t *testing.T) {
