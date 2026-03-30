@@ -1,7 +1,7 @@
 /*
  * sha256mem GPU Miner — submits blocks to a Fairchain daemon
  * ============================================================
- * Uses the optimized OpenCL kernel to mine blocks and submits them
+ * Uses sha256mem_v4_gpu.cl (same algorithm as Go sha256mem) to mine blocks
  * via the REST /submitblock endpoint.
  *
  * Build:
@@ -403,7 +403,8 @@ int main(int argc, char **argv)
     signal(SIGTERM, sighandler);
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    const size_t MEM_PER_WORKER = 4194304UL * 32;
+    /* 2097152 slots × 32 bytes = 64 MiB per worker (matches internal/algorithms/sha256mem) */
+    const size_t MEM_PER_WORKER = 2097152UL * 32;
 
     /* ── OpenCL setup ─────────────────────────────────────────── */
     cl_platform_id platform;
@@ -441,12 +442,18 @@ int main(int argc, char **argv)
     if (err != CL_SUCCESS) { fprintf(stderr, "create queue: %d\n", err); return 1; }
 
     size_t src_len;
-    char *src = load_kernel_source("sha256mem_gpu_fast.cl", &src_len);
+    char *src = load_kernel_source("sha256mem_v4_gpu.cl", &src_len);
     cl_program prog = clCreateProgramWithSource(ctx, 1, (const char **)&src, &src_len, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "create program: %d\n", err); return 1; }
 
     printf("Compiling kernel...\n");
-    err = clBuildProgram(prog, 1, &device, "-cl-mad-enable -cl-fast-relaxed-math -cl-std=CL1.2", NULL, NULL);
+    {
+        char build_opts[512];
+        snprintf(build_opts, sizeof(build_opts),
+                 "-cl-mad-enable -cl-fast-relaxed-math -cl-std=CL1.2%s",
+                 strstr(dev_name, "NVIDIA") != NULL ? " -cl-nv-opt-level=3" : "");
+        err = clBuildProgram(prog, 1, &device, build_opts, NULL, NULL);
+    }
     if (err != CL_SUCCESS) {
         size_t log_len;
         clGetProgramBuildInfo(prog, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_len);
@@ -477,7 +484,7 @@ int main(int argc, char **argv)
     cl_mem buf_target = clCreateBuffer(ctx, CL_MEM_READ_ONLY, 8*sizeof(uint32_t), NULL, &err);
     CL_CHECK(err, "alloc target");
 
-    cl_kernel kernel = clCreateKernel(prog, "sha256mem_mine_fast", &err);
+    cl_kernel kernel = clCreateKernel(prog, "sha256mem_mine", &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "create kernel: %d (%s)\n", err, cl_err_str(err)); return 1; }
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem), &buf_midstate), "arg 0");
@@ -493,7 +500,7 @@ int main(int argc, char **argv)
     CL_CHECK(clSetKernelArg(kernel, 9, sizeof(uint32_t), &hpi), "arg 9");
 
     size_t global_size = (size_t)num_workers;
-    size_t local_size = 1;
+    /* NULL local size: let the driver pick work-group size (matches bench_gpu_v4). */
 
     uint32_t *hash_counts_host = calloc(num_workers, sizeof(uint32_t));
     uint64_t total_blocks_mined = 0;
@@ -599,7 +606,7 @@ int main(int argc, char **argv)
 
             CL_CHECK(clSetKernelArg(kernel, 8, sizeof(uint32_t), &nonce_offset), "arg 8");
 
-            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL), "enqueue");
+            CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, NULL, 0, NULL, NULL), "enqueue");
             CL_CHECK(clFinish(queue), "finish");
 
             /* Read results */

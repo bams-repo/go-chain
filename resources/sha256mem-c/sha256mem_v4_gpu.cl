@@ -15,6 +15,7 @@
  */
 
 #define SHA256MEM_SLOTS           2097152
+#define SHA256MEM_SLOTS_MASK      (SHA256MEM_SLOTS - 1u) /* power-of-2; same as % Slots */
 #define SHA256MEM_HARDEN_INTERVAL 128
 #define SHA256MEM_MIX_ROUNDS      32768
 
@@ -206,26 +207,25 @@ __kernel void sha256mem_mine(
         uint acc[8];
         for (int w = 0; w < 8; w++) acc[w] = last_slot[w];
 
+        uint mix_buf[16];
         for (int r = 0; r < SHA256MEM_MIX_ROUNDS; r++) {
-            uint idx = acc[0] % SHA256MEM_SLOTS;
-            __global uint *slot = my_mem + idx * 8;
+            uint idx = acc[0] & SHA256MEM_SLOTS_MASK;
+            __global uint *slot = my_mem + ((ulong)idx * 8u);
 
-            uint buf[16];
-            for (int w = 0; w < 8; w++) buf[w] = acc[w];
-            for (int w = 0; w < 8; w++) buf[8 + w] = slot[w];
+            for (int w = 0; w < 8; w++) mix_buf[w] = acc[w];
+            for (int w = 0; w < 8; w++) mix_buf[8 + w] = slot[w];
 
-            sha256_64(buf, acc);
+            sha256_64(mix_buf, acc);
         }
 
         for (int r = 0; r < SHA256MEM_MIX_ROUNDS; r++) {
-            uint idx = acc[r % 7] % SHA256MEM_SLOTS;
-            __global uint *slot = my_mem + idx * 8;
+            uint idx = acc[r % 7] & SHA256MEM_SLOTS_MASK;
+            __global uint *slot = my_mem + ((ulong)idx * 8u);
 
-            uint buf[16];
-            for (int w = 0; w < 8; w++) buf[w] = acc[w];
-            for (int w = 0; w < 8; w++) buf[8 + w] = slot[w];
+            for (int w = 0; w < 8; w++) mix_buf[w] = acc[w];
+            for (int w = 0; w < 8; w++) mix_buf[8 + w] = slot[w];
 
-            sha256_64(buf, acc);
+            sha256_64(mix_buf, acc);
         }
 
         /* Phase 4: Finalize */
@@ -293,26 +293,25 @@ __kernel void sha256mem_validate(
     uint acc[8];
     for (int w = 0; w < 8; w++) acc[w] = last_slot[w];
 
+    uint mix_buf[16];
     for (int r = 0; r < SHA256MEM_MIX_ROUNDS; r++) {
-        uint idx = acc[0] % SHA256MEM_SLOTS;
-        __global uint *slot = g_mem_pool + idx * 8;
+        uint idx = acc[0] & SHA256MEM_SLOTS_MASK;
+        __global uint *slot = g_mem_pool + ((ulong)idx * 8u);
 
-        uint buf[16];
-        for (int w = 0; w < 8; w++) buf[w] = acc[w];
-        for (int w = 0; w < 8; w++) buf[8 + w] = slot[w];
+        for (int w = 0; w < 8; w++) mix_buf[w] = acc[w];
+        for (int w = 0; w < 8; w++) mix_buf[8 + w] = slot[w];
 
-        sha256_64(buf, acc);
+        sha256_64(mix_buf, acc);
     }
 
     for (int r = 0; r < SHA256MEM_MIX_ROUNDS; r++) {
-        uint idx = acc[r % 7] % SHA256MEM_SLOTS;
-        __global uint *slot = g_mem_pool + idx * 8;
+        uint idx = acc[r % 7] & SHA256MEM_SLOTS_MASK;
+        __global uint *slot = g_mem_pool + ((ulong)idx * 8u);
 
-        uint buf[16];
-        for (int w = 0; w < 8; w++) buf[w] = acc[w];
-        for (int w = 0; w < 8; w++) buf[8 + w] = slot[w];
+        for (int w = 0; w < 8; w++) mix_buf[w] = acc[w];
+        for (int w = 0; w < 8; w++) mix_buf[8 + w] = slot[w];
 
-        sha256_64(buf, acc);
+        sha256_64(mix_buf, acc);
     }
 
     uint final_hash[8];

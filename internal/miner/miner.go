@@ -47,7 +47,11 @@ type Miner struct {
 	rewardScript []byte
 	timeSource   TimeSource
 	onBlock      func(*types.Block)
-	workers      int
+	// allowMining, if non-nil, must return true before building templates or hashing.
+	// Used to suppress mining during P2P header/block sync (IBD) so the block tip
+	// cannot diverge from the header chain. Nil means always allowed.
+	allowMining func() bool
+	workers     int
 
 	hashCount     atomic.Uint64
 	hashrate      atomic.Uint64
@@ -61,7 +65,8 @@ type Miner struct {
 }
 
 // New creates a new Miner. ts may be nil, in which case raw local time is used.
-func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.ChainParams, rewardScript []byte, ts TimeSource, onBlock func(*types.Block)) *Miner {
+// allowMining may be nil (always mine); otherwise mining runs only when it returns true.
+func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.ChainParams, rewardScript []byte, ts TimeSource, allowMining func() bool, onBlock func(*types.Block)) *Miner {
 	if ts == nil {
 		ts = localClock{}
 	}
@@ -70,14 +75,15 @@ func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.Chai
 		workers = 1
 	}
 	return &Miner{
-		chain:        c,
-		engine:       e,
-		mempool:      mp,
-		params:       p,
-		rewardScript: rewardScript,
-		timeSource:   ts,
-		onBlock:      onBlock,
-		workers:      workers,
+		chain:         c,
+		engine:        e,
+		mempool:       mp,
+		params:        p,
+		rewardScript:  rewardScript,
+		timeSource:    ts,
+		allowMining:   allowMining,
+		onBlock:       onBlock,
+		workers:       workers,
 	}
 }
 
@@ -125,6 +131,15 @@ func (m *Miner) Run(ctx context.Context) {
 			m.hashrateReady.Store(false)
 			return
 		default:
+		}
+
+		if m.allowMining != nil && !m.allowMining() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
 		}
 
 		block, err := m.MineOne(ctx)
@@ -289,11 +304,14 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, target types.Hash, txs []types.Transaction, tipHash types.Hash) (*types.Block, bool) {
 	numWorkers := m.workers
 	rangeSize := uint64(0x100000000) / uint64(numWorkers)
-	// Keep batches tiny for memory-hard PoW. sha256mem runs on the order of
-	// tens of hashes per second per core, so even a batch of 128 delays
-	// minutes. With 5-second block targets we must check for new tips
-	// after every few hashes to avoid mining on a stale parent.
-	const batchSize = uint64(4)
+	// PoW hashes per SealHeader call before re-checking the chain tip.
+	// For fast algorithms (sha256d), small batches keep stale work low.
+	// For sha256mem (~10–200 H/s per machine), a slightly larger batch
+	// reduces per-batch overhead while still checking the tip many times per second.
+	batchSize := uint64(4)
+	if coinparams.Algorithm == "sha256mem" {
+		batchSize = 32
+	}
 
 	type result struct {
 		header types.BlockHeader

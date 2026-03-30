@@ -9,6 +9,7 @@ package discovery
 import (
 	"log"
 
+	"github.com/bams-repo/fairchain/internal/logging"
 	"github.com/bams-repo/fairchain/internal/store"
 )
 
@@ -39,16 +40,22 @@ func (d *Discovery) Bootstrap() []string {
 		addrs = append(addrs, stored...)
 	}
 
-	return deduplicate(addrs)
+	out := deduplicate(addrs)
+	logging.P2PSyncDebug("discovery.Bootstrap",
+		"seed_count", len(d.seeds),
+		"total_addrs", len(out))
+	return out
 }
 
 // AddPeer persists a newly discovered peer address.
 func (d *Discovery) AddPeer(addr string) {
+	logging.P2PSyncDebug("discovery.AddPeer", "addr", addr)
 	d.peerStore.PutPeer(addr)
 }
 
 // RemovePeer removes a peer address from the persistent store.
 func (d *Discovery) RemovePeer(addr string) {
+	logging.P2PSyncDebug("discovery.RemovePeer", "addr", addr)
 	d.peerStore.RemovePeer(addr)
 }
 

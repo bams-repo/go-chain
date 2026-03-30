@@ -42,6 +42,15 @@ func (h *BlockHeader) SerializeToBytes() []byte {
 	return buf[:]
 }
 
+// SerializeInto writes the canonical 80-byte header into buf.
+// len(buf) must be at least BlockHeaderSize (no allocation; for mining hot paths).
+func (h *BlockHeader) SerializeInto(buf []byte) {
+	if len(buf) < BlockHeaderSize {
+		panic("BlockHeader.SerializeInto: buf shorter than BlockHeaderSize")
+	}
+	h.serializeInto(buf)
+}
+
 func (h *BlockHeader) serializeInto(buf []byte) {
 	binary.LittleEndian.PutUint32(buf[0:4], h.Version)
 	copy(buf[4:36], h.PrevBlock[:])

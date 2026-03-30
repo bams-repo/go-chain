@@ -405,7 +405,7 @@ fairchain-cli getpeerinfo
 [
   {
     "id": 1,
-    "addr": "45.32.196.26:19334",
+    "addr": "95.179.203.47:19334",
     "addrlocal": "192.168.1.5:48210",
     "network": "ipv4",
     "services": "0000000000000001",

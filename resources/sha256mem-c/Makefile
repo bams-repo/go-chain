@@ -24,9 +24,9 @@ gpu_fast: bench_gpu_fast.c sha256mem_gpu_fast.cl
 validate_gpu: validate_gpu.c sha256mem_gpu.cl
 	$(CC) -O2 -o $@ validate_gpu.c -lssl $(CL_FLAGS)
 
-# GPU miner (connects to daemon, submits blocks)
-gpu_miner: gpu_miner.c sha256mem_gpu_fast.cl
-	$(CC) -O2 -o $@ gpu_miner.c -lOpenCL -lcrypto -lcurl -lm
+# GPU miner (connects to daemon, submits blocks; consensus kernel v4)
+gpu_miner: gpu_miner.c sha256mem_v4_gpu.cl
+	$(CC) -O3 -Wall -Wextra -o $@ gpu_miner.c -lOpenCL -lcrypto -lcurl -lm
 
 # OpenCL GPU benchmark (consensus sha256mem.c + sha256mem_v4_gpu.cl)
 gpu_v4: bench_gpu_v4.c sha256mem.c sha256mem.h sha256mem_v4_gpu.cl

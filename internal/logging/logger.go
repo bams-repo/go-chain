@@ -63,6 +63,38 @@ func EnableDebug() {
 	slog.SetDefault(L)
 }
 
+// P2PSyncDebug emits verbose P2P, header sync, and block-download diagnostics.
+// It is a no-op unless DebugMode is true (CLI -debug).
+func P2PSyncDebug(msg string, args ...any) {
+	if !DebugMode {
+		return
+	}
+	a := append([]any{"component", "p2p_sync"}, args...)
+	L.Debug(msg, a...)
+}
+
+// ChainSyncDebug emits verbose chain, header-index, reorg, and fork diagnostics.
+// It is a no-op unless DebugMode is true (CLI -debug).
+func ChainSyncDebug(msg string, args ...any) {
+	if !DebugMode {
+		return
+	}
+	a := append([]any{"component", "chain_sync"}, args...)
+	L.Debug(msg, a...)
+}
+
+// SyncAuditDebug records high-signal sync/IBD decisions (why we are syncing, why
+// we dropped a message, header/body phase transitions). Grep for component=sync_audit
+// in logs to verify chain convergence behavior on mainnet review.
+// No-op unless DebugMode is true (CLI -debug).
+func SyncAuditDebug(msg string, args ...any) {
+	if !DebugMode {
+		return
+	}
+	a := append([]any{"component", "sync_audit"}, args...)
+	L.Debug(msg, a...)
+}
+
 // With returns a child logger with additional default attributes.
 func With(args ...any) *slog.Logger {
 	return L.With(args...)

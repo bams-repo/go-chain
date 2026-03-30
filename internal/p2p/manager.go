@@ -101,6 +101,11 @@ type Manager struct {
 	headerSyncStalls    int
 	headerSyncCaughtUp  bool
 
+	// Rate-limited audit: blocks received during HEADER_SYNC are dropped on purpose.
+	headerSyncDropLogMu       sync.Mutex
+	lastHeaderSyncBlockDropLog time.Time
+	headerSyncBlocksDropped   uint64
+
 	headerIndex    *chain.HeaderIndex
 	blockScheduler *BlockScheduler
 
@@ -357,6 +362,47 @@ func (m *Manager) IsSyncing() bool {
 	return state == SyncStateHeaderSync || state == SyncStateBlockSync
 }
 
+// ShouldMine returns true when block production is safe. Mining is suppressed
+// during active IBD (header/block sync) and during INITIAL until the node has
+// connected to at least one peer and confirmed no peer is ahead. On a fresh
+// genesis network every node sees peers at height 0 — no one is ahead — so
+// mining proceeds immediately. When a node restarts into an existing network,
+// peers advertise a higher height and mining stays off until sync completes.
+func (m *Manager) ShouldMine() bool {
+	m.syncStateMu.RLock()
+	state := m.syncState
+	m.syncStateMu.RUnlock()
+
+	switch state {
+	case SyncStateHeaderSync, SyncStateBlockSync:
+		return false
+	case SyncStateSynced:
+		return true
+	case SyncStateInitial:
+		_, ourHeight := m.chain.Tip()
+		m.mu.RLock()
+		peerCount := len(m.peers)
+		var bestPeerHeight uint32
+		for _, p := range m.peers {
+			v := p.Version()
+			if v == nil || v.Version < 2 {
+				continue
+			}
+			if h := p.BestHeight(); h > bestPeerHeight {
+				bestPeerHeight = h
+			}
+		}
+		m.mu.RUnlock()
+
+		if peerCount == 0 {
+			return false
+		}
+		return bestPeerHeight <= ourHeight
+	default:
+		return false
+	}
+}
+
 // SyncState returns the current sync state name for RPC/logging.
 func (m *Manager) GetSyncState() string {
 	m.syncStateMu.RLock()
@@ -371,6 +417,18 @@ func (m *Manager) HeaderSyncHeight() uint32 {
 		return 0
 	}
 	return m.headerIndex.BestHeaderHeight()
+}
+
+// NotifyBlockAccepted inserts a newly accepted block's header into the
+// header index so that subsequent single-header announcements from peers
+// can connect. Without this, blocks accepted via direct relay or mining
+// advance the chain tip but leave the header index behind, causing every
+// peer header announcement to be silently dropped as unconnectable.
+func (m *Manager) NotifyBlockAccepted(header *types.BlockHeader) {
+	if m.headerIndex == nil {
+		return
+	}
+	_ = m.headerIndex.InsertTrustedHeader(header)
 }
 
 // BestPeerHeight returns the highest block height reported by any connected
@@ -955,14 +1013,14 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 					"known_addrs", len(connected))
 			}
 
-			if outCount >= m.maxOutbound {
-				continue
-			}
-
 			// -connect mode: always maintain connections to the explicit list,
 			// then also connect to discovered peers for mesh formation.
 			// Bitcoin Core's strict -connect prevents discovery, but for a small
 			// network this creates an unworkable hub-and-spoke topology.
+			//
+			// Mandatory -connect targets MUST be attempted even when outbound
+			// slots are full; otherwise discovered peers can starve explicit
+			// seeds and nodes lose their backbone link (chaos / small meshes).
 			if len(m.connectOnly) > 0 {
 				for _, addr := range m.connectOnly {
 					if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) {
@@ -970,6 +1028,9 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 						connected[addr] = true
 					}
 				}
+				m.mu.RLock()
+				outCount = m.outboundCount()
+				m.mu.RUnlock()
 				// Also connect to discovered peers for mesh formation.
 				if stored, err := m.peerStore.GetPeers(); err == nil {
 					for _, addr := range stored {
@@ -983,6 +1044,10 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 						}
 					}
 				}
+				continue
+			}
+
+			if outCount >= m.maxOutbound {
 				continue
 			}
 
@@ -1680,12 +1745,20 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	peer.AddKnownInventory(blockHash)
 
 	if m.seenBlocks.AddOrHas(blockHash) {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] handleBlock: already seen, skipping",
-				"hash", blockHash.ReverseString()[:16],
-				"peer", peer.Addr())
+		// If the block scheduler is waiting on this hash, the seenBlocks
+		// entry is stale (set before the scheduler existed, e.g. during
+		// fast-sync that later fell back). Remove it and continue so the
+		// block reaches BlockReceived and unstalls the scheduler.
+		if m.blockScheduler != nil && m.blockScheduler.IsInFlight(blockHash) {
+			m.seenBlocks.Remove(blockHash)
+		} else {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] handleBlock: already seen, skipping",
+					"hash", blockHash.ReverseString()[:16],
+					"peer", peer.Addr())
+			}
+			return
 		}
-		return
 	}
 
 	if logging.DebugMode {
@@ -1715,6 +1788,10 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 				m.fastSyncInFlight--
 				return
 			}
+			logging.SyncAuditDebug("fast sync: block validation failed — falling back to parallel scheduler",
+				"hash", blockHash.ReverseString()[:16],
+				"peer", peer.Addr(),
+				"err", err)
 			logging.L.Error("fast sync block failed validation",
 				"component", "p2p",
 				"hash", blockHash.ReverseString(),
@@ -1730,6 +1807,12 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 			m.blockScheduler.Populate()
 			m.blockSyncLastProgress = time.Now()
 			m.blockSyncLastHeight = tipH
+			// Scrub seenBlocks for every hash the scheduler needs so that
+			// blocks received (and marked seen) before the fallback can be
+			// re-delivered without being silently dropped.
+			for _, h := range m.blockScheduler.ExpectedHashes() {
+				m.seenBlocks.Remove(h)
+			}
 			return
 		}
 		m.fastSyncInFlight--
@@ -1779,6 +1862,26 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	// since we don't have their parents yet. Drop them silently — the block
 	// scheduler will fetch them in order once headers are complete.
 	if state == SyncStateHeaderSync {
+		bestH := uint32(0)
+		if m.headerIndex != nil {
+			bestH = m.headerIndex.BestHeaderHeight()
+		}
+		now := time.Now()
+		m.headerSyncDropLogMu.Lock()
+		m.headerSyncBlocksDropped++
+		n := m.headerSyncBlocksDropped
+		if m.lastHeaderSyncBlockDropLog.IsZero() || now.Sub(m.lastHeaderSyncBlockDropLog) >= 2*time.Second {
+			m.lastHeaderSyncBlockDropLog = now
+			m.headerSyncBlocksDropped = 0
+			m.headerSyncDropLogMu.Unlock()
+			logging.SyncAuditDebug("HEADER_SYNC: dropped unsolicited blocks (by design; block bodies after headers)",
+				"dropped_in_window", n,
+				"last_hash", blockHash.ReverseString()[:16],
+				"last_peer", peer.Addr(),
+				"best_header_height", bestH)
+		} else {
+			m.headerSyncDropLogMu.Unlock()
+		}
 		return
 	}
 
@@ -1833,6 +1936,8 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 		}
 		return
 	}
+
+	m.NotifyBlockAccepted(&block.Header)
 
 	var confirmedHashes []types.Hash
 	for _, tx := range block.Transactions {
@@ -2181,15 +2286,27 @@ func (m *Manager) processIBDBlock(item *ibdBlockItem) {
 	block := item.block
 	peer := item.peer
 	blockHash := crypto.HashBlockHeader(&block.Header)
+	_, tipBefore := m.chain.Tip()
+	logging.P2PSyncDebug("processIBDBlock",
+		"hash", blockHash.ReverseString()[:16],
+		"parent", block.Header.PrevBlock.ReverseString()[:16],
+		"peer", peer.Addr(),
+		"tip_before", tipBefore)
 
 	height, err := m.chain.ProcessBlock(block)
 	if err != nil {
 		if errors.Is(err, chain.ErrSideChain) {
+			logging.SyncAuditDebug("IBD ProcessBlock: side chain (stored, not main)",
+				"hash", blockHash.ReverseString()[:16], "side_height", height, "peer", peer.Addr())
 			logging.L.Info("IBD block stored as side chain", "component", "p2p",
 				"hash", blockHash.ReverseString(), "height", height, "addr", peer.Addr())
 			return
 		}
 		if errors.Is(err, chain.ErrOrphanBlock) {
+			logging.SyncAuditDebug("IBD ProcessBlock: orphan — will request parent + getblocks",
+				"hash", blockHash.ReverseString()[:16],
+				"parent", block.Header.PrevBlock.ReverseString()[:16],
+				"peer", peer.Addr())
 			logging.L.Info("IBD orphan block, requesting parent", "component", "p2p",
 				"hash", blockHash.ReverseString(),
 				"parent", block.Header.PrevBlock.ReverseString(),
@@ -2201,8 +2318,12 @@ func (m *Manager) processIBDBlock(item *ibdBlockItem) {
 		m.seenBlocks.Remove(blockHash)
 		errStr := err.Error()
 		if strings.Contains(errStr, "already in chain") {
+			logging.SyncAuditDebug("IBD ProcessBlock: duplicate / already in chain (benign)",
+				"hash", blockHash.ReverseString()[:16], "peer", peer.Addr())
 			return
 		}
+		logging.SyncAuditDebug("IBD ProcessBlock: rejected",
+			"hash", blockHash.ReverseString()[:16], "peer", peer.Addr(), "err", err)
 		logging.L.Warn("IBD block rejected", "component", "p2p",
 			"hash", blockHash.ReverseString(), "addr", peer.Addr(), "error", err)
 		if strings.Contains(errStr, "proof of work") || strings.Contains(errStr, "merkle") || strings.Contains(errStr, "bits mismatch") || strings.Contains(errStr, "exceeds target") || strings.Contains(errStr, "PoW check failed") {
@@ -2210,6 +2331,8 @@ func (m *Manager) processIBDBlock(item *ibdBlockItem) {
 		}
 		return
 	}
+
+	m.NotifyBlockAccepted(&block.Header)
 
 	var confirmedHashes []types.Hash
 	for _, tx := range block.Transactions {
@@ -2257,6 +2380,15 @@ func (m *Manager) transitionSyncState(newState SyncState) {
 	if old != newState {
 		logging.L.Info("sync state transition", "component", "p2p",
 			"from", old.String(), "to", newState.String())
+		_, tipH := m.chain.Tip()
+		headerH := uint32(0)
+		if m.headerIndex != nil {
+			headerH = m.headerIndex.BestHeaderHeight()
+		}
+		logging.P2PSyncDebug("transitionSyncState",
+			"from", old.String(), "to", newState.String(),
+			"chain_tip", tipH, "best_header", headerH,
+			"fast_sync_peer", m.fastSyncPeer, "header_sync_peer", m.headerSyncPeerAddr)
 	}
 }
 
@@ -2264,6 +2396,7 @@ func (m *Manager) syncLoop(ctx context.Context) {
 	wasIBD := false
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	var lastSyncDebugLog time.Time
 
 	for {
 		select {
@@ -2276,6 +2409,35 @@ func (m *Manager) syncLoop(ctx context.Context) {
 			m.syncStateMu.RLock()
 			state := m.syncState
 			m.syncStateMu.RUnlock()
+
+			if time.Since(lastSyncDebugLog) >= 2*time.Second {
+				lastSyncDebugLog = time.Now()
+				_, tipH := m.chain.Tip()
+				headerH := uint32(0)
+				if m.headerIndex != nil {
+					headerH = m.headerIndex.BestHeaderHeight()
+				}
+				bestV2 := m.peerBestHeightV2()
+				var gap uint32
+				if bestV2 > tipH {
+					gap = bestV2 - tipH
+				}
+				headerBehind := uint32(0)
+				if headerH > tipH {
+					headerBehind = headerH - tipH
+				}
+				logging.P2PSyncDebug("syncLoop tick",
+					"state", state.String(),
+					"chain_tip", tipH,
+					"best_header", headerH,
+					"headers_ahead_of_tip", headerBehind,
+					"best_peer_height_v2", bestV2,
+					"gap_to_best_peer", gap,
+					"finished_ibd", m.finishedIBD,
+					"fast_sync_peer", m.fastSyncPeer,
+					"header_sync_peer", m.headerSyncPeerAddr,
+					"peer_count", m.PeerCount())
+			}
 
 			switch state {
 			case SyncStateInitial:
@@ -2304,24 +2466,66 @@ func (m *Manager) syncLoop(ctx context.Context) {
 	}
 }
 
-// isInitialBlockDownload mirrors Bitcoin Core's IsInitialBlockDownload().
-// IBD is true when the chain tip timestamp is older than maxTipAge.
-// Once IBD latches to false it stays false until the process restarts.
+// peerBestHeightV2 returns the maximum advertised height among v2+ peers.
+func (m *Manager) peerBestHeightV2() uint32 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var best uint32
+	for _, p := range m.peers {
+		v := p.Version()
+		if v == nil || v.Version < 2 {
+			continue
+		}
+		ph := p.BestHeight()
+		if ph > best {
+			best = ph
+		}
+	}
+	return best
+}
+
+// isInitialBlockDownload mirrors Bitcoin Core's IsInitialBlockDownload():
+// tip timestamp age (stale chain) plus catch-up when peers advertise a longer
+// chain. Without the peer check, a node with a "fresh" tip can latch IBD off
+// while still blocks behind — then never pulls the main chain (chaos / restart).
 func (m *Manager) isInitialBlockDownload() bool {
 	if m.finishedIBD {
 		return false
 	}
-	if m.chain.IsTipStale() {
+	tipStale := m.chain.IsTipStale()
+	_, ourHeight := m.chain.Tip()
+	best := m.peerBestHeightV2()
+	const margin = uint32(2) // propagation slack; still sync if further behind
+	behindPeers := best > ourHeight+margin
+
+	if tipStale {
+		logging.SyncAuditDebug("IBD check: in IBD (tip stale)",
+			"our_height", ourHeight,
+			"best_peer_height_v2", best,
+			"margin", margin,
+			"tip_stale", true)
+		return true
+	}
+	if behindPeers {
+		logging.SyncAuditDebug("IBD check: in IBD (peers ahead of us)",
+			"our_height", ourHeight,
+			"best_peer_height_v2", best,
+			"gap", best-ourHeight,
+			"margin", margin,
+			"tip_stale", false)
 		return true
 	}
 	m.finishedIBD = true
+	logging.SyncAuditDebug("IBD check: leaving IBD — tip fresh and within peer margin",
+		"our_height", ourHeight,
+		"best_peer_height_v2", best,
+		"finished_ibd_set", true)
 	return false
 }
 
 // handleSyncInitial checks if the node needs to catch up with the network.
-// Bitcoin Core parity: use tip timestamp age as the primary IBD signal,
-// not raw peer height comparison. A node whose tip is recent is "synced"
-// even if a peer is a few blocks ahead (normal propagation delay).
+// Uses tip staleness (IsTipStale) and isInitialBlockDownload(), which also
+// compares our height to peers so we do not mark SYNCED while still behind.
 func (m *Manager) handleSyncInitial() {
 	_, ourHeight := m.chain.Tip()
 
@@ -2370,6 +2574,9 @@ func (m *Manager) handleSyncInitial() {
 
 	// Tip is recent — we're not in IBD. Transition to SYNCED.
 	if !m.isInitialBlockDownload() {
+		logging.SyncAuditDebug("handleSyncInitial: not in IBD — SYNCED",
+			"our_height", ourHeight,
+			"best_v2_peer_height", bestHeight)
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] handleSyncInitial: not IBD, transitioning to SYNCED")
 		}
@@ -2377,8 +2584,35 @@ func (m *Manager) handleSyncInitial() {
 		return
 	}
 
-	// Tip is stale but no peer is ahead — we're the best chain we know of.
+	// No peer advertises a longer chain than our tip.
 	if bestHeight <= ourHeight {
+		// Stale genesis/tip with only same-height peers: stay in INITIAL until
+		// a peer pulls ahead or the chain becomes non-stale. Transitioning to
+		// SYNCED here skips proper catch-up and matches "solo" incorrectly
+		// during startup (chaos: seeds behind the mining majority).
+		if m.chain.IsTipStale() {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] handleSyncInitial: stale tip, no peer ahead — staying INITIAL",
+					"best_peer_height", bestHeight,
+					"our_height", ourHeight)
+			}
+			// Still request blocks from all peers (same as handleSyncedTick for a
+			// stale tip) so we do not stall waiting for SYNCED state.
+			m.mu.RLock()
+			allPeers := make([]*Peer, 0, len(m.peers))
+			for _, p := range m.peers {
+				allPeers = append(allPeers, p)
+			}
+			m.mu.RUnlock()
+			for _, p := range allPeers {
+				m.requestBlocks(p)
+			}
+			return
+		}
+		logging.SyncAuditDebug("handleSyncInitial: no v2 peer ahead — SYNCED (solo or leader)",
+			"our_height", ourHeight,
+			"best_v2_peer_height", bestHeight,
+			"tip_stale", m.chain.IsTipStale())
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] handleSyncInitial: no peer ahead, transitioning to SYNCED",
 				"best_peer_height", bestHeight,
@@ -2415,6 +2649,10 @@ func (m *Manager) handleSyncInitial() {
 		m.syncPeerSince = time.Now()
 		m.syncPeerAddrMu.Unlock()
 
+		logging.SyncAuditDebug("handleSyncInitial: entering HEADER_SYNC",
+			"peer", peer.Addr(),
+			"peer_height", peer.BestHeight(),
+			"our_height", ourHeight)
 		m.transitionSyncState(SyncStateHeaderSync)
 		m.requestHeaders(peer)
 		return
@@ -2438,9 +2676,16 @@ func (m *Manager) handleSyncInitial() {
 		m.lastSyncHeight = ourHeight
 		m.syncPeerAddrMu.Unlock()
 
+		logging.SyncAuditDebug("handleSyncInitial: entering BLOCK_SYNC (legacy v1 path)",
+			"peer", peer.Addr(),
+			"peer_height", peer.BestHeight(),
+			"our_height", ourHeight)
 		m.transitionSyncState(SyncStateBlockSync)
 		m.requestBlocks(peer)
 	} else if logging.DebugMode {
+		logging.SyncAuditDebug("handleSyncInitial: no header/legacy sync peer — staying INITIAL",
+			"our_height", ourHeight,
+			"peer_heights", strings.Join(peerHeights, ";"))
 		logging.L.Debug("[dbg] handleSyncInitial: no sync peer found at all")
 	}
 }
@@ -2562,11 +2807,20 @@ func (m *Manager) handleHeaderSyncTick() {
 	// 2. We have headers >= our sync peer's claimed height
 	// 3. The sync peer sent a partial batch, meaning it has no more headers
 	// Conditions 2 and 3 protect against rogue peers that claim inflated heights.
-	headersDone := currentHeight >= bestHeight ||
-		currentHeight >= syncPeerHeight ||
-		(m.headerSyncCaughtUp && currentHeight > 0)
+	condGeBest := currentHeight >= bestHeight
+	condGeSyncPeer := currentHeight >= syncPeerHeight
+	condCaughtUp := m.headerSyncCaughtUp && currentHeight > 0
+	headersDone := condGeBest || condGeSyncPeer || condCaughtUp
 
 	if headersDone {
+		logging.SyncAuditDebug("header phase complete — transitioning to block sync",
+			"best_header_height", currentHeight,
+			"best_peer_height", bestHeight,
+			"sync_peer_height", syncPeerHeight,
+			"cond_ge_best", condGeBest,
+			"cond_ge_sync_peer", condGeSyncPeer,
+			"cond_sync_peer_caught_up", condCaughtUp,
+			"header_sync_caught_up_flag", m.headerSyncCaughtUp)
 		_, tipH := m.chain.Tip()
 		m.blockSyncLastProgress = time.Now()
 		m.blockSyncLastHeight = tipH
@@ -2664,6 +2918,7 @@ func (m *Manager) handleBlockSyncTick() {
 			}
 			continue
 		}
+		m.NotifyBlockAccepted(&block.Header)
 		m.blockScheduler.UpdateNextConnectHeight(height)
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] handleBlockSyncTick: block connected",
@@ -2696,6 +2951,9 @@ func (m *Manager) handleBlockSyncTick() {
 			"staging", stats.Staging,
 			"next_connect", stats.NextHeight)
 		m.blockScheduler.Reset()
+		for _, h := range m.blockScheduler.ExpectedHashes() {
+			m.seenBlocks.Remove(h)
+		}
 		m.blockSyncLastProgress = time.Now()
 	}
 
@@ -2742,6 +3000,11 @@ func (m *Manager) handleBlockSyncTick() {
 
 	// 4. Check completion.
 	if m.blockScheduler.IsComplete() {
+		_, tipH := m.chain.Tip()
+		hdrH := m.headerIndex.BestHeaderHeight()
+		logging.SyncAuditDebug("parallel block scheduler complete — SYNCED",
+			"chain_tip", tipH,
+			"best_header", hdrH)
 		m.transitionSyncState(SyncStateSynced)
 	}
 }
@@ -2762,7 +3025,13 @@ func (m *Manager) handleLegacyBlockSync() {
 	}
 	m.mu.RUnlock()
 
+	logging.P2PSyncDebug("handleLegacyBlockSync",
+		"our_height", ourHeight,
+		"best_peer_height", bestHeight,
+		"sync_peer_addr", m.syncPeerAddr)
+
 	if bestPeer == nil || bestHeight <= ourHeight {
+		logging.P2PSyncDebug("handleLegacyBlockSync: caught up or no peer", "transition", "SYNCED")
 		m.transitionSyncState(SyncStateSynced)
 		return
 	}
@@ -2775,6 +3044,7 @@ func (m *Manager) handleLegacyBlockSync() {
 		m.lastSyncHeight = ourHeight
 	} else if time.Since(m.syncPeerSince) > 30*time.Second && ourHeight == m.lastSyncHeight {
 		// Stall on legacy sync — rotate peer.
+		logging.P2PSyncDebug("handleLegacyBlockSync: stall rotate", "peer", bestPeer.Addr())
 		m.syncPeerAddr = bestPeer.Addr()
 		m.syncPeerSince = time.Now()
 	}
@@ -2794,6 +3064,7 @@ func (m *Manager) selectFastSyncPeer() *Peer {
 	var best *Peer
 	var bestHeight uint32
 	var bestPing time.Duration
+	var skippedTooFar int
 
 	for _, p := range m.peers {
 		v := p.Version()
@@ -2805,6 +3076,7 @@ func (m *Manager) selectFastSyncPeer() *Peer {
 		// Skip peers claiming heights far beyond our validated header chain.
 		// Such peers are either rogue or on a different fork.
 		if h > headerHeight+500 {
+			skippedTooFar++
 			continue
 		}
 
@@ -2818,6 +3090,13 @@ func (m *Manager) selectFastSyncPeer() *Peer {
 			bestHeight = h
 			bestPing = ping
 		}
+	}
+	if best != nil {
+		logging.P2PSyncDebug("selectFastSyncPeer: chosen",
+			"peer", best.Addr(), "peer_height", bestHeight,
+			"ping_ms", bestPing.Milliseconds(), "skipped_too_far", skippedTooFar)
+	} else {
+		logging.P2PSyncDebug("selectFastSyncPeer: none", "header_height", headerHeight, "skipped_too_far", skippedTooFar)
 	}
 	return best
 }
@@ -2926,11 +3205,9 @@ func (m *Manager) handleFastSyncTick() {
 	}
 }
 
-// handleSyncedTick monitors the chain while synced. Bitcoin Core parity:
-// once IBD has latched off it does not re-enter. We only fall back to
-// INITIAL if the tip becomes genuinely stale (timestamp-based) AND peers
-// report a meaningfully higher chain. Normal 1-2 block propagation delay
-// does not trigger re-sync.
+// handleSyncedTick monitors the chain while synced. Re-enter header/block sync
+// when we are far behind peers: either the tip is timestamp-stale, or peers are
+// many blocks ahead (fork recovery — our tip can look "fresh" on a losing fork).
 func (m *Manager) handleSyncedTick() {
 	_, ourHeight := m.chain.Tip()
 
@@ -2950,14 +3227,40 @@ func (m *Manager) handleSyncedTick() {
 
 	tipStale := m.chain.IsTipStale()
 
-	// Only re-enter sync if tip is stale AND a peer is significantly ahead.
-	if tipStale && bestHeight > ourHeight+5 {
+	// Far behind peers on a fork: tip timestamps stay recent, so IsTipStale is
+	// false — must still re-sync (matches chaos divergence: same spread as checks).
+	// Small networks with short chains need a lower gap than mainnet-scale
+	// defaults so nodes re-enter sync quickly after partitions or eclipses.
+	const forkRecoveryGap = uint32(3)
+	var gap uint32
+	if bestHeight > ourHeight {
+		gap = bestHeight - ourHeight
+	}
+	reSync := (tipStale && bestHeight > ourHeight+2) || (gap >= forkRecoveryGap)
+
+	if reSync {
+		logging.SyncAuditDebug("SYNCED tick: re-entering full sync",
+			"our_height", ourHeight,
+			"best_peer_height_v2", bestHeight,
+			"gap", gap,
+			"fork_recovery_threshold", forkRecoveryGap,
+			"tip_stale", tipStale,
+			"reason_stale_and_behind", tipStale && bestHeight > ourHeight+2,
+			"reason_fork_recovery", gap >= forkRecoveryGap)
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] handleSyncedTick: re-entering sync",
 				"our_height", ourHeight,
 				"best_peer_height", bestHeight,
-				"gap", bestHeight-ourHeight)
+				"gap", gap,
+				"fork_recovery_gap", forkRecoveryGap,
+				"tip_stale", tipStale)
 		}
+		logging.L.Info("re-entering sync: catching up to peer chain",
+			"component", "p2p",
+			"our_height", ourHeight,
+			"best_peer_height", bestHeight,
+			"gap", gap,
+			"tip_stale", tipStale)
 		m.mu.Lock()
 		m.bestPeerHeight = bestHeight
 		m.mu.Unlock()
@@ -3014,6 +3317,9 @@ func (m *Manager) selectHeaderSyncPeer() *Peer {
 			best = p
 		}
 	}
+	if best != nil {
+		logging.P2PSyncDebug("selectHeaderSyncPeer", "peer", best.Addr(), "peer_height", bestHeight, "our_height", ourHeight)
+	}
 	return best
 }
 
@@ -3031,6 +3337,9 @@ func (m *Manager) selectLegacySyncPeer() *Peer {
 			best = p
 		}
 	}
+	if best != nil {
+		logging.P2PSyncDebug("selectLegacySyncPeer", "peer", best.Addr(), "peer_height", bestHeight, "our_height", ourHeight)
+	}
 	return best
 }
 
@@ -3039,21 +3348,17 @@ func (m *Manager) selectLegacySyncPeer() *Peer {
 func (m *Manager) requestHeaders(peer *Peer) {
 	locator := m.headerIndex.HeaderLocator()
 	if len(locator) == 0 {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] requestHeaders: empty locator, skipping",
-				"peer", peer.Addr())
-		}
+		logging.SyncAuditDebug("requestHeaders: empty locator — cannot getheaders",
+			"peer", peer.Addr())
 		return
 	}
 
-	if logging.DebugMode {
-		locatorTip := locator[0].ReverseString()[:16]
-		logging.L.Debug("[dbg] requestHeaders",
-			"peer", peer.Addr(),
-			"locator_len", len(locator),
-			"locator_tip", locatorTip,
-			"best_header_height", m.headerIndex.BestHeaderHeight())
-	}
+	locatorTip := locator[0].ReverseString()[:16]
+	logging.P2PSyncDebug("requestHeaders",
+		"peer", peer.Addr(),
+		"locator_len", len(locator),
+		"locator_tip", locatorTip,
+		"best_header_height", m.headerIndex.BestHeaderHeight())
 
 	msg := protocol.GetHeadersMsg{
 		Version:            protocol.ProtocolVersion,
@@ -3067,10 +3372,10 @@ func (m *Manager) requestHeaders(peer *Peer) {
 
 func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 	if len(msg.Headers) == 0 {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] handleHeaders: empty batch from peer",
-				"peer", peer.Addr())
-		}
+		logging.SyncAuditDebug("handleHeaders: empty batch",
+			"peer", peer.Addr(),
+			"sync_peer_is_header_peer", peer.Addr() == m.headerSyncPeerAddr,
+			"note", "peer may have no headers past our locator, or same chain tip")
 		return
 	}
 
@@ -3090,12 +3395,11 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 	// batch. This is normal during initial sync when peers announce headers
 	// we can't yet connect. Bitcoin Core silently drops these — no penalty.
 	if !m.headerIndex.HasHeader(msg.Headers[0].PrevBlock) {
-		if logging.DebugMode {
-			logging.L.Debug("ignoring unconnectable headers batch",
-				"component", "p2p", "peer", peer.Addr(),
-				"prev", msg.Headers[0].PrevBlock.ReverseString()[:16],
-				"count", len(msg.Headers))
-		}
+		logging.SyncAuditDebug("handleHeaders: ignoring batch (first header does not connect to our header index)",
+			"peer", peer.Addr(),
+			"first_prev", msg.Headers[0].PrevBlock.ReverseString()[:16],
+			"batch_count", len(msg.Headers),
+			"our_best_header_height", m.headerIndex.BestHeaderHeight())
 		return
 	}
 
@@ -3313,6 +3617,9 @@ func (m *Manager) requestBlocks(peer *Peer) {
 // missing parent block. Matches Bitcoin Core's approach of requesting missing
 // parents from the peer that provided the orphan.
 func (m *Manager) requestOrphanParent(peer *Peer, parentHash types.Hash) {
+	logging.P2PSyncDebug("requestOrphanParent enter",
+		"parent", parentHash.ReverseString()[:16], "peer", peer.Addr())
+
 	getData := protocol.GetDataMsg{
 		Inventory: []protocol.InvVector{
 			{Type: protocol.InvTypeBlock, Hash: parentHash},

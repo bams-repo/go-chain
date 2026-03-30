@@ -124,7 +124,7 @@ var Mainnet = &ChainParams{
 // Testnet is the public test network with easier difficulty.
 var Testnet = &ChainParams{
 	Name:         "testnet",
-	DataDirName:  "testnet3",
+	DataDirName:  "testnet0",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x02},
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
@@ -132,7 +132,7 @@ var Testnet = &ChainParams{
 	// Pre-mined genesis block (sha256mem: 64 MiB sequential fill + dual SHA256 mix).
 	// Coinbase: "fairchain genesis"
 	// Timestamp: 1774176069 (2026-03-22T10:41:09Z)
-	// Display hash: 2fdc82c99a3e6284aeb96932fe489c2d3e20944568bba8a8a380865ca4b7306e
+	// Display hash: 2a8f71957c5911c51e45ea71fb8a68b0c8cb5e37c71b355df3dc51b321dba373
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
@@ -144,8 +144,8 @@ var Testnet = &ChainParams{
 				0xb3, 0x83, 0x0e, 0x8e, 0x0c, 0xe3, 0xdf, 0x29,
 			},
 			Timestamp: 1774176069,
-			Bits:      0x1f3a910b,
-			Nonce:     43,
+			Bits:      0x2000ea44,
+			Nonce:     268435471,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -168,10 +168,10 @@ var Testnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0x6e, 0x30, 0xb7, 0xa4, 0x5c, 0x86, 0x80, 0xa3,
-		0xa8, 0xa8, 0xbb, 0x68, 0x45, 0x94, 0x20, 0x3e,
-		0x2d, 0x9c, 0x48, 0xfe, 0x32, 0x69, 0xb9, 0xae,
-		0x84, 0x62, 0x3e, 0x9a, 0xc9, 0x82, 0xdc, 0x2f,
+		0x73, 0xa3, 0xdb, 0x21, 0xb3, 0x51, 0xdc, 0xf3,
+		0x5d, 0x35, 0x1b, 0xc7, 0x37, 0x5e, 0xcb, 0xc8,
+		0xb0, 0x68, 0x8a, 0xfb, 0x71, 0xea, 0x45, 0x1e,
+		0xc5, 0x11, 0x59, 0x7c, 0x95, 0x71, 0x8f, 0x2a,
 	},
 
 	TargetBlockSpacing:  5 * time.Second,
@@ -181,8 +181,8 @@ var Testnet = &ChainParams{
 	MinTimestampRule:    "median-11",
 
 	// Difficulty calibrated for sha256mem dual-mix (order ~10–30 H/s per core on testnet hardware).
-	// 0x1f3a910b ≈ 570 hashes ≈ ~21 sec on a single core.
-	InitialBits:              0x1f3a910b,
+	// 0x2000ea44 is 4× easier target than the prior testnet (0x1f3a910b).
+	InitialBits:              0x2000ea44,
 	MinBits:                  0x207fffff, // Floor: trivial difficulty (same as regtest)
 	NoRetarget:               false,
 	AllowMinDifficultyBlocks: true,
@@ -208,10 +208,8 @@ var Testnet = &ChainParams{
 	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
 
 	SeedNodes: []string{
-		"45.32.196.26:19334",   // main_web
-		"149.28.248.117:19334", // seednode_dallas
-		"78.141.227.33:19334",  // seednode_london
-		"45.63.16.42:19334",    // mynta_webserver
+		"95.179.203.47:19334",  // seednode_london
+		"207.246.117.14:19334", // seednode_miami
 	},
 
 	ActivationHeights: map[string]uint32{

@@ -13,8 +13,8 @@ import (
 )
 
 func TestCheckTarget(t *testing.T) {
-	// Testnet InitialBits
-	bits := uint32(0x1f3a910b)
+	// Testnet InitialBits (see params.Testnet)
+	bits := uint32(0x2000ea44)
 	target := crypto.CompactToHash(bits)
 	fmt.Printf("Bits 0x%08x -> target: %s\n", bits, target)
 	

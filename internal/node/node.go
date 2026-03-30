@@ -278,12 +278,15 @@ func (n *Node) startMiner(ctx context.Context) error {
 	mp := n.mempool
 	p2pMgr := n.p2p
 
-	m := miner.New(bc, n.engine, mp, n.params, rewardScript, n.adjClock, func(block *types.Block) {
+	m := miner.New(bc, n.engine, mp, n.params, rewardScript, n.adjClock, func() bool {
+		return p2pMgr.ShouldMine()
+	}, func(block *types.Block) {
 		height, err := bc.ProcessBlock(block)
 		if err != nil {
 			logging.L.Warn("mined block rejected", "error", err)
 			return
 		}
+		p2pMgr.NotifyBlockAccepted(&block.Header)
 		var confirmedHashes []types.Hash
 		for _, tx := range block.Transactions {
 			txHash, hashErr := crypto.HashTransaction(&tx)

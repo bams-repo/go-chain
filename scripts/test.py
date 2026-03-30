@@ -5,14 +5,14 @@ def vs(s):
     return bytes([len(b)])+b
 magic=b'\xfa\x1c\xc0\x02'
 cmd=b'version\x00\x00\x00\x00\x00'
-addr_recv=vs('45.32.196.26:19334')
+addr_recv=vs('95.179.203.47:19334')
 addr_from=vs('0.0.0.0:0')
 payload=struct.pack('<IQq',1,1,int(time.time()))+addr_recv+addr_from+struct.pack('<Q',12345)+vs('/probe/')+struct.pack('<I',0)
 cksum=dsha(payload)[:4]
 hdr=magic+cmd+struct.pack('<I',len(payload))+cksum
 s=socket.socket()
 s.settimeout(10)
-s.connect(('45.32.196.26',19334))
+s.connect(('95.179.203.47',19334))
 s.sendall(hdr+payload)
 data=b''
 while len(data)<24:
@@ -30,5 +30,5 @@ off+=8
 ualen=p[off]; off+=1
 ua=p[off:off+ualen].decode(); off+=ualen
 height=struct.unpack('<I',p[off:off+4])[0]
-print(f'Seed: 45.32.196.26:19334  Height: {height}  UserAgent: {ua}  Protocol: {ver}')
+print(f'Seed: 95.179.203.47:19334  Height: {height}  UserAgent: {ua}  Protocol: {ver}')
 s.close()

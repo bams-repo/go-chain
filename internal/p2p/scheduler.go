@@ -115,16 +115,14 @@ func (s *BlockScheduler) populateLocked() {
 	s.nextConnectHeight = tipHeight + 1
 	bestHeaderHeight := s.headerIndex.BestHeaderHeight()
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] scheduler.Populate",
-			"tip_height", tipHeight,
-			"next_connect", s.nextConnectHeight,
-			"best_header", bestHeaderHeight,
-			"gap", int(bestHeaderHeight)-int(tipHeight),
-			"existing_needed", len(s.needed),
-			"in_flight", len(s.inFlight),
-			"staging", len(s.staging))
-	}
+	logging.P2PSyncDebug("scheduler.Populate",
+		"tip_height", tipHeight,
+		"next_connect", s.nextConnectHeight,
+		"best_header", bestHeaderHeight,
+		"gap", int(bestHeaderHeight)-int(tipHeight),
+		"existing_needed", len(s.needed),
+		"in_flight", len(s.inFlight),
+		"staging", len(s.staging))
 
 	alreadyQueued := make(map[types.Hash]struct{}, len(s.needed))
 	for _, e := range s.needed {
@@ -148,12 +146,10 @@ func (s *BlockScheduler) populateLocked() {
 		newCount++
 	}
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] scheduler.Populate done",
-			"fetched_hashes", len(hashes),
-			"new_queued", newCount,
-			"total_needed", len(s.needed))
-	}
+	logging.P2PSyncDebug("scheduler.Populate done",
+		"fetched_hashes", len(hashes),
+		"new_queued", newCount,
+		"total_needed", len(s.needed))
 }
 
 // Reset clears all in-flight requests, staging, and the needed queue, then
@@ -238,8 +234,8 @@ func (s *BlockScheduler) AssignWork(peerAddr string, limit int, peerBestHeight u
 
 	s.needed = remaining
 
-	if logging.DebugMode && len(assigned) > 0 {
-		logging.L.Debug("[dbg] scheduler.AssignWork",
+	if len(assigned) > 0 {
+		logging.P2PSyncDebug("scheduler.AssignWork",
 			"peer", peerAddr,
 			"peer_best_height", peerBestHeight,
 			"assigned", len(assigned),
@@ -262,12 +258,10 @@ func (s *BlockScheduler) BlockReceived(hash types.Hash, block *types.Block, peer
 
 	entry, ok := s.inFlight[hash]
 	if !ok {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] scheduler.BlockReceived: not in-flight",
-				"hash", hash.ReverseString()[:16],
-				"peer", peerAddr,
-				"in_flight_count", len(s.inFlight))
-		}
+		logging.P2PSyncDebug("scheduler.BlockReceived: not in-flight",
+			"hash", hash.ReverseString()[:16],
+			"peer", peerAddr,
+			"in_flight_count", len(s.inFlight))
 		return false
 	}
 
@@ -294,15 +288,13 @@ func (s *BlockScheduler) BlockReceived(hash types.Hash, block *types.Block, peer
 	delete(s.inFlight, hash)
 	s.staging[hash] = &stagedBlock{Block: block, PeerAddr: peerAddr}
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] scheduler.BlockReceived: staged",
-			"hash", hash.ReverseString()[:16],
-			"height", entry.Height,
-			"peer", peerAddr,
-			"latency_ms", latency.Milliseconds(),
-			"staging_count", len(s.staging),
-			"in_flight_count", len(s.inFlight))
-	}
+	logging.P2PSyncDebug("scheduler.BlockReceived: staged",
+		"hash", hash.ReverseString()[:16],
+		"height", entry.Height,
+		"peer", peerAddr,
+		"latency_ms", latency.Milliseconds(),
+		"staging_count", len(s.staging),
+		"in_flight_count", len(s.inFlight))
 
 	return true
 }
@@ -320,8 +312,8 @@ func (s *BlockScheduler) DrainReady() []stagedBlock {
 	for {
 		node := s.headerIndex.GetHeaderByHeight(s.nextConnectHeight)
 		if node == nil {
-			if logging.DebugMode && len(ready) == 0 {
-				logging.L.Debug("[dbg] scheduler.DrainReady: no header node at height",
+			if len(ready) == 0 {
+				logging.P2PSyncDebug("scheduler.DrainReady: no header node at height",
 					"height", s.nextConnectHeight,
 					"staging_count", len(s.staging))
 			}
@@ -330,8 +322,8 @@ func (s *BlockScheduler) DrainReady() []stagedBlock {
 
 		staged, ok := s.staging[node.Hash]
 		if !ok {
-			if logging.DebugMode && len(ready) == 0 {
-				logging.L.Debug("[dbg] scheduler.DrainReady: block not in staging",
+			if len(ready) == 0 {
+				logging.P2PSyncDebug("scheduler.DrainReady: block not in staging",
 					"height", s.nextConnectHeight,
 					"hash", node.Hash.ReverseString()[:16],
 					"staging_count", len(s.staging),
@@ -360,8 +352,8 @@ func (s *BlockScheduler) DrainReady() []stagedBlock {
 		s.nextConnectHeight++
 	}
 
-	if logging.DebugMode && len(ready) > 0 {
-		logging.L.Debug("[dbg] scheduler.DrainReady",
+	if len(ready) > 0 {
+		logging.P2PSyncDebug("scheduler.DrainReady",
 			"drained", len(ready),
 			"from_height", startHeight,
 			"to_height", s.nextConnectHeight-1,
@@ -378,6 +370,10 @@ func (s *BlockScheduler) RequeueBlock(hash types.Hash, height uint32) {
 	defer s.mu.Unlock()
 	delete(s.staging, hash)
 	s.needed = append(s.needed, schedulerEntry{Hash: hash, Height: height})
+	logging.P2PSyncDebug("scheduler.RequeueBlock",
+		"hash", hash.ReverseString()[:16],
+		"height", height,
+		"needed_after", len(s.needed))
 }
 
 // HandleTimeout checks for in-flight requests that have exceeded the timeout.
@@ -405,6 +401,13 @@ func (s *BlockScheduler) HandleTimeout() []inFlightEntry {
 		}
 	}
 
+	if len(timedOut) > 0 {
+		logging.P2PSyncDebug("scheduler.HandleTimeout",
+			"timed_out", len(timedOut),
+			"remaining_in_flight", len(s.inFlight),
+			"needed_after", len(s.needed))
+	}
+
 	return timedOut
 }
 
@@ -425,6 +428,41 @@ func (s *BlockScheduler) RemovePeer(peerAddr string) {
 	}
 
 	delete(s.peerStats, peerAddr)
+	logging.P2PSyncDebug("scheduler.RemovePeer",
+		"peer", peerAddr,
+		"needed_after", len(s.needed),
+		"in_flight_after", len(s.inFlight))
+}
+
+// IsInFlight returns true if the given block hash has an outstanding
+// download request. Used by handleBlock to bypass the seenBlocks filter
+// for blocks the scheduler is actively waiting on — prevents a stall
+// when a block was seen before the scheduler existed (e.g. fast-sync
+// fallback) and the seenBlocks filter would otherwise silently drop it.
+func (s *BlockScheduler) IsInFlight(hash types.Hash) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.inFlight[hash]
+	return ok
+}
+
+// ExpectedHashes returns every hash the scheduler is waiting on
+// (needed + in-flight + staging). Used to scrub the seenBlocks filter
+// after a fast-sync fallback so those blocks can be re-delivered.
+func (s *BlockScheduler) ExpectedHashes() []types.Hash {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]types.Hash, 0, len(s.needed)+len(s.inFlight)+len(s.staging))
+	for _, e := range s.needed {
+		out = append(out, e.Hash)
+	}
+	for h := range s.inFlight {
+		out = append(out, h)
+	}
+	for h := range s.staging {
+		out = append(out, h)
+	}
+	return out
 }
 
 // IsComplete returns true when all needed blocks have been downloaded
@@ -433,12 +471,9 @@ func (s *BlockScheduler) IsComplete() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	complete := len(s.needed) == 0 && len(s.inFlight) == 0 && len(s.staging) == 0
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] scheduler.IsComplete",
-			"complete", complete,
-			"needed", len(s.needed),
-			"in_flight", len(s.inFlight),
-			"staging", len(s.staging),
+	if complete {
+		logging.P2PSyncDebug("scheduler.IsComplete",
+			"complete", true,
 			"next_connect", s.nextConnectHeight)
 	}
 	return complete
@@ -482,9 +517,14 @@ func (s *BlockScheduler) StagingCount() int {
 func (s *BlockScheduler) UpdateNextConnectHeight(height uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prev := s.nextConnectHeight
 	if height >= s.nextConnectHeight {
 		s.nextConnectHeight = height + 1
 	}
+	logging.P2PSyncDebug("scheduler.UpdateNextConnectHeight",
+		"prev_next", prev,
+		"applied_height", height,
+		"next_connect", s.nextConnectHeight)
 }
 
 // scorePeer returns a priority score for assigning work to a peer.

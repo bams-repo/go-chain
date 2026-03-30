@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/consensus"
 	"github.com/bams-repo/fairchain/internal/crypto"
@@ -43,6 +44,10 @@ const (
 	// pruning is simpler and sufficient.
 	maxForkDepth uint32 = 2016
 )
+
+// Throttle HeadersToFetch debug — the block scheduler calls this every tick.
+var headersToFetchLogMu sync.Mutex
+var lastHeadersToFetchLog time.Time
 
 // HeaderIndex maintains the in-memory header tree for header-first sync.
 // It tracks all validated headers, supports forks, and identifies the
@@ -172,12 +177,10 @@ func (idx *HeaderIndex) addHeaderLocked(header *types.BlockHeader, nowUnix uint3
 
 	parentNode, ok := idx.byHash[header.PrevBlock]
 	if !ok {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] headers.addHeaderLocked: orphan",
-				"hash", headerHash.ReverseString()[:16],
-				"prev", header.PrevBlock.ReverseString()[:16],
-				"index_size", len(idx.byHash))
-		}
+		logging.ChainSyncDebug("addHeaderLocked: orphan (parent not in index)",
+			"hash", headerHash.ReverseString()[:16],
+			"prev", header.PrevBlock.ReverseString()[:16],
+			"index_size", len(idx.byHash))
 		return nil, ErrOrphanHeader
 	}
 
@@ -203,14 +206,12 @@ func (idx *HeaderIndex) addHeaderLocked(header *types.BlockHeader, nowUnix uint3
 		parentNode.Height,
 		idx.params,
 	); err != nil {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] headers.addHeaderLocked: validation failed",
-				"hash", headerHash.ReverseString()[:16],
-				"height", childHeight,
-				"bits", fmt.Sprintf("0x%08x", header.Bits),
-				"timestamp", header.Timestamp,
-				"error", err)
-		}
+		logging.ChainSyncDebug("addHeaderLocked: validation failed",
+			"hash", headerHash.ReverseString()[:16],
+			"height", childHeight,
+			"bits", fmt.Sprintf("0x%08x", header.Bits),
+			"timestamp", header.Timestamp,
+			"error", err)
 		idx.addRejectedLocked(headerHash)
 		return nil, fmt.Errorf("header validation: %w", err)
 	}
@@ -229,8 +230,14 @@ func (idx *HeaderIndex) addHeaderLocked(header *types.BlockHeader, nowUnix uint3
 	idx.byHash[headerHash] = node
 
 	if cumulativeWork.Cmp(idx.bestHeader.Work) > 0 {
+		oldTip := idx.bestHeader
 		idx.bestHeader = node
 		idx.rebuildHeightIndex()
+		logging.ChainSyncDebug("header index best tip updated (more work)",
+			"new_height", node.Height,
+			"new_hash", node.Hash.ReverseString()[:16],
+			"prev_best_height", oldTip.Height,
+			"prev_best_hash", oldTip.Hash.ReverseString()[:16])
 		if node.Height%100 == 0 {
 			idx.pruneStaleForks()
 		}
@@ -320,27 +327,23 @@ func (idx *HeaderIndex) AddHeaders(headers []types.BlockHeader, nowUnix uint32) 
 				rejected++
 				continue
 			}
-			if logging.DebugMode {
-				logging.L.Debug("[dbg] headers.AddHeaders: hard error",
-					"index", i,
-					"error", err,
-					"added_so_far", added,
-					"best_height", idx.bestHeader.Height)
-			}
+			logging.ChainSyncDebug("AddHeaders: hard error",
+				"index", i,
+				"error", err,
+				"added_so_far", added,
+				"best_height", idx.bestHeader.Height)
 			return added, err
 		}
 		added++
 	}
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] headers.AddHeaders complete",
-			"batch_size", len(headers),
-			"added", added,
-			"dupes", dupes,
-			"rejected", rejected,
-			"best_height", idx.bestHeader.Height,
-			"index_size", len(idx.byHash))
-	}
+	logging.ChainSyncDebug("AddHeaders complete",
+		"batch_size", len(headers),
+		"added", added,
+		"dupes", dupes,
+		"rejected", rejected,
+		"best_height", idx.bestHeader.Height,
+		"index_size", len(idx.byHash))
 	return added, nil
 }
 
@@ -443,12 +446,17 @@ func (idx *HeaderIndex) HeadersToFetch(startHeight uint32, limit int) []types.Ha
 	}
 
 	if logging.DebugMode {
-		logging.L.Debug("[dbg] headers.HeadersToFetch",
-			"start", startHeight,
-			"limit", limit,
-			"best_header", bestH,
-			"returned", len(result),
-			"nil_gaps", nilCount)
+		headersToFetchLogMu.Lock()
+		if time.Since(lastHeadersToFetchLog) >= 2*time.Second || nilCount > 0 {
+			lastHeadersToFetchLog = time.Now()
+			logging.ChainSyncDebug("HeadersToFetch",
+				"start", startHeight,
+				"limit", limit,
+				"best_header", bestH,
+				"returned", len(result),
+				"nil_gaps", nilCount)
+		}
+		headersToFetchLogMu.Unlock()
 	}
 
 	return result
@@ -476,12 +484,18 @@ func (idx *HeaderIndex) addRejectedLocked(hash types.Hash) {
 }
 
 // buildAncestorLookup returns a function that looks up a header at a given
-// height. Uses the bestChainByHeight slice for O(1) lookups when the parent
-// is on the best chain (always true during linear sync). Falls back to
-// walking parent pointers for fork cases.
+// height by walking the parent chain from parentNode. This ensures that when
+// validating a fork header, we use the fork's own ancestors (and their
+// timestamps) rather than the best chain's. Bitcoin Core achieves this via
+// CBlockIndex::GetAncestor which follows pskip pointers along the actual
+// chain ancestry. We use the bestChainByHeight shortcut only when the parent
+// is confirmed to be on the best chain.
 func (idx *HeaderIndex) buildAncestorLookup(parentNode *HeaderNode) func(uint32) *types.BlockHeader {
+	onBestChain := parentNode.Height < uint32(len(idx.bestChainByHeight)) &&
+		idx.bestChainByHeight[parentNode.Height] == parentNode
+
 	return func(height uint32) *types.BlockHeader {
-		if height < uint32(len(idx.bestChainByHeight)) {
+		if onBestChain && height < uint32(len(idx.bestChainByHeight)) {
 			node := idx.bestChainByHeight[height]
 			if node != nil {
 				h := node.Header

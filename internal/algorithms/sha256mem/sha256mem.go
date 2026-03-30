@@ -4,6 +4,15 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+// Package sha256mem implements the flagship memory-hard PoW used by Fairchain.
+//
+// The design favors CPUs over GPUs: each hash builds a large scratchpad (Slots)
+// with periodic serial SHA-256 hardening, then runs two long mixing passes where
+// each step depends on the previous SHA-256 output (data-dependent indexing).
+// GPUs get poor occupancy from the serial SHA dependency and scattered 64-byte
+// reads; high-end CPUs with large caches and strong single-thread SHA throughput
+// remain competitive. This is an economic tilt, not a cryptographic proof that
+// GPUs cannot mine—only that they are not favored relative to commodity CPUs.
 package sha256mem
 
 import (
@@ -57,9 +66,9 @@ func (h *Hasher) PoWHash(data []byte) types.Hash {
 
 func mixPassA(acc [32]byte, mem *[][32]byte) [32]byte {
 	m := *mem
+	var buf [64]byte
 	for i := 0; i < MixRounds; i++ {
 		idx := binary.LittleEndian.Uint32(acc[:4]) % uint32(Slots)
-		var buf [64]byte
 		copy(buf[:32], acc[:])
 		copy(buf[32:], m[idx][:])
 		acc = sha256.Sum256(buf[:])
@@ -69,10 +78,10 @@ func mixPassA(acc [32]byte, mem *[][32]byte) [32]byte {
 
 func mixPassB(acc [32]byte, mem *[][32]byte) [32]byte {
 	m := *mem
+	var buf [64]byte
 	for i := 0; i < MixRounds; i++ {
 		off := (i % 7) * 4
 		idx := binary.LittleEndian.Uint32(acc[off:off+4]) % uint32(Slots)
-		var buf [64]byte
 		copy(buf[:32], acc[:])
 		copy(buf[32:], m[idx][:])
 		acc = sha256.Sum256(buf[:])

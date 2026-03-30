@@ -113,7 +113,7 @@ const (
 	RateLimitMaxMsgs  = 500
 
 	// MinPeerProtoVersion is the lowest wire protocol version we accept.
-	MinPeerProtoVersion uint32 = 1
+	MinPeerProtoVersion uint32 = 4
 
 	// MaxPeerStartHeight rejects peers advertising an implausibly high
 	// chain height, preventing an attacker from forcing permanent IBD mode.

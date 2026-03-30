@@ -33,6 +33,10 @@ const MaxOrphanBlocks = 100
 // concept adapted for blocks.
 const OrphanExpiry = 20 * time.Minute
 
+// Throttle IsTipStale debug lines — the P2P sync loop may call this very often.
+var tipStaleLogMu sync.Mutex
+var lastTipStaleLog time.Time
+
 type orphanBlock struct {
 	block    *types.Block
 	addedAt  time.Time
@@ -556,20 +560,23 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 
 	blockHash := crypto.HashBlockHeader(&block.Header)
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] chain.ProcessBlock enter",
-			"hash", blockHash.ReverseString()[:16],
-			"parent", block.Header.PrevBlock.ReverseString()[:16],
-			"tip", c.tipHash.ReverseString()[:16],
-			"tip_height", c.tipHeight)
-	}
+	logging.ChainSyncDebug("ProcessBlock enter",
+		"hash", blockHash.ReverseString()[:16],
+		"parent", block.Header.PrevBlock.ReverseString()[:16],
+		"tip", c.tipHash.ReverseString()[:16],
+		"tip_height", c.tipHeight,
+		"trusted_header", trustedHeader)
 
 	if _, ok := c.heightByHash[blockHash]; ok {
 		metrics.Global.BlocksRejected.Add(1)
+		logging.ChainSyncDebug("ProcessBlock: reject duplicate (already on main/side index)",
+			"hash", blockHash.ReverseString()[:16], "tip_height", c.tipHeight)
 		return 0, fmt.Errorf("block %s already in chain", blockHash)
 	}
 	if _, ok := c.orphans[blockHash]; ok {
 		metrics.Global.BlocksRejected.Add(1)
+		logging.ChainSyncDebug("ProcessBlock: reject duplicate orphan",
+			"hash", blockHash.ReverseString()[:16])
 		return 0, fmt.Errorf("%w: block %s already in orphan pool", ErrOrphanBlock, blockHash)
 	}
 
@@ -580,11 +587,14 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 		// difficulty floor (MinBits) to prevent trivial orphan flooding.
 		if crypto.CompactToBig(block.Header.Bits).Cmp(crypto.CompactToBig(c.params.MinBits)) > 0 {
 			metrics.Global.BlocksRejected.Add(1)
+			logging.ChainSyncDebug("ProcessBlock: reject orphan (bits below MinBits)",
+				"bits", fmt.Sprintf("0x%08x", block.Header.Bits), "min_bits", fmt.Sprintf("0x%08x", c.params.MinBits))
 			return 0, fmt.Errorf("orphan declared difficulty too low: bits 0x%08x easier than minimum 0x%08x", block.Header.Bits, c.params.MinBits)
 		}
 		orphanPowHash := c.engine.Hasher().PoWHash(block.Header.SerializeToBytes())
 		if err := crypto.ValidateProofOfWork(orphanPowHash, block.Header.Bits); err != nil {
 			metrics.Global.BlocksRejected.Add(1)
+			logging.ChainSyncDebug("ProcessBlock: reject orphan (PoW)", "err", err)
 			return 0, fmt.Errorf("orphan PoW check failed: %w", err)
 		}
 
@@ -594,12 +604,10 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 		}
 		c.orphans[blockHash] = &orphanBlock{block: block, addedAt: time.Now()}
 		metrics.Global.OrphansReceived.Add(1)
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] chain.ProcessBlock → orphan",
-				"hash", blockHash.ReverseString()[:16],
-				"parent", block.Header.PrevBlock.ReverseString()[:16],
-				"orphan_pool_size", len(c.orphans))
-		}
+		logging.ChainSyncDebug("ProcessBlock: queued orphan",
+			"hash", blockHash.ReverseString()[:16],
+			"parent", block.Header.PrevBlock.ReverseString()[:16],
+			"orphan_pool_size", len(c.orphans))
 		return 0, fmt.Errorf("%w: %s (parent %s unknown)", ErrOrphanBlock, blockHash, block.Header.PrevBlock)
 	}
 
@@ -607,6 +615,8 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 
 	parentHeader, err := c.store.GetHeader(block.Header.PrevBlock)
 	if err != nil {
+		logging.ChainSyncDebug("ProcessBlock: load parent header failed",
+			"parent", block.Header.PrevBlock.ReverseString()[:16], "err", err)
 		return 0, fmt.Errorf("load parent header: %w", err)
 	}
 
@@ -618,17 +628,23 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 	if !trustedHeader {
 		nowUnix := uint32(c.timeSource.Now())
 		if err := consensus.FullValidateHeader(c.engine, &block.Header, parentHeader, newHeight, getAncestor, nowUnix, parentHeight, c.params); err != nil {
+			logging.ChainSyncDebug("ProcessBlock: FullValidateHeader failed",
+				"height", newHeight, "hash", blockHash.ReverseString()[:16], "err", err)
 			return 0, fmt.Errorf("validate header at height %d: %w", newHeight, err)
 		}
 	}
 
 	if err := c.engine.ValidateBlock(block, newHeight, c.params); err != nil {
+		logging.ChainSyncDebug("ProcessBlock: ValidateBlock failed",
+			"height", newHeight, "hash", blockHash.ReverseString()[:16], "err", err)
 		return 0, fmt.Errorf("validate block at height %d: %w", newHeight, err)
 	}
 
 	blockWork := c.engine.CalcBlockWeight(&block.Header)
 	parentWork, err := c.workForParentChain(block.Header.PrevBlock)
 	if err != nil {
+		logging.ChainSyncDebug("ProcessBlock: workForParentChain failed",
+			"parent", block.Header.PrevBlock.ReverseString()[:16], "err", err)
 		return 0, fmt.Errorf("compute parent chain work: %w", err)
 	}
 	newWork := new(big.Int).Add(parentWork, blockWork)
@@ -640,6 +656,8 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 		mtp := consensus.CalcMedianTimePast(parentHeight, getAncestor)
 		if _, err := consensus.ValidateTransactionInputs(block, c.utxoSet, newHeight, c.params, mtp, nil); err != nil {
 			metrics.Global.BlocksRejected.Add(1)
+			logging.ChainSyncDebug("ProcessBlock: tx input validation failed",
+				"height", newHeight, "hash", blockHash.ReverseString()[:16], "err", err)
 			return 0, fmt.Errorf("validate tx inputs at height %d: %w", newHeight, err)
 		}
 
@@ -730,23 +748,19 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 			}
 		}
 
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] chain.ProcessBlock → extend main chain",
-				"hash", blockHash.ReverseString()[:16],
-				"height", newHeight,
-				"ibd_nosync", useNoSync)
-		}
+		logging.ChainSyncDebug("ProcessBlock: extend main chain",
+			"hash", blockHash.ReverseString()[:16],
+			"height", newHeight,
+			"ibd_nosync", useNoSync)
 
 	} else if newWork.Cmp(c.tipWork) > 0 {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] chain.ProcessBlock → REORG triggered",
-				"hash", blockHash.ReverseString()[:16],
-				"new_height", newHeight,
-				"new_work", newWork.Text(16),
-				"old_tip", c.tipHash.ReverseString()[:16],
-				"old_height", c.tipHeight,
-				"old_work", c.tipWork.Text(16))
-		}
+		logging.ChainSyncDebug("ProcessBlock: REORG triggered (more work than tip)",
+			"hash", blockHash.ReverseString()[:16],
+			"new_height", newHeight,
+			"new_work", newWork.Text(16),
+			"old_tip", c.tipHash.ReverseString()[:16],
+			"old_height", c.tipHeight,
+			"old_work", c.tipWork.Text(16))
 		// Write the block to disk BEFORE reorg so the reorg function can
 		// load it from the store. If the reorg fails, we clean up.
 		fileNum, offset, size, err := c.store.WriteBlock(blockHash, block)
@@ -801,13 +815,11 @@ func (c *Chain) processBlock(block *types.Block, trustedHeader bool) (uint32, er
 			return 0, fmt.Errorf("store block index: %w", err)
 		}
 		c.heightByHash[blockHash] = newHeight
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] chain.ProcessBlock → side chain (insufficient work)",
-				"hash", blockHash.ReverseString()[:16],
-				"height", newHeight,
-				"block_work", newWork.Text(16),
-				"tip_work", c.tipWork.Text(16))
-		}
+		logging.ChainSyncDebug("ProcessBlock: side chain (insufficient work for reorg)",
+			"hash", blockHash.ReverseString()[:16],
+			"height", newHeight,
+			"block_work", newWork.Text(16),
+			"tip_work", c.tipWork.Text(16))
 		c.processOrphans(blockHash)
 		return newHeight, fmt.Errorf("%w: block %s at height %d (insufficient work)", ErrSideChain, blockHash, newHeight)
 	}
@@ -968,10 +980,8 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 	reorgDepth := oldTipHeight - forkParentHeight
 
 	if c.params.MaxReorgDepth > 0 && reorgDepth > c.params.MaxReorgDepth {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] reorg rejected: exceeds MaxReorgDepth",
-				"depth", reorgDepth, "limit", c.params.MaxReorgDepth, "fork_height", forkParentHeight)
-		}
+		logging.ChainSyncDebug("reorg rejected: exceeds MaxReorgDepth",
+			"depth", reorgDepth, "limit", c.params.MaxReorgDepth, "fork_height", forkParentHeight)
 		return fmt.Errorf("%w: depth %d exceeds limit %d (fork at height %d)",
 			ErrReorgTooDeep, reorgDepth, c.params.MaxReorgDepth, forkParentHeight)
 	}
@@ -990,10 +1000,8 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 		cumulative += reorgDepth
 		cumulativeLimit := c.params.MaxReorgDepth * 3
 		if cumulative > cumulativeLimit {
-			if logging.DebugMode {
-				logging.L.Debug("[dbg] reorg rejected: cumulative depth exceeded",
-					"cumulative", cumulative, "limit", cumulativeLimit, "window", "24h")
-			}
+			logging.ChainSyncDebug("reorg rejected: cumulative depth exceeded",
+				"cumulative", cumulative, "limit", cumulativeLimit, "window", "24h")
 			return fmt.Errorf("%w: cumulative depth %d exceeds limit %d over 24h sliding window",
 				ErrReorgTooDeep, cumulative, cumulativeLimit)
 		}
@@ -1001,14 +1009,12 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 
 	logging.L.Warn("chain reorg", "component", "chain", "fork_height", forkParentHeight, "old_tip", oldTipHeight, "new_tip", newTipHeight, "depth", reorgDepth)
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg phase-0: chain path built",
-			"old_tip_hash", c.tipHash.ReverseString()[:16],
-			"new_tip_hash", newTipHash.ReverseString()[:16],
-			"fork_height", forkParentHeight,
-			"disconnect_count", reorgDepth,
-			"connect_count", len(newChain))
-	}
+	logging.ChainSyncDebug("reorg phase-0: chain path built",
+		"old_tip_hash", c.tipHash.ReverseString()[:16],
+		"new_tip_hash", newTipHash.ReverseString()[:16],
+		"fork_height", forkParentHeight,
+		"disconnect_count", reorgDepth,
+		"connect_count", len(newChain))
 
 	// --- Phase 1: Dry-run validation against a cloned UTXO set. ---
 	// Clone the live UTXO set and simulate the full disconnect/connect cycle.
@@ -1016,11 +1022,9 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 	// and the live chain + chainstate are completely untouched.
 	trialSet := cloneUtxoSet(c.utxoSet)
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg phase-1: UTXO set cloned for trial",
-			"clone_utxo_count", trialSet.Count(),
-			"live_utxo_count", c.utxoSet.Count())
-	}
+	logging.ChainSyncDebug("reorg phase-1: UTXO set cloned for trial",
+		"clone_utxo_count", trialSet.Count(),
+		"live_utxo_count", c.utxoSet.Count())
 
 	// Disconnect old main chain blocks from the clone.
 	for h := c.tipHeight; h > forkParentHeight; h-- {
@@ -1050,18 +1054,14 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 		if err := trialSet.DisconnectBlock(block, undoData); err != nil {
 			return fmt.Errorf("trial disconnect block at height %d: %w", h, err)
 		}
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] reorg phase-1: trial disconnect ok",
-				"height", h, "hash", hash.ReverseString()[:16],
-				"trial_utxo_count", trialSet.Count())
-		}
+		logging.ChainSyncDebug("reorg phase-1: trial disconnect ok",
+			"height", h, "hash", hash.ReverseString()[:16],
+			"trial_utxo_count", trialSet.Count())
 	}
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg phase-1: trial disconnects complete",
-			"trial_utxo_count", trialSet.Count(),
-			"blocks_disconnected", reorgDepth)
-	}
+	logging.ChainSyncDebug("reorg phase-1: trial disconnects complete",
+		"trial_utxo_count", trialSet.Count(),
+		"blocks_disconnected", reorgDepth)
 
 	// Validate and connect new chain blocks against the clone.
 	type trialResult struct {
@@ -1082,34 +1082,26 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 		trialGetAncestor := c.buildAncestorLookup(block.Header.PrevBlock, h-1)
 		trialMTP := consensus.CalcMedianTimePast(h-1, trialGetAncestor)
 		if _, err := consensus.ValidateTransactionInputs(block, trialSet, h, c.params, trialMTP, nil); err != nil {
-			if logging.DebugMode {
-				logging.L.Debug("[dbg] reorg phase-1: trial tx validation FAILED — aborting reorg, no state changed",
-					"height", h, "hash", blockHash.ReverseString()[:16], "error", err)
-			}
+			logging.ChainSyncDebug("reorg phase-1: trial tx validation FAILED — aborting reorg, no state changed",
+				"height", h, "hash", blockHash.ReverseString()[:16], "error", err)
 			return fmt.Errorf("trial validate tx inputs at height %d: %w", h, err)
 		}
 		undoData, err := trialSet.ConnectBlock(block, h, nil)
 		if err != nil {
-			if logging.DebugMode {
-				logging.L.Debug("[dbg] reorg phase-1: trial UTXO connect FAILED — aborting reorg, no state changed",
-					"height", h, "hash", blockHash.ReverseString()[:16], "error", err)
-			}
+			logging.ChainSyncDebug("reorg phase-1: trial UTXO connect FAILED — aborting reorg, no state changed",
+				"height", h, "hash", blockHash.ReverseString()[:16], "error", err)
 			return fmt.Errorf("trial connect block %s UTXOs: %w", blockHash, err)
 		}
 		trialConnected = append(trialConnected, trialResult{hash: blockHash, height: h, undoData: undoData, block: block})
 
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] reorg phase-1: trial connect ok",
-				"height", h, "hash", blockHash.ReverseString()[:16],
-				"trial_utxo_count", trialSet.Count())
-		}
-	}
-
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg phase-1: trial PASSED — all new chain blocks valid",
-			"blocks_validated", len(trialConnected),
+		logging.ChainSyncDebug("reorg phase-1: trial connect ok",
+			"height", h, "hash", blockHash.ReverseString()[:16],
 			"trial_utxo_count", trialSet.Count())
 	}
+
+	logging.ChainSyncDebug("reorg phase-1: trial PASSED — all new chain blocks valid",
+		"blocks_validated", len(trialConnected),
+		"trial_utxo_count", trialSet.Count())
 
 	// --- Phase 2: Trial passed — commit the reorg to live state and disk. ---
 	// From this point forward we are committed. The new chain is fully
@@ -1117,10 +1109,8 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 	metrics.Global.Reorgs.Add(1)
 	metrics.Global.ReorgDepthTotal.Add(uint64(reorgDepth))
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg phase-2: committing — disconnecting old chain from live state",
-			"live_utxo_count_before", c.utxoSet.Count())
-	}
+	logging.ChainSyncDebug("reorg phase-2: committing — disconnecting old chain from live state",
+		"live_utxo_count_before", c.utxoSet.Count())
 
 	// Disconnect old main chain blocks from the live UTXO set and persist.
 	for h := c.tipHeight; h > forkParentHeight; h-- {
@@ -1153,11 +1143,9 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 			return fmt.Errorf("persist disconnect at height %d: %w", h, err)
 		}
 
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] reorg phase-2: live disconnect + persist ok",
-				"height", h, "hash", hash.ReverseString()[:16],
-				"live_utxo_count", c.utxoSet.Count())
-		}
+		logging.ChainSyncDebug("reorg phase-2: live disconnect + persist ok",
+			"height", h, "hash", hash.ReverseString()[:16],
+			"live_utxo_count", c.utxoSet.Count())
 	}
 
 	// Snapshot old main chain hashes for deferred cleanup.
@@ -1168,10 +1156,8 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 		}
 	}
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg phase-2: old chain entries snapshotted for deferred cleanup, connecting new chain",
-			"live_utxo_count", c.utxoSet.Count())
-	}
+	logging.ChainSyncDebug("reorg phase-2: old chain entries snapshotted for deferred cleanup, connecting new chain",
+		"live_utxo_count", c.utxoSet.Count())
 
 	// Connect new chain blocks to the live UTXO set and persist.
 	// Use undo data from the live ConnectBlock call, not the trial clone's.
@@ -1211,11 +1197,9 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 		c.heightByHash[tr.hash] = tr.height
 		c.hashByHeight[tr.height] = tr.hash
 
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] reorg phase-2: live connect + persist ok",
-				"height", tr.height, "hash", tr.hash.ReverseString()[:16],
-				"live_utxo_count", c.utxoSet.Count())
-		}
+		logging.ChainSyncDebug("reorg phase-2: live connect + persist ok",
+			"height", tr.height, "hash", tr.hash.ReverseString()[:16],
+			"live_utxo_count", c.utxoSet.Count())
 	}
 
 	// Remove old main chain entries above fork — deferred until after all
@@ -1239,22 +1223,18 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 	c.tipHeight = newTipHeight
 	c.tipWork = newWork
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg phase-2: chain tip updated",
-			"new_tip", newTipHash.ReverseString()[:16],
-			"new_height", newTipHeight,
-			"live_utxo_count", c.utxoSet.Count())
-	}
+	logging.ChainSyncDebug("reorg phase-2: chain tip updated",
+		"new_tip", newTipHash.ReverseString()[:16],
+		"new_height", newTipHeight,
+		"live_utxo_count", c.utxoSet.Count())
 
-	if logging.DebugMode {
-		logging.L.Debug("[dbg] reorg complete",
-			"old_tip_height", oldTipHeight,
-			"new_tip_height", newTipHeight,
-			"fork_height", forkParentHeight,
-			"depth", reorgDepth,
-			"blocks_connected", len(connected),
-			"final_utxo_count", c.utxoSet.Count())
-	}
+	logging.ChainSyncDebug("reorg complete",
+		"old_tip_height", oldTipHeight,
+		"new_tip_height", newTipHeight,
+		"fork_height", forkParentHeight,
+		"depth", reorgDepth,
+		"blocks_connected", len(connected),
+		"final_utxo_count", c.utxoSet.Count())
 
 	c.reorgHistory = append(c.reorgHistory, reorgRecord{
 		height:    newTipHeight,
@@ -1285,11 +1265,9 @@ func (c *Chain) evictExpiredOrphans() {
 	now := time.Now()
 	for hash, ob := range c.orphans {
 		if now.Sub(ob.addedAt) > OrphanExpiry {
-			if logging.DebugMode {
-				logging.L.Debug("evicting expired orphan", "component", "chain",
-					"hash", hash.ReverseString()[:16],
-					"age", now.Sub(ob.addedAt).String())
-			}
+			logging.ChainSyncDebug("evicting expired orphan",
+				"hash", hash.ReverseString()[:16],
+				"age", now.Sub(ob.addedAt).String())
 			delete(c.orphans, hash)
 		}
 	}
@@ -1354,8 +1332,8 @@ func (c *Chain) processOrphans(parentHash types.Hash) {
 			}
 		}
 
-		if logging.DebugMode && len(toProcess) > 0 {
-			logging.L.Debug("[dbg] processOrphans",
+		if len(toProcess) > 0 {
+			logging.ChainSyncDebug("processOrphans: resolving children",
 				"parent", parent.ReverseString()[:16],
 				"candidates", len(toProcess),
 				"remaining_orphans", len(c.orphans))
@@ -1664,13 +1642,18 @@ func (c *Chain) IsTipStale() bool {
 	age := now - int64(tipHeader.Timestamp)
 	stale := age > threshold
 	if logging.DebugMode {
-		logging.L.Debug("[dbg] chain.IsTipStale",
-			"tip_height", c.tipHeight,
-			"tip_timestamp", tipHeader.Timestamp,
-			"now", now,
-			"age_seconds", age,
-			"threshold_seconds", threshold,
-			"stale", stale)
+		tipStaleLogMu.Lock()
+		if time.Since(lastTipStaleLog) >= 2*time.Second {
+			lastTipStaleLog = time.Now()
+			logging.ChainSyncDebug("IsTipStale",
+				"tip_height", c.tipHeight,
+				"tip_timestamp", tipHeader.Timestamp,
+				"now", now,
+				"age_seconds", age,
+				"threshold_seconds", threshold,
+				"stale", stale)
+		}
+		tipStaleLogMu.Unlock()
 	}
 	return stale
 }

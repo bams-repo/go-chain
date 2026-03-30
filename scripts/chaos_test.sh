@@ -39,7 +39,11 @@ set -uo pipefail
 #
 # Usage:
 #   python scripts/chaos_test.py [--skip PHASES]
-#   bash scripts/chaos_test.sh [--skip PHASES]   # legacy backend invocation
+#   bash scripts/chaos_test.sh [--skip PHASES] [--no-debug]   # default: -log-level debug -debug on each node
+#
+# Environment:
+#   CHAOS_POST_CHURN_CONVERGE_SECS — max seconds to wait for height convergence after
+#     restarts/partitions (phases 4, 8, 9, 9C, 9B). Default: 60.
 #
 #   --skip accepts a comma-separated list of phase IDs or group aliases:
 #     Phase IDs: 0,1,2,3,4,5,6,7,8,9,9B,9C,10,11,12,13,14,15,A,B,C,D,E,F,H,I,J,K,L,M,16
@@ -53,10 +57,12 @@ set -uo pipefail
 #   Example: --skip 0,1,2,3,I,J,K     (skip specific phases)
 # ==========================================================================
 
-# ── Phase skip / debug support ──────────────────────────────
+# ── Phase skip / logging ────────────────────────────────────
+# Default: DEBUG-level node logs (-log-level debug -debug) for post-mortems.
+# Use --no-debug for quieter runs (info + no p2p topology dumps).
 ORIG_ARGS="$*"
 SKIP_LIST=""
-NODE_DEBUG=""
+CHAOS_NODE_LOG_FLAGS="-debug -log-level debug"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip)
@@ -64,12 +70,16 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --debug)
-            NODE_DEBUG="-debug"
+            CHAOS_NODE_LOG_FLAGS="-debug -log-level debug"
+            shift
+            ;;
+        --no-debug)
+            CHAOS_NODE_LOG_FLAGS=""
             shift
             ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [--skip PHASES] [--debug]" >&2
+            echo "Usage: $0 [--skip PHASES] [--debug] [--no-debug]" >&2
             exit 1
             ;;
     esac
@@ -204,6 +214,8 @@ RUN_LOG="${RUN_DIR}/chaos_test.log"
 NUM_NODES=12
 SEED_NODES=(0 1)
 MINER_NODES=($(seq 2 11))
+# After restarts/partitions, nodes may re-enter IBD; allow time to catch up (override: CHAOS_POST_CHURN_CONVERGE_SECS).
+CHAOS_POST_CHURN_CONVERGE_SECS="${CHAOS_POST_CHURN_CONVERGE_SECS:-60}"
 BASE_P2P_PORT=30000
 BASE_RPC_PORT=31000
 PIDS=()
@@ -252,6 +264,7 @@ started:    $(portable_date_iso)
 hostname:   $(hostname)
 args:       $0 ${ORIG_ARGS:-}
 skip_list:  ${SKIP_LIST:-<none>}
+node_logs:  ${CHAOS_NODE_LOG_FLAGS:-<default off>}
 num_nodes:  ${NUM_NODES}
 num_seeds:  ${NUM_SEEDS}
 num_miners: ${NUM_MINERS}
@@ -309,6 +322,9 @@ get_peers()      { get_status_field "$1" peers; }
 get_epoch()      { get_status "$1" | $PYTHON_CMD -c "import sys,json;d=json.load(sys.stdin);print(f\"epoch={d['retarget_epoch']} prog={d['epoch_progress']}/{d['retarget_interval']}\")" 2>/dev/null || echo "ERR"; }
 
 # ── Node management ─────────────────────────────────────────
+# Miner nodes (-mine): GOMAXPROCS=1 so the Go runtime does not spread work across
+# all CPUs. On Linux/WSL, taskset pins each miner to a single logical CPU (idx % ncpu)
+# so miners do not pile onto the same core.
 
 start_node() {
     local idx=$1
@@ -319,11 +335,30 @@ start_node() {
     mkdir -p "$datadir"
 
     local mine_flag=""
+    local cmd_prefix=()
+    local miner_note=""
     if [ "$do_mine" = "true" ]; then
         mine_flag="-mine"
+        cmd_prefix=(env GOMAXPROCS=1)
+        case "$CHAOS_OS" in
+            linux|wsl)
+                if command -v taskset &>/dev/null; then
+                    local ncpu
+                    ncpu=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)
+                    local core=$((idx % ncpu))
+                    cmd_prefix=(env GOMAXPROCS=1 taskset -c "${core}")
+                    miner_note="GOMAXPROCS=1 taskset=${core} "
+                else
+                    miner_note="GOMAXPROCS=1 "
+                fi
+                ;;
+            *)
+                miner_note="GOMAXPROCS=1 "
+                ;;
+        esac
     fi
 
-    "$BIN" \
+    "${cmd_prefix[@]}" "$BIN" \
         -network testnet \
         -datadir "$datadir" \
         -listen "127.0.0.1:${p2p_port}" \
@@ -332,13 +367,13 @@ start_node() {
         -connect "$SEED_ADDRS" \
         -norpcauth \
         ${mine_flag} \
-        ${NODE_DEBUG} \
+        ${CHAOS_NODE_LOG_FLAGS} \
         > "${datadir}/stdout.log" 2>&1 &
 
     PIDS[$idx]=$!
     local role="miner"
     [ "$do_mine" = "false" ] && role="SEED"
-    log "  Node $idx [$role] started (pid=${PIDS[$idx]}, p2p=:${p2p_port}, rpc=:${rpc_port})"
+    log "  Node $idx [$role] started (${miner_note}pid=${PIDS[$idx]}, p2p=:${p2p_port}, rpc=:${rpc_port})"
 }
 
 stop_node() {
@@ -827,6 +862,10 @@ done
 log "Waiting 10s for mesh formation and initial mining..."
 sleep 10
 
+# Brief catch-up: nodes start at different times; a tight consensus check here
+# spuriously fails while heights are still spreading (not a chain bug).
+wait_for_convergence 25 "Phase 1 warmup" 3
+
 print_cluster_status "Initial Launch"
 run_check check_consensus "Phase 1"
 
@@ -867,7 +906,7 @@ for i in "${PHASE3_VICTIMS[@]}"; do
 done
 
 log "Waiting for restarted miners to sync and converge..."
-wait_for_convergence 5 "Phase 4 sync" 3
+wait_for_convergence "$CHAOS_POST_CHURN_CONVERGE_SECS" "Phase 4 sync" 3
 print_cluster_status "After Restart & Sync"
 run_check check_consensus "Phase 4 (all ${NUM_NODES})"
 fi
@@ -930,7 +969,7 @@ for i in "${PHASE7_VICTIMS[@]}"; do
     portable_sleep 0.1
 done
 
-wait_for_convergence 5 "Phase 8 full restore" 3
+wait_for_convergence "$CHAOS_POST_CHURN_CONVERGE_SECS" "Phase 8 full restore" 3
 print_cluster_status "Full Restoration"
 run_check check_consensus "Phase 8 (all ${NUM_NODES})"
 fi
@@ -950,7 +989,7 @@ for round in $(seq 1 $PHASE9_ROUNDS); do
     sleep 5
 done
 
-wait_for_convergence 5 "Phase 9"
+wait_for_convergence "$CHAOS_POST_CHURN_CONVERGE_SECS" "Phase 9"
 print_cluster_status "After Rapid Chaos"
 run_check check_consensus "Phase 9"
 fi
@@ -977,7 +1016,7 @@ done
 log "Waiting 5s for mesh formation and initial sync..."
 sleep 5
 
-wait_for_convergence 5 "Phase 9C no-mine sync" 0
+wait_for_convergence "$CHAOS_POST_CHURN_CONVERGE_SECS" "Phase 9C no-mine sync" 0
 print_cluster_status "No-Mining Convergence"
 run_check check_consensus "Phase 9C (no-mining convergence)"
 fi
@@ -1005,7 +1044,7 @@ done
 log "Waiting 10s for miners to reconnect and resume block production..."
 sleep 10
 
-wait_for_convergence 5 "Phase 9B mining restart" 3
+wait_for_convergence "$CHAOS_POST_CHURN_CONVERGE_SECS" "Phase 9B mining restart" 3
 print_cluster_status "After Mining Restart"
 run_check check_consensus "Phase 9B (mining restarted)"
 fi

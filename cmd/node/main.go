@@ -39,7 +39,7 @@ func main() {
 	noSeedNodes := flag.Bool("noseednode", false, "Suppress hardcoded seed nodes from chain params")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFormat := flag.String("log-format", "text", "Log format: text or json")
-	debugFlag := flag.Bool("debug", false, "Enable hyper-verbose debug output (block relay, peer topology, sync state)")
+	debugFlag := flag.Bool("debug", false, "Enable hyper-verbose debug output (p2p_sync, chain_sync, sync_audit: relay, topology, IBD decisions, reorg, headers)")
 	rpctlsCert := flag.String("rpctlscert", "", "Path to TLS certificate for RPC server (required for non-loopback binds)")
 	rpctlsKey := flag.String("rpctlskey", "", "Path to TLS key for RPC server (required for non-loopback binds)")
 	noRPCAuth := flag.Bool("norpcauth", false, "Disable RPC authentication (testing/regtest only)")

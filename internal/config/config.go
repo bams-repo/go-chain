@@ -27,7 +27,7 @@ type Config struct {
 	// DataDir is the root directory for all node data.
 	DataDir string `json:"data_dir"`
 
-	// DataDirName overrides the network subdirectory name (e.g. "testnet3").
+	// DataDirName overrides the network subdirectory name (e.g. "testnet0").
 	// Set from ChainParams.DataDirName after params are resolved.
 	DataDirName string `json:"-"`
 
@@ -208,7 +208,7 @@ func applyConfOption(cfg *Config, key, val string) {
 
 // NetworkDataDir returns the network-specific data directory.
 // Bitcoin Core convention: mainnet uses the root, others get a subdirectory
-// whose name is controlled by ChainParams.DataDirName (e.g. "testnet3").
+// whose name is controlled by ChainParams.DataDirName (e.g. "testnet0").
 func (c *Config) NetworkDataDir() string {
 	if c.DataDirName == "" {
 		return c.DataDir

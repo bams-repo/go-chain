@@ -61,7 +61,9 @@ func (e *Engine) ValidateHeader(header *types.BlockHeader, parent *types.BlockHe
 		return fmt.Errorf("incorrect difficulty bits at height %d: got 0x%08x, expected 0x%08x", height, header.Bits, expectedBits)
 	}
 
-	powHash := e.hasher.PoWHash(header.SerializeToBytes())
+	var powBuf [types.BlockHeaderSize]byte
+	header.SerializeInto(powBuf[:])
+	powHash := e.hasher.PoWHash(powBuf[:])
 	if err := crypto.ValidateProofOfWork(powHash, header.Bits); err != nil {
 		return fmt.Errorf("PoW validation failed at height %d: %w", height, err)
 	}
@@ -131,8 +133,10 @@ func (e *Engine) PrepareHeader(header *types.BlockHeader, parent *types.BlockHea
 // SealHeader iterates the nonce to find a valid PoW solution.
 // Returns true if found within maxIterations.
 func (e *Engine) SealHeader(header *types.BlockHeader, target types.Hash, maxIterations uint64) (bool, error) {
+	var hdrBuf [types.BlockHeaderSize]byte
 	for i := uint64(0); i < maxIterations; i++ {
-		hash := e.hasher.PoWHash(header.SerializeToBytes())
+		header.SerializeInto(hdrBuf[:])
+		hash := e.hasher.PoWHash(hdrBuf[:])
 		if hash.LessOrEqual(target) {
 			return true, nil
 		}
@@ -147,8 +151,10 @@ func (e *Engine) SealHeader(header *types.BlockHeader, target types.Hash, maxIte
 // SealHeaderCounted is like SealHeader but also returns the number of hashes
 // actually computed, for accurate hashrate measurement.
 func (e *Engine) SealHeaderCounted(header *types.BlockHeader, target types.Hash, maxIterations uint64) (found bool, hashes uint64, err error) {
+	var hdrBuf [types.BlockHeaderSize]byte
 	for i := uint64(0); i < maxIterations; i++ {
-		hash := e.hasher.PoWHash(header.SerializeToBytes())
+		header.SerializeInto(hdrBuf[:])
+		hash := e.hasher.PoWHash(hdrBuf[:])
 		if hash.LessOrEqual(target) {
 			return true, i + 1, nil
 		}
@@ -171,8 +177,10 @@ func (e *Engine) MineGenesis(block *types.Block) error {
 
 	target := crypto.CompactToHash(block.Header.Bits)
 
+	var hdrBuf [types.BlockHeaderSize]byte
 	for {
-		hash := e.hasher.PoWHash(block.Header.SerializeToBytes())
+		block.Header.SerializeInto(hdrBuf[:])
+		hash := e.hasher.PoWHash(hdrBuf[:])
 		if hash.LessOrEqual(target) {
 			return nil
 		}
