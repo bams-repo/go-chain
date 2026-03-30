@@ -39,9 +39,9 @@
 #include <openssl/sha.h>
 
 /* ── sha256mem parameters (match internal/algorithms/sha256mem/sha256mem.go) ─ */
-#define SHA256MEM_SLOTS             1048576
-#define SHA256MEM_HARDEN_INTERVAL   256
-#define SHA256MEM_MIX_ROUNDS        16384
+#define SHA256MEM_SLOTS             2097152
+#define SHA256MEM_HARDEN_INTERVAL   128
+#define SHA256MEM_MIX_ROUNDS        32768
 
 static inline uint32_t le32_load_ba(const uint8_t *p) {
 	uint32_t v;
@@ -298,7 +298,7 @@ int main(int argc, char **argv) {
 	       SHA256MEM_SLOTS, (SHA256MEM_SLOTS * 32) / (1024 * 1024));
 	printf("║  Mix:     2 × %d SHA256 rounds (pass A + pass B)            ║\n",
 	       SHA256MEM_MIX_ROUNDS);
-	printf("║  Harden:  every %d slots (phone-friendly profile)            ║\n",
+	printf("║  Harden:  every %d slots                                     ║\n",
 	       SHA256MEM_HARDEN_INTERVAL);
 	printf("║  Threads: %-3d    Duration: %ds                            ║\n",
 	       num_threads, duration);

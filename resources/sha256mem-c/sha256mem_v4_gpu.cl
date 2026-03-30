@@ -1,16 +1,22 @@
 /*
  * sha256mem GPU kernel — optimized for maximum GPU throughput
  * ============================================================
- * Matches internal/algorithms/sha256mem/sha256mem.go (phone-friendly profile):
- *   32 MiB DAG, harden every 256 slots, dual mix 2×16384 rounds.
+ * Matches internal/algorithms/sha256mem/sha256mem.go:
+ *   1. Seed:     SHA256(80-byte header) via midstate
+ *   2. Fill:     Sequential dependent fill over 64 MiB:
+ *                - Every 128 slots: SHA256(previous) -> anchor
+ *                - Between anchors: ARX(previous, index) -> slot
+ *   3. Mix A:    32768 rounds: idx = acc[0] mod Slots (LE word0)
+ *   4. Mix B:    32768 rounds: idx = acc[r%7] mod Slots (LE words)
+ *   5. Finalize: SHA256(acc) -> PoW hash
  *
  * Copyright (c) 2024-2026 The Fairchain Contributors
  * Distributed under the MIT software license.
  */
 
-#define SHA256MEM_SLOTS           1048576
-#define SHA256MEM_HARDEN_INTERVAL 256
-#define SHA256MEM_MIX_ROUNDS      16384
+#define SHA256MEM_SLOTS           2097152
+#define SHA256MEM_HARDEN_INTERVAL 128
+#define SHA256MEM_MIX_ROUNDS      32768
 
 /* ── SHA256 core ─────────────────────────────────────────────────── */
 

@@ -20,19 +20,10 @@ var memPool = sync.Pool{
 		return &buf
 	},
 }
-
-// Phone-friendly profile: smaller DAG + fewer serial SHA256 mix rounds than the
-// original 64 MiB / 65k-mix design, while keeping sequential fill, dual mix passes,
-// and enough memory to stay costly for wide GPU occupancy.
-//
-// Consensus-critical. Changing any constant is a hard fork.
 const (
-	// Slots × 32 B = 32 MiB per hash — fits low-RAM devices with 1–2 mining threads.
-	Slots = 1048576
-	// HardenInterval balances fill-phase SHA256 vs fast ARX (fewer anchors = faster fill on ARM).
-	HardenInterval = 256
-	// MixRounds per pass; two passes (A+B) run — still thousands of serial SHA256s.
-	MixRounds = 16384
+	Slots = 2097152
+	HardenInterval = 128
+	MixRounds = 32768
 )
 type Hasher struct{}
 

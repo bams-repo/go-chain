@@ -1,3 +1,13 @@
+# resources/sha256mem-c/ local build outputs (see Makefile)
+resources/sha256mem-c/bench_cpu
+resources/sha256mem-c/bench_gpu_v4
+resources/sha256mem-c/gpu_miner
+resources/sha256mem-c/sha256mem_bench
+resources/sha256mem-c/sha256mem_gpu
+resources/sha256mem-c/sha256mem_gpu_fast
+resources/sha256mem-c/validate_gpu
+resources/sha256mem-c/test_sha256mem
+
 # Binaries
 bin/
 /node

@@ -70,7 +70,7 @@ func TestPoWHashKnownVector(t *testing.T) {
 	// Locked known vector. Any change to constants, fill, mix, or
 	// finalize logic will break this test.
 	input := []byte{}
-	want, _ := hex.DecodeString("976d959d2ccb6b9f3cf3a09aa53f30b1bdf73ac179711afeacc1cce37e6e7776")
+	want, _ := hex.DecodeString("c44266989d33a18aeefde8a63588433ff51d61a0afddff88fe9b533bc2d19469")
 	var expected types.Hash
 	copy(expected[:], want)
 

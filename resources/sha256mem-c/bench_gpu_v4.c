@@ -147,7 +147,7 @@ static void compute_midstate(const uint8_t header[80], uint32_t midstate[8], uin
 
 int main(int argc, char **argv)
 {
-    const size_t MEM_PER_WORKER = 1048576UL * 32; /* 32 MiB (phone-friendly profile) */
+    const size_t MEM_PER_WORKER = 2097152UL * 32; /* 64 MiB */
 
     int num_workers = 0;
     int hashes_per_item = 2;
@@ -203,10 +203,10 @@ int main(int argc, char **argv)
     printf("  VRAM:          %lu MiB total, %lu MiB used\n",
            (unsigned long)(dev_gmem / (1024*1024)),
            (unsigned long)(total_vram / (1024*1024)));
-    printf("  Workers:       %d  (32 MiB each)\n", num_workers);
+    printf("  Workers:       %d  (64 MiB each)\n", num_workers);
     printf("  Hashes/worker: %d\n", hashes_per_item);
     printf("  Batches:       %d\n", num_batches);
-    printf("  Algorithm:     ARX+SHA256 fill (32 MiB, harden 256) + dual mix (2x16384)\n");
+    printf("  Algorithm:     ARX+SHA256 fill (64 MiB, harden 128) + dual mix (2x32768)\n");
     printf("==================================================================\n\n");
 
     if (total_vram > (size_t)(dev_gmem * 0.95)) {
@@ -445,7 +445,7 @@ int main(int argc, char **argv)
     printf("==================================================================\n");
     printf("  GPU:            %s\n", dev_name);
     printf("  Compute units:  %u @ %u MHz\n", dev_cu, dev_freq);
-    printf("  Workers:        %d (32 MiB each)\n", num_workers);
+    printf("  Workers:        %d (64 MiB each)\n", num_workers);
     printf("  VRAM used:      %lu MiB\n", (unsigned long)(total_vram / (1024*1024)));
     printf("  Total hashes:   %lu\n", (unsigned long)total_hashes);
     printf("  Wall time:      %.3f seconds\n", total_elapsed);
