@@ -125,3 +125,78 @@ export async function resolveSelfGeo(): Promise<GeoPoint | null> {
   }
   return null;
 }
+
+export async function resolvePeerGeo(ip: string): Promise<GeoPoint | null> {
+  const encoded = encodeURIComponent(ip);
+  const providers: Array<{ url: string; parse: (p: Record<string, unknown>) => GeoPoint | null }> = [
+    {
+      url: `https://ipwho.is/${encoded}`,
+      parse: (payload) => {
+        if (payload.success !== true) return null;
+        const lat = Number(payload.latitude);
+        const lon = Number(payload.longitude);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+        return {
+          ip,
+          lat,
+          lon,
+          city: payload.city as string | undefined,
+          region: payload.region as string | undefined,
+          country: payload.country as string | undefined,
+          org: (payload.connection as { org?: string } | undefined)?.org,
+        };
+      },
+    },
+    {
+      url: `https://ipapi.co/${encoded}/json/`,
+      parse: (payload) => {
+        if (payload.error) return null;
+        const lat = Number(payload.latitude);
+        const lon = Number(payload.longitude);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+        return {
+          ip,
+          lat,
+          lon,
+          city: payload.city as string | undefined,
+          region: payload.region as string | undefined,
+          country:
+            (payload.country_name as string | undefined) ||
+            (payload.country as string | undefined),
+          org: payload.org as string | undefined,
+        };
+      },
+    },
+    {
+      url: `https://ipinfo.io/${encoded}/json`,
+      parse: (payload) => {
+        const loc = String(payload.loc || "");
+        const [a, b] = loc.split(",");
+        const lat = Number(a);
+        const lon = Number(b);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+        return {
+          ip,
+          lat,
+          lon,
+          city: payload.city as string | undefined,
+          region: payload.region as string | undefined,
+          country: payload.country as string | undefined,
+          org: payload.org as string | undefined,
+        };
+      },
+    },
+  ];
+  for (const { url, parse } of providers) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const payload = (await res.json()) as Record<string, unknown>;
+      const point = parse(payload);
+      if (point) return point;
+    } catch {
+      // Try next provider.
+    }
+  }
+  return null;
+}
