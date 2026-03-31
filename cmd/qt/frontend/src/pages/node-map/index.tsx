@@ -9,14 +9,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { GetDebugInfo, GetPeerList } from "../../../wailsjs/go/main/App";
+import { GetDebugInfo, GetPeerList, ResolveGeo } from "../../../wailsjs/go/main/App";
 import { DebugInfo, PeerEntry, GeoPoint, PeerWithGeo } from "@/lib/types";
 import { globals as g } from "@/lib/globals";
 import { formatPeerPing, normalizePeerList } from "@/lib/peer-normalize";
 import {
   loadGeoCache,
-  resolveSelfGeo,
-  resolvePeerGeo,
   extractIpFromAddr,
   isPublicRoutableIp,
   formatBytes,
@@ -85,11 +83,22 @@ export function NodeMap() {
 
   useEffect(() => {
     let disposed = false;
-    resolveSelfGeo().then((resolved) => {
-      if (disposed || !resolved) return;
+    ResolveGeo([""]).then((results) => {
+      if (disposed || !results || results.length === 0) return;
+      const r = results[0];
+      const resolved: GeoPoint = {
+        ip: String(r.ip || ""),
+        lat: Number(r.lat),
+        lon: Number(r.lon),
+        city: r.city ? String(r.city) : undefined,
+        region: r.region ? String(r.region) : undefined,
+        country: r.country ? String(r.country) : undefined,
+        org: r.org ? String(r.org) : undefined,
+      };
+      if (!resolved.ip || !Number.isFinite(resolved.lat) || !Number.isFinite(resolved.lon)) return;
       setSelfGeo(resolved);
       setGeoByIp((prev) => ({ ...prev, [resolved.ip]: resolved }));
-    });
+    }).catch(() => {});
     return () => {
       disposed = true;
     };
@@ -105,23 +114,39 @@ export function NodeMap() {
     let cancelled = false;
     setResolvingGeo(true);
 
-    Promise.all(
-      pending.map(async (ip) => {
-        inflight.current.add(ip);
-        try {
-          const point = await resolvePeerGeo(ip);
-          if (cancelled || !point) return;
+    for (const ip of pending) {
+      inflight.current.add(ip);
+    }
+
+    ResolveGeo(pending)
+      .then((results) => {
+        if (cancelled || !results) return;
+        for (const r of results) {
+          const ip = String(r.ip || "");
+          if (!ip) continue;
+          const point: GeoPoint = {
+            ip,
+            lat: Number(r.lat),
+            lon: Number(r.lon),
+            city: r.city ? String(r.city) : undefined,
+            region: r.region ? String(r.region) : undefined,
+            country: r.country ? String(r.country) : undefined,
+            org: r.org ? String(r.org) : undefined,
+          };
+          if (!Number.isFinite(point.lat) || !Number.isFinite(point.lon)) continue;
           setGeoByIp((prev) => {
             if (prev[ip]) return prev;
             return { ...prev, [ip]: point };
           });
-        } finally {
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        for (const ip of pending) {
           inflight.current.delete(ip);
         }
-      }),
-    ).finally(() => {
-      if (!cancelled) setResolvingGeo(false);
-    });
+        if (!cancelled) setResolvingGeo(false);
+      });
 
     return () => {
       cancelled = true;

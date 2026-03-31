@@ -10,6 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -374,6 +377,178 @@ func (a *App) GetPeerList() ([]map[string]interface{}, error) {
 		}
 	}
 	return result, nil
+}
+
+// ResolveGeo resolves geolocation for the given IP addresses using public
+// APIs. This runs server-side to avoid WebView fetch restrictions. An empty
+// ip string resolves the node's own public IP.
+func (a *App) ResolveGeo(ips []string) []map[string]interface{} {
+	client := &http.Client{Timeout: 6 * time.Second}
+	results := make([]map[string]interface{}, 0, len(ips))
+
+	for _, ip := range ips {
+		geo := resolveOneGeo(client, ip)
+		if geo != nil {
+			results = append(results, geo)
+		}
+	}
+	return results
+}
+
+func resolveOneGeo(client *http.Client, ip string) map[string]interface{} {
+	type provider struct {
+		url   string
+		parse func(map[string]interface{}) map[string]interface{}
+	}
+
+	isSelf := ip == ""
+	encoded := ip
+
+	providers := []provider{
+		{
+			url: func() string {
+				if isSelf {
+					return "https://ipwho.is/"
+				}
+				return "https://ipwho.is/" + encoded
+			}(),
+			parse: func(payload map[string]interface{}) map[string]interface{} {
+				if success, _ := payload["success"].(bool); !success {
+					return nil
+				}
+				lat, latOk := toFloat(payload["latitude"])
+				lon, lonOk := toFloat(payload["longitude"])
+				if !latOk || !lonOk {
+					return nil
+				}
+				resolvedIP, _ := payload["ip"].(string)
+				var org string
+				if conn, ok := payload["connection"].(map[string]interface{}); ok {
+					org, _ = conn["org"].(string)
+				}
+				return map[string]interface{}{
+					"ip":      resolvedIP,
+					"lat":     lat,
+					"lon":     lon,
+					"city":    strOrEmpty(payload["city"]),
+					"region":  strOrEmpty(payload["region"]),
+					"country": strOrEmpty(payload["country"]),
+					"org":     org,
+				}
+			},
+		},
+		{
+			url: func() string {
+				if isSelf {
+					return "https://ipapi.co/json/"
+				}
+				return "https://ipapi.co/" + encoded + "/json/"
+			}(),
+			parse: func(payload map[string]interface{}) map[string]interface{} {
+				if _, hasErr := payload["error"]; hasErr {
+					return nil
+				}
+				lat, latOk := toFloat(payload["latitude"])
+				lon, lonOk := toFloat(payload["longitude"])
+				if !latOk || !lonOk {
+					return nil
+				}
+				resolvedIP, _ := payload["ip"].(string)
+				country := strOrEmpty(payload["country_name"])
+				if country == "" {
+					country = strOrEmpty(payload["country"])
+				}
+				return map[string]interface{}{
+					"ip":      resolvedIP,
+					"lat":     lat,
+					"lon":     lon,
+					"city":    strOrEmpty(payload["city"]),
+					"region":  strOrEmpty(payload["region"]),
+					"country": country,
+					"org":     strOrEmpty(payload["org"]),
+				}
+			},
+		},
+		{
+			url: func() string {
+				if isSelf {
+					return "https://ipinfo.io/json"
+				}
+				return "https://ipinfo.io/" + encoded + "/json"
+			}(),
+			parse: func(payload map[string]interface{}) map[string]interface{} {
+				loc, _ := payload["loc"].(string)
+				parts := strings.SplitN(loc, ",", 2)
+				if len(parts) != 2 {
+					return nil
+				}
+				lat, latOk := toFloat(parts[0])
+				lon, lonOk := toFloat(parts[1])
+				if !latOk || !lonOk {
+					return nil
+				}
+				resolvedIP, _ := payload["ip"].(string)
+				return map[string]interface{}{
+					"ip":      resolvedIP,
+					"lat":     lat,
+					"lon":     lon,
+					"city":    strOrEmpty(payload["city"]),
+					"region":  strOrEmpty(payload["region"]),
+					"country": strOrEmpty(payload["country"]),
+					"org":     strOrEmpty(payload["org"]),
+				}
+			},
+		},
+	}
+
+	for _, p := range providers {
+		resp, err := client.Get(p.url)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			continue
+		}
+		if result := p.parse(payload); result != nil {
+			return result
+		}
+	}
+	return nil
+}
+
+func toFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case string:
+		var f float64
+		if _, err := fmt.Sscanf(n, "%f", &f); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func strOrEmpty(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+// IsPublicRoutableIP checks whether an IP is publicly routable (not private,
+// loopback, link-local, or unspecified).
+func IsPublicRoutableIP(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	return !parsed.IsLoopback() && !parsed.IsPrivate() && !parsed.IsLinkLocalUnicast() &&
+		!parsed.IsLinkLocalMulticast() && !parsed.IsUnspecified()
 }
 
 // ExecuteRPC runs a JSON-RPC command from the debug console.

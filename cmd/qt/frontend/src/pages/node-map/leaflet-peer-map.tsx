@@ -9,14 +9,7 @@ import { globals as g } from "@/lib/globals";
 
 function FitToPeers({ bounds, nonce }: { bounds: LatLngBoundsExpression | null; nonce: number }) {
   const map = useMap();
-  const hasInitialFit = useRef(false);
   const lastNonce = useRef(nonce);
-
-  useEffect(() => {
-    if (!bounds || hasInitialFit.current) return;
-    map.fitBounds(bounds, { padding: [28, 28], maxZoom: 8 });
-    hasInitialFit.current = true;
-  }, [map, bounds]);
 
   useEffect(() => {
     if (!bounds) return;
@@ -75,7 +68,6 @@ export default function LeafletPeerMap({
         zoom={g.FALLBACK_ZOOM}
         minZoom={g.MIN_ZOOM}
         maxZoom={g.MAX_ZOOM}
-        bounds={g.WORLD_BOUNDS as LatLngBoundsExpression}
         maxBounds={g.WORLD_BOUNDS as LatLngBoundsExpression}
         maxBoundsViscosity={1}
         worldCopyJump={false}

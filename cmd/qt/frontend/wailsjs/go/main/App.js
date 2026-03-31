@@ -78,6 +78,10 @@ export function RescanBlockchain() {
   return window['go']['main']['App']['RescanBlockchain']();
 }
 
+export function ResolveGeo(arg1) {
+  return window['go']['main']['App']['ResolveGeo'](arg1);
+}
+
 export function SendIRCMessage(arg1) {
   return window['go']['main']['App']['SendIRCMessage'](arg1);
 }

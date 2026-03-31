@@ -39,6 +39,8 @@ export function ListRPCMethods():Promise<Array<string>>;
 
 export function RescanBlockchain():Promise<string>;
 
+export function ResolveGeo(arg1:Array<string>):Promise<Array<Record<string, any>>>;
+
 export function SendIRCMessage(arg1:string):Promise<void>;
 
 export function SetMining(arg1:boolean):Promise<void>;
