@@ -7,6 +7,8 @@ import {
   GetNetworkTotals,
   RescanBlockchain,
 } from "../../wailsjs/go/main/App";
+import type { PeerEntry } from "@/lib/types";
+import { formatPeerPing, normalizePeerList, peerRowKey } from "@/lib/peer-normalize";
 
 interface DebugInfo {
   clientVersion: string;
@@ -22,22 +24,6 @@ interface DebugInfo {
   lastBlockTime: string;
   mempoolTx: number;
   mempoolBytes: number;
-}
-
-interface PeerEntry {
-  addr: string;
-  addrLocal: string;
-  subver: string;
-  version: number;
-  inbound: boolean;
-  connTime: number;
-  lastSend: number;
-  lastRecv: number;
-  bytesSent: number;
-  bytesRecv: number;
-  pingTime: number;
-  startingHeight: number;
-  banScore: number;
 }
 
 interface NetworkTotals {
@@ -87,9 +73,10 @@ const labelStyle: React.CSSProperties = {
 };
 
 function formatBytes(bytes: number): string {
-  if (bytes < 1024) return bytes + " B";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + " KB";
-  return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+  const n = Number.isFinite(bytes) ? bytes : 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(2) + " KB";
+  return (n / (1024 * 1024)).toFixed(2) + " MB";
 }
 
 function formatTimestamp(unix: number): string {
@@ -634,7 +621,18 @@ function NetworkTrafficTab() {
 // ─── Peers Tab ───
 
 function PeersTab({ peers }: { peers: PeerEntry[] }) {
-  const [selected, setSelected] = useState<number | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (selectedKey && !peers.some((p) => peerRowKey(p) === selectedKey)) {
+      setSelectedKey(null);
+    }
+  }, [peers, selectedKey]);
+
+  const selectedPeer = selectedKey
+    ? peers.find((p) => peerRowKey(p) === selectedKey) ?? null
+    : null;
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
       <div style={{ flex: 1, overflow: "auto", borderBottom: "1px solid var(--color-btc-border)" }}>
@@ -664,13 +662,14 @@ function PeersTab({ peers }: { peers: PeerEntry[] }) {
             </tr>
           </thead>
           <tbody>
-            {peers.map((p, i) => (
+            {peers.map((p) => (
               <tr
-                key={p.addr}
-                onClick={() => setSelected(i)}
+                key={peerRowKey(p)}
+                onClick={() => setSelectedKey(peerRowKey(p))}
                 style={{
                   cursor: "pointer",
-                  background: selected === i ? "rgba(247,147,26,0.1)" : "transparent",
+                  background:
+                    selectedKey === peerRowKey(p) ? "rgba(247,147,26,0.1)" : "transparent",
                   borderBottom: "1px solid var(--color-btc-border)",
                 }}
               >
@@ -701,7 +700,7 @@ function PeersTab({ peers }: { peers: PeerEntry[] }) {
                     fontFamily: "monospace",
                   }}
                 >
-                  {(p.pingTime * 1000).toFixed(0)}ms
+                  {formatPeerPing(p.pingTime)}
                 </td>
                 <td style={{ padding: "4px 8px", color: "var(--color-btc-text-muted)" }}>
                   {formatBytes(p.bytesSent)}
@@ -738,31 +737,43 @@ function PeersTab({ peers }: { peers: PeerEntry[] }) {
           </tbody>
         </table>
       </div>
-      {selected !== null && peers[selected] && (
+      {selectedPeer && (
         <div style={{ padding: "8px 16px", fontSize: 11, color: "var(--color-btc-text-muted)" }}>
           <div style={rowStyle}>
             <span style={{ ...labelStyle, width: 140 }}>Address</span>
-            <span style={{ fontFamily: "monospace" }}>{peers[selected].addr}</span>
+            <span style={{ fontFamily: "monospace" }}>{selectedPeer.addr}</span>
           </div>
           <div style={rowStyle}>
             <span style={{ ...labelStyle, width: 140 }}>Local address</span>
-            <span style={{ fontFamily: "monospace" }}>{peers[selected].addrLocal}</span>
+            <span style={{ fontFamily: "monospace" }}>{selectedPeer.addrLocal || "—"}</span>
           </div>
           <div style={rowStyle}>
             <span style={{ ...labelStyle, width: 140 }}>Connected since</span>
-            <span>{formatTimestamp(peers[selected].connTime)}</span>
+            <span>{formatTimestamp(selectedPeer.connTime)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Ping (RTT)</span>
+            <span>{formatPeerPing(selectedPeer.pingTime)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Bytes sent</span>
+            <span>{formatBytes(selectedPeer.bytesSent)}</span>
+          </div>
+          <div style={rowStyle}>
+            <span style={{ ...labelStyle, width: 140 }}>Bytes received</span>
+            <span>{formatBytes(selectedPeer.bytesRecv)}</span>
           </div>
           <div style={rowStyle}>
             <span style={{ ...labelStyle, width: 140 }}>Last send</span>
-            <span>{formatTimestamp(peers[selected].lastSend)}</span>
+            <span>{formatTimestamp(selectedPeer.lastSend)}</span>
           </div>
           <div style={rowStyle}>
             <span style={{ ...labelStyle, width: 140 }}>Last receive</span>
-            <span>{formatTimestamp(peers[selected].lastRecv)}</span>
+            <span>{formatTimestamp(selectedPeer.lastRecv)}</span>
           </div>
           <div style={rowStyle}>
             <span style={{ ...labelStyle, width: 140 }}>Ban score</span>
-            <span>{peers[selected].banScore}</span>
+            <span>{selectedPeer.banScore}</span>
           </div>
         </div>
       )}
@@ -885,7 +896,7 @@ export function DebugWindow({ onClose }: { onClose: () => void }) {
         .then((d) => setInfo(d as unknown as DebugInfo))
         .catch(() => {});
       GetPeerList()
-        .then((p) => setPeers((p || []) as unknown as PeerEntry[]))
+        .then((p) => setPeers(normalizePeerList(p)))
         .catch(() => {});
     };
     poll();

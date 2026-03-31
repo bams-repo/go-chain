@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -186,8 +187,7 @@ func (a *App) GetWalletAddress() (string, error) {
 	return a.node.Wallet().GetDefaultAddress(), nil
 }
 
-// GetSyncProgress returns a value between 0.0 and 1.0 indicating overall sync
-// progress across both phases (header sync = 0–0.5, block sync = 0.5–1.0).
+// GetSyncProgress returns a value between 0.0 and 1.0 indicating sync progress.
 func (a *App) GetSyncProgress() (float64, error) {
 	if a.node == nil {
 		return 0, fmt.Errorf("node not initialized")
@@ -353,6 +353,8 @@ func (a *App) GetPeerList() ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("node not initialized")
 	}
 	infos := a.node.P2PMgr().PeerInfos()
+	// Map iteration order is random; stable sort so the UI row order and selection stay aligned.
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Addr < infos[j].Addr })
 	result := make([]map[string]interface{}, len(infos))
 	for i, p := range infos {
 		result[i] = map[string]interface{}{

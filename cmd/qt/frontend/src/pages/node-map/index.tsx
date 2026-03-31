@@ -12,9 +12,11 @@ import {
 import { GetDebugInfo, GetPeerList } from "../../../wailsjs/go/main/App";
 import { DebugInfo, PeerEntry, GeoPoint, PeerWithGeo } from "@/lib/types";
 import { globals as g } from "@/lib/globals";
+import { formatPeerPing, normalizePeerList } from "@/lib/peer-normalize";
 import {
   loadGeoCache,
   resolveSelfGeo,
+  resolvePeerGeo,
   extractIpFromAddr,
   isPublicRoutableIp,
   formatBytes,
@@ -30,6 +32,19 @@ export function NodeMap() {
   const [resolvingGeo, setResolvingGeo] = useState<boolean>(false);
   const [viewMode, setViewMode] = useState<"map" | "table">("map");
   const inflight = useRef<Set<string>>(new Set());
+  const geoByIpRef = useRef(geoByIp);
+  geoByIpRef.current = geoByIp;
+
+  const peerPublicIpKey = useMemo(() => {
+    const ips = Array.from(
+      new Set(
+        peers
+          .map((peer) => extractIpFromAddr(peer.addr))
+          .filter((ip): ip is string => !!ip && isPublicRoutableIp(ip)),
+      ),
+    ).sort();
+    return ips.join("|");
+  }, [peers]);
 
   useEffect(() => {
     let mounted = true;
@@ -38,7 +53,7 @@ export function NodeMap() {
         .then(([i, p]) => {
           if (!mounted) return;
           setInfo((i as DebugInfo) || null);
-          setPeers(Array.isArray(p) ? (p as PeerEntry[]) : []);
+          setPeers(normalizePeerList(p));
         })
         .catch((e: unknown) => {
           if (!mounted) return;
@@ -81,60 +96,37 @@ export function NodeMap() {
   }, []);
 
   useEffect(() => {
-    const uniqueIps = Array.from(
-      new Set(
-        peers
-          .map((peer) => extractIpFromAddr(peer.addr))
-          .filter((ip): ip is string => !!ip && isPublicRoutableIp(ip)),
-      ),
+    const uniqueIps = (
+      peerPublicIpKey.length === 0 ? [] : peerPublicIpKey.split("|")
     ).slice(0, g.MAX_GEO_LOOKUPS);
-    const pending = uniqueIps.filter((ip) => !geoByIp[ip] && !inflight.current.has(ip));
+    const known = geoByIpRef.current;
+    const pending = uniqueIps.filter((ip) => !known[ip] && !inflight.current.has(ip));
     if (pending.length === 0) return;
-    let disposed = false;
+    let cancelled = false;
     setResolvingGeo(true);
 
     Promise.all(
       pending.map(async (ip) => {
         inflight.current.add(ip);
         try {
-          const res = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`);
-          const payload = (await res.json()) as {
-            success?: boolean;
-            latitude?: number;
-            longitude?: number;
-            city?: string;
-            region?: string;
-            country?: string;
-            connection?: { org?: string };
-          };
-          if (!payload.success || !payload.latitude || !payload.longitude) return;
-          if (disposed) return;
-          setGeoByIp((prev) => ({
-            ...prev,
-            [ip]: {
-              ip,
-              lat: payload.latitude!,
-              lon: payload.longitude!,
-              city: payload.city,
-              region: payload.region,
-              country: payload.country,
-              org: payload.connection?.org,
-            },
-          }));
-        } catch {
-          // Ignore transient geolocation failures per IP.
+          const point = await resolvePeerGeo(ip);
+          if (cancelled || !point) return;
+          setGeoByIp((prev) => {
+            if (prev[ip]) return prev;
+            return { ...prev, [ip]: point };
+          });
         } finally {
           inflight.current.delete(ip);
         }
       }),
     ).finally(() => {
-      if (!disposed) setResolvingGeo(false);
+      if (!cancelled) setResolvingGeo(false);
     });
 
     return () => {
-      disposed = true;
+      cancelled = true;
     };
-  }, [peers, geoByIp]);
+  }, [peerPublicIpKey]);
 
   const points = useMemo<PeerWithGeo[]>(() => {
     const byKey = new Map<string, PeerWithGeo>();
@@ -149,13 +141,18 @@ export function NodeMap() {
       byKey.set(`self-${selfGeo.ip}`, {
         peer: {
           addr: selfGeo.ip,
+          addrLocal: "",
           subver: info?.userAgent || "local-node",
           version: 0,
           inbound: false,
           connTime: 0,
+          lastSend: 0,
+          lastRecv: 0,
           bytesSent: 0,
           bytesRecv: 0,
           pingTime: 0,
+          startingHeight: 0,
+          banScore: 0,
         },
         geo: selfGeo,
         isSelf: true,
@@ -285,7 +282,7 @@ export function NodeMap() {
                               {peer.subver || peer.version}
                             </TableCell>
                             <TableCell className="px-3 py-2 text-(--color-btc-text-muted)">
-                              {peer.pingTime > 0 ? `${peer.pingTime.toFixed(3)}s` : "—"}
+                              {formatPeerPing(peer.pingTime)}
                             </TableCell>
                             <TableCell className="px-3 py-2 text-(--color-btc-text-muted)">
                               {formatBytes(peer.bytesRecv + peer.bytesSent)}

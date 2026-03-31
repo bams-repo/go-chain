@@ -3,6 +3,7 @@ import type { LatLngBoundsExpression } from "leaflet";
 import { CircleMarker, MapContainer, Popup, TileLayer, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import { Button } from "@/components/ui/button";
+import { formatPeerPing } from "@/lib/peer-normalize";
 import { PeerWithGeo } from "@/lib/types";
 import { globals as g } from "@/lib/globals";
 
@@ -87,7 +88,9 @@ export default function LeafletPeerMap({
         />
         {bounds ? <FitToPeers bounds={bounds} nonce={fitNonce} /> : null}
         {points.map(({ peer, geo, isSelf }) => {
-          const traffic = peer.bytesRecv + peer.bytesSent;
+          const recv = Number.isFinite(peer.bytesRecv) ? peer.bytesRecv : 0;
+          const sent = Number.isFinite(peer.bytesSent) ? peer.bytesSent : 0;
+          const traffic = recv + sent;
           const radius = Math.max(4, Math.min(14, 4 + Math.log10(Math.max(traffic, 1))));
           return (
             <CircleMarker
@@ -115,7 +118,7 @@ export default function LeafletPeerMap({
                   </div>
                   <div>{peer.inbound ? "Inbound" : "Outbound"}</div>
                   <div>Version: {peer.subver || peer.version}</div>
-                  <div>Ping: {peer.pingTime > 0 ? `${peer.pingTime.toFixed(3)}s` : "—"}</div>
+                  <div>Ping: {formatPeerPing(peer.pingTime)}</div>
                   <div>Traffic: {formatBytes(traffic)}</div>
                   {geo.org ? <div>ASN/Org: {geo.org}</div> : null}
                 </div>

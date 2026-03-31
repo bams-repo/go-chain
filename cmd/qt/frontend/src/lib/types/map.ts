@@ -11,13 +11,18 @@ export interface DebugInfo {
 
 export interface PeerEntry {
   addr: string;
+  addrLocal: string;
   subver: string;
   version: number;
   inbound: boolean;
   connTime: number;
+  lastSend: number;
+  lastRecv: number;
   bytesSent: number;
   bytesRecv: number;
   pingTime: number;
+  startingHeight: number;
+  banScore: number;
 }
 
 export interface GeoPoint {
