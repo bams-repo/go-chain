@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,10 +77,11 @@ type Manager struct {
 	lastSyncReqPerPeer   map[string]time.Time
 	lastSyncReqPerPeerMu sync.Mutex
 
-	// Per-peer addr rate limit: max 1000 addresses per connection lifetime
-	// to prevent peer store flooding (Bitcoin Core parity).
-	addrCountPerPeer map[string]int
-	addrCountMu      sync.Mutex
+	// Per-IP addr rate limit: max 1000 addresses per 24h window.
+	// Keyed by IP (not host:port) so reconnecting with a new ephemeral port
+	// does not reset the budget. Budget decays after addrBudgetWindow.
+	addrBudgetPerIP map[string]*addrBudget
+	addrBudgetMu    sync.Mutex
 
 	// Current sync peer — only this peer is exempt from rate limits during IBD.
 	syncPeerAddr    string
@@ -169,6 +171,10 @@ const (
 	// Peer store pruning: remove addresses not seen in this duration.
 	peerStorePruneAge = 7 * 24 * time.Hour
 
+	// Per-IP addr gossip budget: max addresses accepted per IP per window.
+	addrBudgetMax    = 1000
+	addrBudgetWindow = 24 * time.Hour
+
 	// Header-first sync constants.
 	headerSyncStallTimeout = 30 * time.Second
 	blockSyncStallTimeout  = 15 * time.Second
@@ -185,6 +191,29 @@ const (
 	fastSyncMaxInFlight   = fastSyncBatchSize * fastSyncPipelineDepth
 	fastSyncStallTimeout  = 15 * time.Second
 )
+
+// addrBudget tracks how many addr entries an IP has injected within a
+// rolling time window. The budget resets after addrBudgetWindow elapses.
+type addrBudget struct {
+	count    int
+	windowStart time.Time
+}
+
+func (b *addrBudget) remaining(now time.Time) int {
+	if now.Sub(b.windowStart) >= addrBudgetWindow {
+		b.count = 0
+		b.windowStart = now
+	}
+	r := addrBudgetMax - b.count
+	if r < 0 {
+		return 0
+	}
+	return r
+}
+
+func (b *addrBudget) consume(n int) {
+	b.count += n
+}
 
 // boundedHashSet is a bounded set of hashes with FIFO eviction, modeled after
 // Bitcoin Core's CRollingBloomFilter used for inventory deduplication.
@@ -293,7 +322,7 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		seenBlocks:         newBoundedHashSet(maxSeenBlocks),
 		seenTxs:            newBoundedHashSet(maxSeenTxs),
 		lastSyncReqPerPeer: make(map[string]time.Time),
-		addrCountPerPeer:   make(map[string]int),
+		addrBudgetPerIP:    make(map[string]*addrBudget),
 		ibdBlockQueue:      make(chan *ibdBlockItem, 1024),
 		ibdQueueDone:       make(chan struct{}),
 		syncState:          SyncStateInitial,
@@ -311,6 +340,9 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 // Start begins listening for connections and connecting to seed peers.
 func (m *Manager) Start(ctx context.Context) error {
 	m.ctx = ctx
+
+	m.pruneEphemeralPeers()
+
 	ln, err := net.Listen("tcp", m.listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", m.listenAddr, err)
@@ -328,6 +360,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	go m.orphanEvictionLoop(ctx)
 	go m.mempoolExpiryLoop(ctx)
 	go m.ibdProcessLoop(ctx)
+	go m.peerStorePruneLoop(ctx)
 	if logging.DebugMode {
 		go m.topologyLoop(ctx)
 	}
@@ -344,6 +377,34 @@ func (m *Manager) Stop() {
 	defer m.mu.RUnlock()
 	for _, p := range m.peers {
 		p.Close()
+	}
+}
+
+// pruneEphemeralPeers removes stored peer addresses that have ephemeral ports.
+// This cleans up pollution from earlier versions that stored inbound connection
+// addresses (with OS-assigned ephemeral ports) instead of listen addresses.
+func (m *Manager) pruneEphemeralPeers() {
+	stored, err := m.peerStore.GetPeers()
+	if err != nil {
+		return
+	}
+	pruned := 0
+	for _, addr := range stored {
+		_, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			m.peerStore.RemovePeer(addr)
+			pruned++
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || !isLikelyListenPort(port, m.params.DefaultPort) {
+			m.peerStore.RemovePeer(addr)
+			pruned++
+		}
+	}
+	if pruned > 0 {
+		logging.L.Info("pruned ephemeral-port peers from store",
+			"component", "p2p", "removed", pruned, "remaining", len(stored)-pruned)
 	}
 }
 
@@ -578,6 +639,20 @@ func validateGossipAddress(addr string, localLoopback ...bool) error {
 		return fmt.Errorf("non-routable address")
 	}
 	return nil
+}
+
+// isLikelyListenPort returns true if the port looks like a deliberately chosen
+// listen port rather than an OS-assigned ephemeral port. Bitcoin Core's AddrMan
+// penalizes non-default-port addresses; we take a simpler approach and reject
+// addresses with ports in the typical ephemeral range (32768–65535) unless they
+// match the network's default port. This prevents inbound connection addresses
+// (which use the remote's ephemeral port) from polluting the peer store and
+// addr gossip.
+func isLikelyListenPort(port int, defaultPort uint16) bool {
+	if port == int(defaultPort) {
+		return true
+	}
+	return port > 0 && port < 32768
 }
 
 // isLocalLoopback returns true if this manager is listening on a loopback address.
@@ -1080,6 +1155,16 @@ func (m *Manager) connectPeer(ctx context.Context, addr string) {
 		return
 	}
 
+	if _, portStr, err := net.SplitHostPort(addr); err == nil {
+		if port, _ := strconv.Atoi(portStr); !isLikelyListenPort(port, m.params.DefaultPort) {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] connectPeer: skipping ephemeral port", "addr", addr)
+			}
+			m.peerStore.RemovePeer(addr)
+			return
+		}
+	}
+
 	m.mu.RLock()
 	if _, exists := m.peers[addr]; exists {
 		m.mu.RUnlock()
@@ -1146,10 +1231,9 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 		disconnectedAddr := peer.Addr()
 		delete(m.peers, disconnectedAddr)
 		m.mu.Unlock()
-		// Clean up per-peer tracking maps when peer disconnects.
-		m.addrCountMu.Lock()
-		delete(m.addrCountPerPeer, disconnectedAddr)
-		m.addrCountMu.Unlock()
+		// Note: addrBudgetPerIP is intentionally NOT cleaned up on disconnect.
+		// Budgets are keyed by IP and decay after addrBudgetWindow (24h),
+		// preventing reconnect-based budget reset attacks.
 		m.lastSyncReqPerPeerMu.Lock()
 		delete(m.lastSyncReqPerPeer, disconnectedAddr)
 		m.lastSyncReqPerPeerMu.Unlock()
@@ -1208,12 +1292,17 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 	m.mu.Unlock()
 
 	// Store the peer's advertised listen address (AddrFrom) rather than the
-	// ephemeral TCP address. This ensures addr gossip propagates reachable
-	// addresses, matching Bitcoin Core's behavior of tracking listen addrs.
+	// ephemeral TCP address. For inbound peers, peer.Addr() is the remote's
+	// ephemeral port — never store that. Only persist addresses that pass
+	// gossip validation AND have a plausible listen port.
 	listenAddr := peer.Version().AddrFrom
 	if listenAddr != "" && listenAddr != m.listenAddr && validateGossipAddress(listenAddr, m.isLocalLoopback()) == nil {
-		m.peerStore.PutPeer(listenAddr)
-	} else if peer.Addr() != m.listenAddr {
+		if _, portStr, err := net.SplitHostPort(listenAddr); err == nil {
+			if port, _ := strconv.Atoi(portStr); isLikelyListenPort(port, m.params.DefaultPort) {
+				m.peerStore.PutPeer(listenAddr)
+			}
+		}
+	} else if !peer.IsInbound() && peer.Addr() != m.listenAddr {
 		m.peerStore.PutPeer(peer.Addr())
 	}
 
@@ -1593,29 +1682,41 @@ func (m *Manager) handleMessage(ctx context.Context, peer *Peer, hdr *protocol.M
 			return
 		}
 
-		// Per-peer addr rate limit: max 1000 addresses per connection lifetime
-		// to prevent peer store flooding (Bitcoin Core parity).
-		m.addrCountMu.Lock()
-		peerAddr := peer.Addr()
-		received := m.addrCountPerPeer[peerAddr]
-		remaining := 1000 - received
+		// Per-IP addr rate limit: max addrBudgetMax addresses per addrBudgetWindow.
+		// Keyed by IP (not host:port) so ephemeral port changes on reconnect
+		// do not reset the budget.
+		ip := extractIP(peer.Addr())
+		m.addrBudgetMu.Lock()
+		budget, ok := m.addrBudgetPerIP[ip]
+		if !ok {
+			budget = &addrBudget{windowStart: time.Now()}
+			m.addrBudgetPerIP[ip] = budget
+		}
+		remaining := budget.remaining(time.Now())
 		if remaining <= 0 {
-			m.addrCountMu.Unlock()
-			logging.L.Debug("addr rate limit exceeded, ignoring", "component", "p2p", "peer", peerAddr, "total_received", received)
+			m.addrBudgetMu.Unlock()
+			logging.L.Debug("addr rate limit exceeded, ignoring", "component", "p2p", "ip", ip, "budget_used", budget.count)
 			return
 		}
 		addrs := addr.Addresses
 		if len(addrs) > remaining {
 			addrs = addrs[:remaining]
 		}
-		m.addrCountPerPeer[peerAddr] = received + len(addrs)
-		m.addrCountMu.Unlock()
+		budget.consume(len(addrs))
+		m.addrBudgetMu.Unlock()
 
+		maxPeers := int(m.params.PeerStoreMaxSize)
 		localLB := m.isLocalLoopback()
 		for _, a := range addrs {
-			if !m.IsBanned(a) && a != m.listenAddr && validateGossipAddress(a, localLB) == nil {
-				m.peerStore.PutPeer(a)
+			if m.IsBanned(a) || a == m.listenAddr || validateGossipAddress(a, localLB) != nil {
+				continue
 			}
+			if _, portStr, err := net.SplitHostPort(a); err == nil {
+				if port, _ := strconv.Atoi(portStr); !isLikelyListenPort(port, m.params.DefaultPort) {
+					continue
+				}
+			}
+			m.peerStore.PutPeerBounded(a, maxPeers)
 		}
 
 	case protocol.CmdGetAddr:
@@ -1712,7 +1813,7 @@ func (m *Manager) handleGetData(peer *Peer, getData *protocol.GetDataMsg) {
 			if err != nil {
 				continue
 			}
-			peer.SendMessage(protocol.CmdBlock, blockBytes)
+			peer.SendCritical(protocol.CmdBlock, blockBytes)
 			sentBlocks++
 
 		case protocol.InvTypeTx:
@@ -2069,15 +2170,16 @@ func (m *Manager) handleGetAddr(peer *Peer) {
 }
 
 // gatherAddresses collects up to limit known peer addresses for addr relay.
-// Prefers advertised listen addresses (AddrFrom) over ephemeral connection
-// addresses, matching Bitcoin Core's behavior of gossiping reachable addrs.
+// Only includes addresses with plausible listen ports. For inbound peers
+// without AddrFrom, the connection address is an ephemeral port and is
+// excluded — matching Bitcoin Core's behavior of only gossiping reachable addrs.
 func (m *Manager) gatherAddresses(limit int) []string {
 	m.mu.RLock()
 	connected := make([]string, 0, len(m.peers))
 	for _, p := range m.peers {
 		if v := p.Version(); v != nil && v.AddrFrom != "" {
 			connected = append(connected, v.AddrFrom)
-		} else {
+		} else if !p.IsInbound() {
 			connected = append(connected, p.Addr())
 		}
 	}
@@ -2088,31 +2190,32 @@ func (m *Manager) gatherAddresses(limit int) []string {
 	seen := make(map[string]struct{})
 	var addrs []string
 
-	for _, addr := range connected {
+	addIfValid := func(addr string) bool {
 		if addr == m.listenAddr {
-			continue
+			return false
 		}
 		if _, ok := seen[addr]; ok {
-			continue
+			return false
+		}
+		if _, portStr, err := net.SplitHostPort(addr); err == nil {
+			if port, _ := strconv.Atoi(portStr); !isLikelyListenPort(port, m.params.DefaultPort) {
+				return false
+			}
 		}
 		seen[addr] = struct{}{}
 		addrs = append(addrs, addr)
-		if len(addrs) >= limit {
+		return len(addrs) >= limit
+	}
+
+	for _, addr := range connected {
+		if addIfValid(addr) {
 			shuffleStrings(addrs)
 			return addrs
 		}
 	}
 
 	for _, addr := range stored {
-		if addr == m.listenAddr {
-			continue
-		}
-		if _, ok := seen[addr]; ok {
-			continue
-		}
-		seen[addr] = struct{}{}
-		addrs = append(addrs, addr)
-		if len(addrs) >= limit {
+		if addIfValid(addr) {
 			shuffleStrings(addrs)
 			return addrs
 		}
@@ -3703,6 +3806,38 @@ func (m *Manager) mempoolExpiryLoop(ctx context.Context) {
 					"expired", expired,
 					"remaining", m.mempool.Count())
 			}
+		}
+	}
+}
+
+// peerStorePruneLoop periodically removes stale peer addresses from the
+// persistent store. Entries older than peerStorePruneAge (7 days) are evicted.
+// Also garbage-collects expired entries from the in-memory addr budget map.
+func (m *Manager) peerStorePruneLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-peerStorePruneAge).Unix()
+			removed, err := m.peerStore.PruneOlderThan(cutoff)
+			if err != nil {
+				logging.L.Warn("peer store prune failed", "component", "p2p", "error", err)
+			} else if removed > 0 {
+				logging.L.Info("pruned stale peer addresses", "component", "p2p", "removed", removed)
+			}
+
+			// GC expired addr budget entries to prevent unbounded memory growth.
+			m.addrBudgetMu.Lock()
+			now := time.Now()
+			for ip, b := range m.addrBudgetPerIP {
+				if now.Sub(b.windowStart) >= addrBudgetWindow {
+					delete(m.addrBudgetPerIP, ip)
+				}
+			}
+			m.addrBudgetMu.Unlock()
 		}
 	}
 }

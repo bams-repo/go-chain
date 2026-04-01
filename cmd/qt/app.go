@@ -48,10 +48,21 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.startupTime = time.Now()
 
-	logging.Init("info", "text")
+	logLevel := "info"
+	if v := os.Getenv("FAIRCHAIN_DEBUG"); v == "1" || v == "true" || strings.EqualFold(v, "yes") {
+		logLevel = "debug"
+	}
+	logging.Init(logLevel, "text")
+	if logLevel == "debug" {
+		logging.EnableDebug()
+	}
 
 	cfg := config.DefaultConfig()
 	cfg.Network = networkForBuild()
+
+	if d := strings.TrimSpace(os.Getenv("FAIRCHAIN_DATADIR")); d != "" {
+		cfg.DataDir = d
+	}
 
 	if netParams := params.NetworkByName(cfg.Network); netParams != nil {
 		cfg.ListenAddr = fmt.Sprintf("0.0.0.0:%d", netParams.DefaultPort)

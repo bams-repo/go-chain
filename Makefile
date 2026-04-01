@@ -76,6 +76,8 @@ genesis:
 
 adversary:
 	$(GO) build -o $(BINDIR)/$(ADVERSARY_NAME) ./cmd/adversary
+	$(GO) build -o $(BINDIR)/$(ADVERSARY_NAME)2 ./cmd/adversary2
+	$(GO) build -o $(BINDIR)/$(ADVERSARY_NAME)3 ./cmd/adversary3
 
 # --- Vendored dependencies (fetched on demand) ---
 deps:

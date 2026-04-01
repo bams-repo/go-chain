@@ -53,6 +53,14 @@ type ChainParams struct {
 	// Reorg safety
 	MaxReorgDepth uint32 // Maximum number of blocks that can be disconnected in a single reorg. 0 = unlimited.
 
+	// BIP-94 timewarp prevention: at retarget boundaries, the new block's
+	// timestamp must not be more than TimewarpGracePeriod before the parent's
+	// timestamp. Gated by ActivationHeights["timewarp"].
+	TimewarpGracePeriod time.Duration
+
+	// P2P peer store
+	PeerStoreMaxSize uint32 // Maximum addresses in the persistent peer store. 0 = unlimited.
+
 	// Mempool policy (non-consensus, but parameterized per network)
 	MaxMempoolSize      uint32        // Maximum number of transactions in mempool.
 	MinRelayTxFee       uint64        // Minimum absolute fee for mempool admission (smallest units).

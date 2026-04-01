@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/types"
@@ -207,15 +208,19 @@ func TestFileStoreNonExistent(t *testing.T) {
 	}
 }
 
-func TestBoltStorePeers(t *testing.T) {
+func newTestBoltStore(t *testing.T) *BoltStore {
+	t.Helper()
 	dir := t.TempDir()
-	dbPath := dir + "/test.db"
-
-	s, err := NewBoltStore(dbPath)
+	s, err := NewBoltStore(dir + "/test.db")
 	if err != nil {
 		t.Fatalf("NewBoltStore: %v", err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestBoltStorePeers(t *testing.T) {
+	s := newTestBoltStore(t)
 
 	if err := s.PutPeer("127.0.0.1:19333"); err != nil {
 		t.Fatalf("PutPeer: %v", err)
@@ -242,5 +247,122 @@ func TestBoltStorePeers(t *testing.T) {
 	}
 	if len(peers) != 1 {
 		t.Fatalf("peer count after remove = %d, want 1", len(peers))
+	}
+}
+
+func TestBoltStorePeerCount(t *testing.T) {
+	s := newTestBoltStore(t)
+
+	count, err := s.PeerCount()
+	if err != nil {
+		t.Fatalf("PeerCount: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("initial count = %d, want 0", count)
+	}
+
+	s.PutPeer("10.0.0.1:19333")
+	s.PutPeer("10.0.0.2:19333")
+	s.PutPeer("10.0.0.3:19333")
+
+	count, err = s.PeerCount()
+	if err != nil {
+		t.Fatalf("PeerCount: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("count = %d, want 3", count)
+	}
+}
+
+func TestBoltStorePutPeerBounded_EvictsOldest(t *testing.T) {
+	s := newTestBoltStore(t)
+
+	// Insert 3 peers with PutPeer (which stores current timestamp).
+	s.PutPeer("10.0.0.1:19333")
+	s.PutPeer("10.0.0.2:19333")
+	s.PutPeer("10.0.0.3:19333")
+
+	count, _ := s.PeerCount()
+	if count != 3 {
+		t.Fatalf("count = %d, want 3", count)
+	}
+
+	// Insert a 4th peer with maxSize=3 -- should evict the oldest.
+	if err := s.PutPeerBounded("10.0.0.4:19333", 3); err != nil {
+		t.Fatalf("PutPeerBounded: %v", err)
+	}
+
+	count, _ = s.PeerCount()
+	if count != 3 {
+		t.Fatalf("count after bounded insert = %d, want 3", count)
+	}
+
+	peers, _ := s.GetPeers()
+	peerSet := make(map[string]bool)
+	for _, p := range peers {
+		peerSet[p] = true
+	}
+
+	if !peerSet["10.0.0.4:19333"] {
+		t.Fatal("new peer should be present")
+	}
+}
+
+func TestBoltStorePutPeerBounded_UpdateExisting(t *testing.T) {
+	s := newTestBoltStore(t)
+
+	s.PutPeer("10.0.0.1:19333")
+	s.PutPeer("10.0.0.2:19333")
+
+	// Re-inserting an existing peer should not increase count.
+	if err := s.PutPeerBounded("10.0.0.1:19333", 2); err != nil {
+		t.Fatalf("PutPeerBounded: %v", err)
+	}
+
+	count, _ := s.PeerCount()
+	if count != 2 {
+		t.Fatalf("count = %d, want 2 (no new entry for existing peer)", count)
+	}
+}
+
+func TestBoltStorePruneOlderThan(t *testing.T) {
+	s := newTestBoltStore(t)
+
+	// Insert peers with PutPeer (current timestamp).
+	s.PutPeer("10.0.0.1:19333")
+	s.PutPeer("10.0.0.2:19333")
+
+	// Prune with a cutoff in the far future -- should remove all.
+	removed, err := s.PruneOlderThan(time.Now().Unix() + 86400)
+	if err != nil {
+		t.Fatalf("PruneOlderThan: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+
+	count, _ := s.PeerCount()
+	if count != 0 {
+		t.Fatalf("count after prune = %d, want 0", count)
+	}
+}
+
+func TestBoltStorePruneOlderThan_KeepsRecent(t *testing.T) {
+	s := newTestBoltStore(t)
+
+	s.PutPeer("10.0.0.1:19333")
+
+	// Prune with a cutoff in the past -- should keep all.
+	removed, err := s.PruneOlderThan(time.Now().Unix() - 86400)
+	if err != nil {
+		t.Fatalf("PruneOlderThan: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0 (peer is recent)", removed)
+	}
+
+	count, _ := s.PeerCount()
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
 	}
 }

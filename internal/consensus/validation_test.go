@@ -7,7 +7,9 @@
 package consensus
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/params"
@@ -160,6 +162,131 @@ func TestSubsidySchedule(t *testing.T) {
 	s300 := p.CalcSubsidy(300)
 	if s300 != p.InitialSubsidy/4 {
 		t.Fatalf("subsidy at height 300 = %d, want %d", s300, p.InitialSubsidy/4)
+	}
+}
+
+// --- BIP-94 timewarp prevention tests ---
+//
+// These tests use "median-11" (matching mainnet/testnet) and construct
+// ancestor headers so the MTP is low enough to allow the block timestamp
+// to pass the MTP check, isolating the timewarp rule.
+
+func timewarpAncestors(parentTS uint32) func(uint32) *types.BlockHeader {
+	// Build 20 headers where most timestamps are very old (low), but the
+	// parent (height 19) has a high timestamp. This simulates the timewarp
+	// scenario: an attacker mines many blocks with compressed timestamps,
+	// then sets a high timestamp on the last block of the epoch.
+	//
+	// MTP at tipHeight=19 is the median of heights 9..19 (11 blocks).
+	// We set heights 0..18 to very old timestamps so MTP is low,
+	// and height 19 (parent) to parentTS.
+	headers := make(map[uint32]*types.BlockHeader)
+	baseTS := parentTS - 50000
+	for i := uint32(0); i < 19; i++ {
+		headers[i] = &types.BlockHeader{Timestamp: baseTS + i*10}
+	}
+	headers[19] = &types.BlockHeader{Timestamp: parentTS}
+	return func(h uint32) *types.BlockHeader { return headers[h] }
+}
+
+func TestTimewarpRejectedAtRetargetBoundary(t *testing.T) {
+	p := &params.ChainParams{
+		RetargetInterval:    20,
+		MaxTimeFutureDrift:  2 * time.Hour,
+		MinTimestampRule:    "median-11",
+		TimewarpGracePeriod: 10 * time.Minute,
+		ActivationHeights:   map[string]uint32{"timewarp": 1},
+	}
+
+	parentTS := uint32(1700002000)
+	parent := &types.BlockHeader{Timestamp: parentTS}
+	getAncestor := timewarpAncestors(parentTS)
+
+	header := &types.BlockHeader{
+		// 700 seconds before parent -- exceeds 600s grace
+		Timestamp: parentTS - 700,
+	}
+
+	// Height 20 is a retarget boundary (20 % 20 == 0), tipHeight=19.
+	err := ValidateHeaderTimestamp(header, parent, 20, uint32(1700003000), getAncestor, 19, p)
+	if err == nil {
+		t.Fatal("should reject timewarp at retarget boundary")
+	}
+	if !strings.Contains(err.Error(), "timewarp rejected") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestTimewarpAcceptedWithinGrace(t *testing.T) {
+	p := &params.ChainParams{
+		RetargetInterval:    20,
+		MaxTimeFutureDrift:  2 * time.Hour,
+		MinTimestampRule:    "median-11",
+		TimewarpGracePeriod: 10 * time.Minute,
+		ActivationHeights:   map[string]uint32{"timewarp": 1},
+	}
+
+	parentTS := uint32(1700002000)
+	parent := &types.BlockHeader{Timestamp: parentTS}
+	getAncestor := timewarpAncestors(parentTS)
+
+	header := &types.BlockHeader{
+		// 500 seconds before parent -- within 600s grace
+		Timestamp: parentTS - 500,
+	}
+
+	err := ValidateHeaderTimestamp(header, parent, 20, uint32(1700003000), getAncestor, 19, p)
+	if err != nil {
+		t.Fatalf("should accept timestamp within grace period: %v", err)
+	}
+}
+
+func TestTimewarpNotEnforcedBeforeActivation(t *testing.T) {
+	p := &params.ChainParams{
+		RetargetInterval:    20,
+		MaxTimeFutureDrift:  2 * time.Hour,
+		MinTimestampRule:    "median-11",
+		TimewarpGracePeriod: 10 * time.Minute,
+		ActivationHeights:   map[string]uint32{"timewarp": 12000},
+	}
+
+	parentTS := uint32(1700002000)
+	parent := &types.BlockHeader{Timestamp: parentTS}
+	getAncestor := timewarpAncestors(parentTS)
+
+	header := &types.BlockHeader{
+		// Way before parent -- would be rejected if timewarp active
+		Timestamp: parentTS - 2000,
+	}
+
+	// Height 20 is below activation height 12000.
+	err := ValidateHeaderTimestamp(header, parent, 20, uint32(1700003000), getAncestor, 19, p)
+	if err != nil {
+		t.Fatalf("should not enforce timewarp before activation: %v", err)
+	}
+}
+
+func TestTimewarpNotEnforcedOffBoundary(t *testing.T) {
+	p := &params.ChainParams{
+		RetargetInterval:    20,
+		MaxTimeFutureDrift:  2 * time.Hour,
+		MinTimestampRule:    "median-11",
+		TimewarpGracePeriod: 10 * time.Minute,
+		ActivationHeights:   map[string]uint32{"timewarp": 1},
+	}
+
+	parentTS := uint32(1700002000)
+	parent := &types.BlockHeader{Timestamp: parentTS}
+	getAncestor := timewarpAncestors(parentTS)
+
+	header := &types.BlockHeader{
+		Timestamp: parentTS + 1,
+	}
+
+	// Height 15 is NOT a retarget boundary (15 % 20 != 0).
+	err := ValidateHeaderTimestamp(header, parent, 15, uint32(1700003000), getAncestor, 14, p)
+	if err != nil {
+		t.Fatalf("should not enforce timewarp off retarget boundary: %v", err)
 	}
 }
 

@@ -67,11 +67,22 @@ type PeerStore interface {
 	// GetPeers returns known peer addresses.
 	GetPeers() ([]string, error)
 
-	// PutPeer stores a peer address.
+	// PutPeer stores a peer address (updates last-seen timestamp if exists).
 	PutPeer(addr string) error
+
+	// PutPeerBounded stores a peer address, evicting the oldest entry if the
+	// store exceeds maxSize. Pass maxSize <= 0 for unlimited.
+	PutPeerBounded(addr string, maxSize int) error
 
 	// RemovePeer removes a peer address.
 	RemovePeer(addr string) error
+
+	// PeerCount returns the number of stored peer addresses.
+	PeerCount() (int, error)
+
+	// PruneOlderThan removes peer entries whose last-seen timestamp is older
+	// than the given Unix timestamp. Returns the number of entries removed.
+	PruneOlderThan(beforeUnix int64) (int, error)
 
 	// Close releases storage resources.
 	Close() error

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/types"
 	bolt "go.etcd.io/bbolt"
@@ -69,6 +70,23 @@ func (s *BoltStore) Close() error {
 }
 
 // PeerStore methods
+//
+// Values are 8-byte little-endian Unix timestamps (last-seen time).
+// Legacy entries with value []byte{1} are treated as timestamp 0 and
+// upgraded on next PutPeer.
+
+func peerTimestamp(v []byte) int64 {
+	if len(v) == 8 {
+		return int64(binary.LittleEndian.Uint64(v))
+	}
+	return 0
+}
+
+func peerTimestampBytes(ts int64) []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, uint64(ts))
+	return b
+}
 
 func (s *BoltStore) GetPeers() ([]string, error) {
 	var peers []string
@@ -84,7 +102,48 @@ func (s *BoltStore) GetPeers() ([]string, error) {
 
 func (s *BoltStore) PutPeer(addr string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(peersBucket).Put([]byte(addr), []byte{1})
+		return tx.Bucket(peersBucket).Put([]byte(addr), peerTimestampBytes(time.Now().Unix()))
+	})
+}
+
+func (s *BoltStore) PutPeerBounded(addr string, maxSize int) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(peersBucket)
+		now := peerTimestampBytes(time.Now().Unix())
+		key := []byte(addr)
+
+		// If the entry already exists, just update its timestamp.
+		if b.Get(key) != nil {
+			return b.Put(key, now)
+		}
+
+		if maxSize <= 0 {
+			return b.Put(key, now)
+		}
+
+		// Count entries; if at capacity, evict the oldest.
+		count := 0
+		var oldestKey []byte
+		var oldestTS int64 = 1<<63 - 1
+		if err := b.ForEach(func(k, v []byte) error {
+			count++
+			ts := peerTimestamp(v)
+			if ts < oldestTS {
+				oldestTS = ts
+				oldestKey = append(oldestKey[:0], k...)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		if count >= maxSize && oldestKey != nil {
+			if err := b.Delete(oldestKey); err != nil {
+				return err
+			}
+		}
+
+		return b.Put(key, now)
 	})
 }
 
@@ -92,6 +151,40 @@ func (s *BoltStore) RemovePeer(addr string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(peersBucket).Delete([]byte(addr))
 	})
+}
+
+func (s *BoltStore) PeerCount() (int, error) {
+	var count int
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(peersBucket)
+		count = b.Stats().KeyN
+		return nil
+	})
+	return count, err
+}
+
+func (s *BoltStore) PruneOlderThan(beforeUnix int64) (int, error) {
+	removed := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(peersBucket)
+		var toDelete [][]byte
+		if err := b.ForEach(func(k, v []byte) error {
+			if peerTimestamp(v) < beforeUnix {
+				toDelete = append(toDelete, append([]byte(nil), k...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range toDelete {
+			if err := b.Delete(k); err != nil {
+				return err
+			}
+			removed++
+		}
+		return nil
+	})
+	return removed, err
 }
 
 // Legacy block storage methods (used by migration tool).

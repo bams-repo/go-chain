@@ -12,6 +12,8 @@ resources/sha256mem-c/test_sha256mem
 bin/
 /node
 /adversary
+/adversary2
+/adversary3
 /genesis
 /qt
 *.exe

@@ -71,7 +71,7 @@ func DefaultConfig() *Config {
 		ListenAddr:    "0.0.0.0:19444",
 		RPCAddr:       "127.0.0.1:19445",
 		SeedPeers:     []string{},
-		MaxInbound:    25,
+		MaxInbound:    125,
 		MaxOutbound:   8,
 		MiningEnabled: false,
 		MiningAddr:    "",

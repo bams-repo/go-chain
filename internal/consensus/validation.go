@@ -125,14 +125,19 @@ func FullValidateHeader(e Engine, header *types.BlockHeader, parent *types.Block
 	if err := e.ValidateHeader(header, parent, height, getAncestor, p); err != nil {
 		return err
 	}
-	return ValidateHeaderTimestamp(header, parent, nowUnix, getAncestor, tipHeight, p)
+	return ValidateHeaderTimestamp(header, parent, height, nowUnix, getAncestor, tipHeight, p)
 }
 
 // ValidateHeaderTimestamp checks the block timestamp against basic rules.
 // For "prev+1": timestamp must be strictly greater than parent.
 // For "median-11": timestamp must be greater than the median of the last 11 blocks.
 // In both cases, timestamp must not be more than MaxTimeFutureDrift ahead of the provided "now".
-func ValidateHeaderTimestamp(header *types.BlockHeader, parent *types.BlockHeader, nowUnix uint32, getAncestor func(height uint32) *types.BlockHeader, tipHeight uint32, p *params.ChainParams) error {
+//
+// BIP-94 timewarp prevention: at retarget boundaries (height % RetargetInterval == 0),
+// the block's timestamp must not be more than TimewarpGracePeriod before the parent's
+// timestamp. This prevents an attacker from resetting timestamps at epoch boundaries
+// to compress the retarget window and inflate difficulty.
+func ValidateHeaderTimestamp(header *types.BlockHeader, parent *types.BlockHeader, height uint32, nowUnix uint32, getAncestor func(height uint32) *types.BlockHeader, tipHeight uint32, p *params.ChainParams) error {
 	maxFuture := int64(nowUnix) + int64(p.MaxTimeFutureDrift/time.Second)
 	if int64(header.Timestamp) > maxFuture {
 		return fmt.Errorf("block timestamp %d too far in future (max %d)", header.Timestamp, maxFuture)
@@ -150,6 +155,18 @@ func ValidateHeaderTimestamp(header *types.BlockHeader, parent *types.BlockHeade
 		}
 	default:
 		return fmt.Errorf("unknown timestamp rule: %s", p.MinTimestampRule)
+	}
+
+	// BIP-94 timewarp prevention, gated by activation height.
+	if twHeight, ok := p.ActivationHeights["timewarp"]; ok && height >= twHeight {
+		if p.RetargetInterval > 0 && height%p.RetargetInterval == 0 && p.TimewarpGracePeriod > 0 {
+			graceSeconds := uint32(p.TimewarpGracePeriod / time.Second)
+			minTS := int64(parent.Timestamp) - int64(graceSeconds)
+			if int64(header.Timestamp) < minTS {
+				return fmt.Errorf("timewarp rejected: block timestamp %d is more than %ds before parent %d at retarget boundary (height %d)",
+					header.Timestamp, graceSeconds, parent.Timestamp, height)
+			}
+		}
 	}
 
 	return nil

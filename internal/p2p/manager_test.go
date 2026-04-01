@@ -8,6 +8,7 @@ package p2p
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/types"
 )
@@ -131,5 +132,75 @@ func TestSeenBlocksAddOrHasIdempotent(t *testing.T) {
 	}
 	if !set.AddOrHas(h) {
 		t.Fatal("second AddOrHas should return true (already present)")
+	}
+}
+
+// --- Per-IP addr budget tests ---
+
+func TestAddrBudget_InitialRemaining(t *testing.T) {
+	b := &addrBudget{windowStart: time.Now()}
+	r := b.remaining(time.Now())
+	if r != addrBudgetMax {
+		t.Fatalf("initial remaining = %d, want %d", r, addrBudgetMax)
+	}
+}
+
+func TestAddrBudget_ConsumeReducesRemaining(t *testing.T) {
+	b := &addrBudget{windowStart: time.Now()}
+	b.consume(300)
+	r := b.remaining(time.Now())
+	if r != addrBudgetMax-300 {
+		t.Fatalf("remaining after consume(300) = %d, want %d", r, addrBudgetMax-300)
+	}
+}
+
+func TestAddrBudget_ExhaustedReturnsZero(t *testing.T) {
+	b := &addrBudget{windowStart: time.Now()}
+	b.consume(addrBudgetMax)
+	r := b.remaining(time.Now())
+	if r != 0 {
+		t.Fatalf("remaining after full consume = %d, want 0", r)
+	}
+}
+
+func TestAddrBudget_ResetsAfterWindow(t *testing.T) {
+	start := time.Now().Add(-addrBudgetWindow - time.Second)
+	b := &addrBudget{count: addrBudgetMax, windowStart: start}
+
+	r := b.remaining(time.Now())
+	if r != addrBudgetMax {
+		t.Fatalf("remaining after window expiry = %d, want %d (budget should reset)", r, addrBudgetMax)
+	}
+	if b.count != 0 {
+		t.Fatalf("count should be reset to 0, got %d", b.count)
+	}
+}
+
+func TestAddrBudget_DoesNotResetWithinWindow(t *testing.T) {
+	start := time.Now().Add(-addrBudgetWindow + time.Hour)
+	b := &addrBudget{count: 500, windowStart: start}
+
+	r := b.remaining(time.Now())
+	if r != addrBudgetMax-500 {
+		t.Fatalf("remaining within window = %d, want %d", r, addrBudgetMax-500)
+	}
+}
+
+func TestAddrBudget_PersistsAcrossSimulatedReconnect(t *testing.T) {
+	budgets := make(map[string]*addrBudget)
+
+	ip := "192.168.1.100"
+	budgets[ip] = &addrBudget{windowStart: time.Now()}
+	budgets[ip].consume(800)
+
+	// Simulate disconnect -- budget is NOT deleted (unlike old per-peer map).
+	// Simulate reconnect -- same IP, different port.
+	b, ok := budgets[ip]
+	if !ok {
+		t.Fatal("budget should persist after simulated disconnect")
+	}
+	r := b.remaining(time.Now())
+	if r != addrBudgetMax-800 {
+		t.Fatalf("remaining after reconnect = %d, want %d (budget must persist)", r, addrBudgetMax-800)
 	}
 }

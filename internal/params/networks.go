@@ -106,6 +106,9 @@ var Mainnet = &ChainParams{
 
 	MaxReorgDepth: 288,
 
+	TimewarpGracePeriod: 10 * time.Minute, // BIP-94: 600 seconds (one block spacing on mainnet)
+	PeerStoreMaxSize:    4096,
+
 	MaxMempoolSize:    5000,
 	MinRelayTxFee:     1000,
 	MinRelayTxFeeRate: 1, // 1 sat/byte minimum, matching Bitcoin Core's default
@@ -118,7 +121,10 @@ var Mainnet = &ChainParams{
 		"45.63.16.42:19333",    
 	},
 
-	ActivationHeights: map[string]uint32{"locktime": 1},
+	ActivationHeights: map[string]uint32{
+		"locktime": 1,
+		"timewarp": 1,
+	},
 }
 
 // Testnet is the public test network with easier difficulty.
@@ -202,6 +208,9 @@ var Testnet = &ChainParams{
 
 	MaxReorgDepth: 1000,
 
+	TimewarpGracePeriod: 10 * time.Minute, // BIP-94: generous for 5s blocks but prevents extreme manipulation
+	PeerStoreMaxSize:    1024,
+
 	MaxMempoolSize:    5000,
 	MinRelayTxFee:     100,
 	MinRelayTxFeeRate: 1, // 1 sat/byte minimum
@@ -215,6 +224,7 @@ var Testnet = &ChainParams{
 	ActivationHeights: map[string]uint32{
 		"locktime":      1,
 		"mindiffblocks": 15_000,
+		"timewarp":      12_000,
 	},
 }
 
@@ -247,6 +257,9 @@ var Regtest = &ChainParams{
 
 	MaxReorgDepth: 0,
 
+	TimewarpGracePeriod: 10 * time.Minute,
+	PeerStoreMaxSize:    512,
+
 	MaxMempoolSize:    10000,
 	MinRelayTxFee:     0,
 	MinRelayTxFeeRate: 0, // No fee-rate requirement on regtest
@@ -254,7 +267,10 @@ var Regtest = &ChainParams{
 
 	SeedNodes: []string{},
 
-	ActivationHeights: map[string]uint32{"locktime": 1},
+	ActivationHeights: map[string]uint32{
+		"locktime": 1,
+		"timewarp": 1,
+	},
 }
 
 // NetworkByName returns chain params by network name.

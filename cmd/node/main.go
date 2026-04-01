@@ -36,6 +36,8 @@ func main() {
 	addNode := flag.String("addnode", "", "Add a peer to connect to (ip:port)")
 	seedPeers := flag.String("seed-peers", "", "Comma-separated seed peer addresses (ip:port,ip:port)")
 	connectPeers := flag.String("connect", "", "Connect ONLY to these peers (ip:port,ip:port) — disables all discovery")
+	maxInbound := flag.Int("maxinbound", 0, "Maximum inbound peer connections (0 = use config/default)")
+	maxOutbound := flag.Int("maxoutbound", 0, "Maximum outbound peer connections (0 = use config/default)")
 	noSeedNodes := flag.Bool("noseednode", false, "Suppress hardcoded seed nodes from chain params")
 	logLevel := flag.String("log-level", "info", "Log level: debug, info, warn, error")
 	logFormat := flag.String("log-format", "text", "Log format: text or json")
@@ -126,6 +128,12 @@ func main() {
 	}
 	if *seedPeers != "" {
 		cfg.SeedPeers = append(cfg.SeedPeers, strings.Split(*seedPeers, ",")...)
+	}
+	if *maxInbound > 0 {
+		cfg.MaxInbound = *maxInbound
+	}
+	if *maxOutbound > 0 {
+		cfg.MaxOutbound = *maxOutbound
 	}
 
 	// --- Handle migration (exits after completion) ---
