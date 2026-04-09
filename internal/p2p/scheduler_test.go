@@ -188,7 +188,15 @@ func TestSchedulerDrainReady(t *testing.T) {
 	}
 
 	_ = idx
-	ready := sched.DrainReady()
+	var ready []stagedBlock
+	for i := 0; i < 5; i++ {
+		batch := sched.DrainReady()
+		if len(batch) != 1 {
+			t.Fatalf("iteration %d: expected 1 ready block, got %d", i, len(batch))
+		}
+		ready = append(ready, batch[0])
+		sched.UpdateNextConnectHeight(uint32(i + 1))
+	}
 	if len(ready) != 5 {
 		t.Fatalf("expected 5 ready blocks, got %d", len(ready))
 	}
@@ -218,8 +226,18 @@ func TestSchedulerDrainReadyGap(t *testing.T) {
 		sched.BlockReceived(h, block, "peer1")
 	}
 
-	ready := sched.DrainReady()
-	// Should only get blocks 0 and 1 (stops at gap).
+	var ready []stagedBlock
+	for i := 0; i < 2; i++ {
+		batch := sched.DrainReady()
+		if len(batch) != 1 {
+			t.Fatalf("iteration %d: expected 1 ready block (gap at height 3), got %d", i, len(batch))
+		}
+		ready = append(ready, batch[0])
+		sched.UpdateNextConnectHeight(uint32(i + 1))
+	}
+	if empty := sched.DrainReady(); len(empty) != 0 {
+		t.Fatalf("expected no block at gap, got %d", len(empty))
+	}
 	if len(ready) != 2 {
 		t.Fatalf("expected 2 ready blocks (gap at 2), got %d", len(ready))
 	}
@@ -329,10 +347,13 @@ func TestSchedulerComplete(t *testing.T) {
 		sched.BlockReceived(h, block, "peer1")
 	}
 
-	// Drain all ready blocks.
-	ready := sched.DrainReady()
-	if len(ready) != 3 {
-		t.Fatalf("expected 3 ready, got %d", len(ready))
+	// Drain all ready blocks (one validated step at a time).
+	for i := 0; i < 3; i++ {
+		batch := sched.DrainReady()
+		if len(batch) != 1 {
+			t.Fatalf("iteration %d: expected 1 ready, got %d", i, len(batch))
+		}
+		sched.UpdateNextConnectHeight(uint32(i + 1))
 	}
 
 	if !sched.IsComplete() {

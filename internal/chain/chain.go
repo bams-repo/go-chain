@@ -501,6 +501,16 @@ func (c *Chain) BlockLocator() []types.Hash {
 	return locator
 }
 
+// MainChainHashAtHeight returns the block hash at the given height on the
+// active main chain. Returns (hash, true) if the height exists, or
+// (ZeroHash, false) if not.
+func (c *Chain) MainChainHashAtHeight(height uint32) (types.Hash, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	hash, ok := c.hashByHeight[height]
+	return hash, ok
+}
+
 // FindMainChainHash checks if a hash is on the active main chain and returns
 // its height. Returns (height, true) if found, (0, false) otherwise.
 func (c *Chain) FindMainChainHash(hash types.Hash) (uint32, bool) {
@@ -1288,6 +1298,19 @@ func (c *Chain) OrphanCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.orphans)
+}
+
+// ClearOrphanBlocks removes every block from the orphan pool. Used when the P2P
+// layer discards speculative download state and re-requests blocks in order
+// (analogous to dropping invalid download state in Bitcoin Core rather than
+// letting stale orphans steer getdata).
+func (c *Chain) ClearOrphanBlocks() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(c.orphans)
+	clear(c.orphans)
+	c.orphans = make(map[types.Hash]*orphanBlock)
+	return n
 }
 
 // evictOldestOrphan removes the oldest orphan (by arrival time) to make room

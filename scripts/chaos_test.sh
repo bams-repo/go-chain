@@ -287,7 +287,7 @@ cleanup() {
     echo "finished:   $(portable_date_iso)" >> "${RUN_DIR}/meta.txt"
     echo "exit_code:  ${FAILURES}" >> "${RUN_DIR}/meta.txt"
     log "Run data preserved in: ${RUN_DIR}"
-    log "  Node data:  ${BASEDIR}/node*/  (data dirs + stdout.log per node)"
+    log "  Node data:  ${BASEDIR}/node*/  (data dirs + stdout.log + rotated logs per node)"
     log "  Script log: ${RUN_LOG}"
     log "  Metadata:   ${RUN_DIR}/meta.txt"
     log "  Latest:     ${RUNS_ROOT}/latest -> run-${NEXT_RUN}"
@@ -358,6 +358,13 @@ start_node() {
         esac
     fi
 
+    # Rotate existing stdout.log so previous generation's output is preserved.
+    if [ -f "${datadir}/stdout.log" ] && [ -s "${datadir}/stdout.log" ]; then
+        local gen=${NODE_GEN[$idx]:-0}
+        mv "${datadir}/stdout.log" "${datadir}/stdout.log.${gen}"
+        NODE_GEN[$idx]=$((gen + 1))
+    fi
+
     "${cmd_prefix[@]}" "$BIN" \
         -network testnet \
         -datadir "$datadir" \
@@ -386,6 +393,24 @@ stop_node() {
     fi
 }
 
+# wipe_node_data removes a node's blockchain data while preserving logs.
+# Each restart rotates stdout.log → stdout.log.<gen> so every generation's
+# debug output survives for post-mortem analysis.
+declare -A NODE_GEN
+wipe_node_data() {
+    local idx=$1
+    local datadir="${BASEDIR}/node${idx}"
+    local gen=${NODE_GEN[$idx]:-0}
+
+    if [ -f "${datadir}/stdout.log" ]; then
+        mv "${datadir}/stdout.log" "${datadir}/stdout.log.${gen}"
+        NODE_GEN[$idx]=$((gen + 1))
+    fi
+
+    # Remove blockchain state but keep the node directory and rotated logs.
+    rm -rf "${datadir}/testnet0"
+}
+
 is_alive() {
     local idx=$1
     [ -n "${PIDS[$idx]:-}" ] && kill -0 "${PIDS[$idx]}" 2>/dev/null
@@ -408,6 +433,10 @@ print_reorg_report() {
         local total_lines
         total_lines=$(wc -l < "$logfile" 2>/dev/null || echo 0)
 
+        if [ "$total_lines" -lt "$offset" ]; then
+            # Log was rotated (node restarted); reset offset to scan from the top.
+            offset=0
+        fi
         if [ "$total_lines" -le "$offset" ]; then
             REORG_OFFSETS[$i]=$total_lines
             continue
@@ -900,7 +929,7 @@ if ! should_skip "4"; then
 # ── Phase 4: Restart killed miners (fresh sync) ────────────
 header "Phase 4: Restart Killed Miners (fresh sync from seeds)"
 for i in "${PHASE3_VICTIMS[@]}"; do
-    rm -rf "${BASEDIR}/node${i}"
+    wipe_node_data "$i"
     start_node "$i" true
     portable_sleep 0.1
 done
@@ -927,7 +956,7 @@ fi
 if ! should_skip "6"; then
 # ── Phase 6: Restore seed 0, kill seed 1 ───────────────────
 header "Phase 6: Seed Swap — restore seed 0, kill seed 1"
-rm -rf "${BASEDIR}/node0"
+wipe_node_data 0
 start_node 0 false
 sleep 4
 stop_node 1
@@ -946,7 +975,7 @@ PHASE7_KILL_COUNT=$((NUM_MINERS * 6 / 10))
 PHASE7_VICTIMS=($(pick_random_miners $PHASE7_KILL_COUNT))
 PHASE7_SURVIVORS=$((NUM_MINERS - PHASE7_KILL_COUNT + NUM_SEEDS))
 header "Phase 7: Restore seed 1, kill $PHASE7_KILL_COUNT miners"
-rm -rf "${BASEDIR}/node1"
+wipe_node_data 1
 start_node 1 false
 sleep 3
 for i in "${PHASE7_VICTIMS[@]}"; do stop_node "$i"; done
@@ -964,7 +993,7 @@ if ! should_skip "8"; then
 # ── Phase 8: Restore all miners ────────────────────────────
 header "Phase 8: Restore all killed miners (fresh sync)"
 for i in "${PHASE7_VICTIMS[@]}"; do
-    rm -rf "${BASEDIR}/node${i}"
+    wipe_node_data "$i"
     start_node "$i" true
     portable_sleep 0.1
 done
@@ -984,7 +1013,7 @@ for round in $(seq 1 $PHASE9_ROUNDS); do
     stop_node "$victim"
     sleep 5
     log "  Round $round: restart miner $victim (fresh)"
-    rm -rf "${BASEDIR}/node${victim}"
+    wipe_node_data "$victim"
     start_node "$victim" true
     sleep 5
 done
@@ -1247,7 +1276,7 @@ for i in "${PART_A_MINERS[@]}"; do stop_node "$i"; done
 sleep 1
 
 for i in "${PART_B_MINERS[@]}"; do
-    rm -rf "${BASEDIR}/node${i}"
+    wipe_node_data "$i"
     start_node "$i" true
     portable_sleep 0.1
 done
@@ -1258,7 +1287,7 @@ PARTITION_B_HEIGHT=$(get_height "$((BASE_RPC_PORT + ${PART_B_MINERS[0]}))")
 log "  Partition B height: $PARTITION_B_HEIGHT"
 
 for i in "${PART_A_MINERS[@]}"; do
-    rm -rf "${BASEDIR}/node${i}"
+    wipe_node_data "$i"
     start_node "$i" true
     portable_sleep 0.1
 done
@@ -1489,7 +1518,7 @@ fi
 
 echo "────────────────────────────────────────────────────────────────────"
 echo " Run #${NEXT_RUN} data preserved in: ${RUN_DIR}"
-echo " Node logs: ${BASEDIR}/node*/stdout.log"
+echo " Node logs: ${BASEDIR}/node*/stdout.log (rotated: stdout.log.0, .1, …)"
 echo " Full log:  ${RUN_LOG}"
 echo "════════════════════════════════════════════════════════════════════"
 echo ""

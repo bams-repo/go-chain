@@ -65,7 +65,12 @@ type Manager struct {
 	backoff   map[string]time.Time
 	backoffN  map[string]int // consecutive failure count per addr
 
-	nextPeerID int32 // monotonically increasing peer ID counter
+	// When outbound slots are still free, retry hardcoded seeds on a short cadence
+	// even if dial backoff is active — otherwise small networks sit on one peer.
+	seedRetryMu   sync.Mutex
+	seedRetryNext map[string]time.Time
+
+	nextPeerID  int32               // monotonically increasing peer ID counter
 	manualPeers map[string]struct{} // addresses added via AddNode (for connection_type)
 
 	seenBlocks *boundedHashSet
@@ -84,29 +89,29 @@ type Manager struct {
 	addrBudgetMu    sync.Mutex
 
 	// Current sync peer — only this peer is exempt from rate limits during IBD.
-	syncPeerAddr    string
-	syncPeerAddrMu  sync.RWMutex
-	syncPeerSince   time.Time
-	lastSyncHeight  uint32
+	syncPeerAddr   string
+	syncPeerAddrMu sync.RWMutex
+	syncPeerSince  time.Time
+	lastSyncHeight uint32
 
 	// IBD block processing queue: decouples network I/O from block validation.
 	ibdBlockQueue chan *ibdBlockItem
 	ibdQueueDone  chan struct{}
 
 	// Header-first sync state machine (Tasks 3-7).
-	syncState       SyncState
-	syncStateMu     sync.RWMutex
+	syncState   SyncState
+	syncStateMu sync.RWMutex
 
-	headerSyncPeerAddr  string
-	headerSyncSince     time.Time
-	lastHeaderHeight    uint32
-	headerSyncStalls    int
-	headerSyncCaughtUp  bool
+	headerSyncPeerAddr string
+	headerSyncSince    time.Time
+	lastHeaderHeight   uint32
+	headerSyncStalls   int
+	headerSyncCaughtUp bool
 
 	// Rate-limited audit: blocks received during HEADER_SYNC are dropped on purpose.
-	headerSyncDropLogMu       sync.Mutex
+	headerSyncDropLogMu        sync.Mutex
 	lastHeaderSyncBlockDropLog time.Time
-	headerSyncBlocksDropped   uint64
+	headerSyncBlocksDropped    uint64
 
 	headerIndex    *chain.HeaderIndex
 	blockScheduler *BlockScheduler
@@ -114,17 +119,43 @@ type Manager struct {
 	blockSyncLastProgress time.Time
 	blockSyncLastHeight   uint32
 
+	// Block sync stall / orphan recovery (Bitcoin Core–style re-fetch from valid tip).
+	blockSyncRecoveriesSinceTip int // consecutive recoveries without chain tip advance
+	blockSyncOrphanFailHash     types.Hash
+	blockSyncOrphanFailCount    int
+	blockSyncOrphanFailSince    time.Time
+
 	// Fast sync: sequential block download from a single high-throughput peer.
 	// Eliminates the parallel scheduler's staging/ordering complexity for IBD.
-	fastSyncPeer       string       // addr of the peer serving fast sync
-	fastSyncNextHeight uint32       // next block height to request
-	fastSyncInFlight   int          // blocks requested but not yet received
-	fastSyncLastRecv   time.Time    // last time a block was received from fast sync peer
-	fastSyncFallback   bool         // true = fast sync failed, use parallel scheduler
+	fastSyncPeer       string    // addr of the peer serving fast sync
+	fastSyncNextHeight uint32    // next block height to request
+	fastSyncInFlight   int       // blocks requested but not yet received
+	fastSyncLastRecv   time.Time // last time a block was received from fast sync peer
+	fastSyncFallback   bool      // true = fast sync failed, use parallel scheduler
 
 	// Bitcoin Core parity: once IBD finishes, it latches and never reverts
 	// to true until the process restarts (m_cached_finished_ibd).
 	finishedIBD bool
+
+	// IBD recovery trigger: if we lose our best peer (or the current sync peer)
+	// mid-IBD, we immediately try seeds even if we still have some peers.
+	// This avoids getting stuck with only behind peers (common in small networks).
+	ibdRecoverMu         sync.Mutex
+	ibdRecoverUntil      time.Time
+	ibdRecoverLastReason string
+
+	// Legacy (v1) block download tracking: when we are in BLOCK_SYNC without
+	// a scheduler, we rely on getblocks -> inv -> getdata. We must keep a
+	// bounded "blocks in flight" window to avoid requesting only 1 block at
+	// a time near tip, and to avoid request spam loops.
+	legacyMu       sync.Mutex
+	legacyInFlight map[types.Hash]time.Time // hash -> request time
+
+	// Addresses detected as self-connections via nonce comparison during
+	// handshake. Keyed by host:port so future reconnect attempts skip them
+	// without wasting a TCP dial + handshake round-trip.
+	selfAddrsMu sync.RWMutex
+	selfAddrs   map[string]struct{}
 
 	ctx      context.Context
 	listener net.Listener
@@ -139,7 +170,7 @@ type ibdBlockItem struct {
 type SyncState int
 
 const (
-	SyncStateInitial    SyncState = iota
+	SyncStateInitial SyncState = iota
 	SyncStateHeaderSync
 	SyncStateBlockSync
 	SyncStateSynced
@@ -164,9 +195,11 @@ const (
 	maxSeenBlocks = 10000
 	maxSeenTxs    = 50000
 
-	// Reconnection backoff parameters.
+	// Reconnection backoff parameters. Bitcoin Core uses aggressive backoff
+	// but has many DNS seeds to fall back on. For a small network with few
+	// seeds, a 60-second cap prevents extended isolation.
 	backoffBase = 5 * time.Second
-	backoffMax  = 10 * time.Minute
+	backoffMax  = 60 * time.Second
 
 	// Peer store pruning: remove addresses not seen in this duration.
 	peerStorePruneAge = 7 * 24 * time.Hour
@@ -178,8 +211,16 @@ const (
 	// Header-first sync constants.
 	headerSyncStallTimeout = 30 * time.Second
 	blockSyncStallTimeout  = 15 * time.Second
-	maxStallsBeforeRotate  = 3
-	maxStallsBeforeBan     = 10
+	// After this many block-download recoveries without tip movement, poke seed
+	// reconnection (small network; Core has many DNS seeds — we escalate rarely).
+	maxBlockSyncRecoveriesBeforeIBDPoke = 5
+	// Repeated ProcessBlock orphan failures for the same block while on the
+	// header-validated main chain: clear orphan pool and reset scheduler
+	// (analogous to dropping bad mapBlocksInFlight state).
+	blockSyncOrphanRepeatWindow    = 40 * time.Second
+	blockSyncOrphanRepeatThreshold = 3
+	maxStallsBeforeRotate          = 3
+	maxStallsBeforeBan             = 10
 	maxHeadersPerPeer      = 100000
 
 	// Fast sync: request blocks in large sequential batches from one peer.
@@ -190,12 +231,18 @@ const (
 	fastSyncPipelineDepth = 2
 	fastSyncMaxInFlight   = fastSyncBatchSize * fastSyncPipelineDepth
 	fastSyncStallTimeout  = 15 * time.Second
+
+	// Legacy v1 sync: bound concurrent requested blocks so we request full
+	// remaining windows (including the final partial batch) without flooding.
+	legacyMaxInFlight         = 128
+	legacyInFlightTimeout     = 20 * time.Second
+	legacyGetBlocksMinSpacing = 250 * time.Millisecond
 )
 
 // addrBudget tracks how many addr entries an IP has injected within a
 // rolling time window. The budget resets after addrBudgetWindow elapses.
 type addrBudget struct {
-	count    int
+	count       int
 	windowStart time.Time
 }
 
@@ -304,21 +351,22 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 	headerIndex := c.NewHeaderIndex()
 
 	mgr := &Manager{
-		params:      p,
-		chain:       c,
-		mempool:     mp,
-		peerStore:   ps,
-		listenAddr:  listenAddr,
-		maxInbound:  maxIn,
-		maxOutbound: maxOut,
-		seedPeers:   seeds,
-		timeSampler: ts,
-		peers:       make(map[string]*Peer),
-		localNonce:  nonce,
-		manualPeers: make(map[string]struct{}),
-		banned:      make(map[string]time.Time),
-		backoff:     make(map[string]time.Time),
-		backoffN:    make(map[string]int),
+		params:             p,
+		chain:              c,
+		mempool:            mp,
+		peerStore:          ps,
+		listenAddr:         listenAddr,
+		maxInbound:         maxIn,
+		maxOutbound:        maxOut,
+		seedPeers:          seeds,
+		timeSampler:        ts,
+		peers:              make(map[string]*Peer),
+		localNonce:         nonce,
+		manualPeers:        make(map[string]struct{}),
+		banned:             make(map[string]time.Time),
+		backoff:            make(map[string]time.Time),
+		backoffN:           make(map[string]int),
+		seedRetryNext:      make(map[string]time.Time),
 		seenBlocks:         newBoundedHashSet(maxSeenBlocks),
 		seenTxs:            newBoundedHashSet(maxSeenTxs),
 		lastSyncReqPerPeer: make(map[string]time.Time),
@@ -327,6 +375,8 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		ibdQueueDone:       make(chan struct{}),
 		syncState:          SyncStateInitial,
 		headerIndex:        headerIndex,
+		legacyInFlight:     make(map[types.Hash]time.Time),
+		selfAddrs:          make(map[string]struct{}),
 	}
 
 	if opts != nil {
@@ -856,6 +906,90 @@ func (m *Manager) canReconnect(addr string) bool {
 	return time.Now().After(next)
 }
 
+// canReconnectSeedEmergency returns true for seed nodes when the node has
+// zero peers. This is the "last resort" equivalent of Bitcoin Core's DNS
+// seed fallback — without it a small network with few seeds can sit
+// isolated for the full backoff duration.
+//
+// When we already have a peer but outbound slots remain free, long dial
+// backoff on a second seed would otherwise strand the node on a single
+// connection (common on testnet with only two static seeds).
+func (m *Manager) canReconnectSeedEmergency(addr string) bool {
+	m.mu.RLock()
+	peerCount := len(m.peers)
+	m.mu.RUnlock()
+	if peerCount == 0 {
+		return true
+	}
+	if m.canReconnect(addr) {
+		return true
+	}
+	if m.outboundCount() < m.maxOutbound {
+		return m.allowAggressiveSeedRetry(addr)
+	}
+	return false
+}
+
+// allowAggressiveSeedRetry rate-limits extra seed dials while below max outbound.
+func (m *Manager) allowAggressiveSeedRetry(addr string) bool {
+	m.seedRetryMu.Lock()
+	defer m.seedRetryMu.Unlock()
+	now := time.Now()
+	if t, ok := m.seedRetryNext[addr]; ok && now.Before(t) {
+		return false
+	}
+	m.seedRetryNext[addr] = now.Add(12 * time.Second)
+	return true
+}
+
+func (m *Manager) ibdRecoveryActive() bool {
+	m.ibdRecoverMu.Lock()
+	defer m.ibdRecoverMu.Unlock()
+	return time.Now().Before(m.ibdRecoverUntil)
+}
+
+func (m *Manager) triggerIBDRecovery(reason, peerAddr string) {
+	// Only meaningful during IBD/header sync/block sync; avoid spamming
+	// reconnect attempts during normal operation.
+	if m.finishedIBD {
+		return
+	}
+	if !m.IsSyncing() {
+		return
+	}
+
+	m.ibdRecoverMu.Lock()
+	defer m.ibdRecoverMu.Unlock()
+
+	// Rate limit: once per 30 seconds.
+	now := time.Now()
+	if now.Before(m.ibdRecoverUntil) {
+		return
+	}
+	m.ibdRecoverUntil = now.Add(30 * time.Second)
+	m.ibdRecoverLastReason = reason
+
+	logging.L.Warn("IBD peer recovery triggered",
+		"component", "p2p",
+		"reason", reason,
+		"peer", peerAddr)
+
+	// Actively refresh headers from all peers to detect fork divergence.
+	// Bitcoin Core re-evaluates chain tips on stall; for a small network
+	// we explicitly ask every peer for their latest headers.
+	if m.headerIndex != nil {
+		m.mu.RLock()
+		peers := make([]*Peer, 0, len(m.peers))
+		for _, p := range m.peers {
+			peers = append(peers, p)
+		}
+		m.mu.RUnlock()
+		for _, p := range peers {
+			m.requestHeaders(p)
+		}
+	}
+}
+
 func (m *Manager) recordConnectFailure(addr string) {
 	m.backoffMu.Lock()
 	defer m.backoffMu.Unlock()
@@ -873,6 +1007,21 @@ func (m *Manager) recordConnectSuccess(addr string) {
 	defer m.backoffMu.Unlock()
 	delete(m.backoff, addr)
 	delete(m.backoffN, addr)
+}
+
+// decayBackoff resets the failure counter for addresses that have been in
+// backoff for longer than 2x the max delay. This prevents transient failures
+// from permanently accumulating state.
+func (m *Manager) decayBackoff() {
+	m.backoffMu.Lock()
+	defer m.backoffMu.Unlock()
+	threshold := time.Now().Add(-2 * backoffMax)
+	for addr, next := range m.backoff {
+		if next.Before(threshold) {
+			delete(m.backoff, addr)
+			delete(m.backoffN, addr)
+		}
+	}
 }
 
 // --- Outbound counting ---
@@ -1063,14 +1212,19 @@ func (m *Manager) connectSeeds(ctx context.Context) {
 func (m *Manager) reconnectLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	decayTicker := time.NewTicker(2 * time.Minute)
+	defer decayTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-decayTicker.C:
+			m.decayBackoff()
 		case <-ticker.C:
 			m.mu.RLock()
 			outCount := m.outboundCount()
 			inCount := len(m.peers) - outCount
+			totalPeers := len(m.peers)
 			connected := make(map[string]bool, len(m.peers)*2)
 			for addr, p := range m.peers {
 				connected[addr] = true
@@ -1099,28 +1253,30 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 			if len(m.connectOnly) > 0 {
 				for _, addr := range m.connectOnly {
 					if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) {
-						m.connectPeer(ctx, addr)
+						go m.connectPeer(ctx, addr)
 						connected[addr] = true
 					}
 				}
 				m.mu.RLock()
 				outCount = m.outboundCount()
 				m.mu.RUnlock()
-				// Also connect to discovered peers for mesh formation.
 				if stored, err := m.peerStore.GetPeers(); err == nil {
 					for _, addr := range stored {
 						if outCount >= m.maxOutbound {
 							break
 						}
-						if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) && addr != m.listenAddr {
-							m.connectPeer(ctx, addr)
-							connected[addr] = true
-							outCount++
-						}
+					m.selfAddrsMu.RLock()
+					_, isSelf := m.selfAddrs[addr]
+					m.selfAddrsMu.RUnlock()
+					if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) && addr != m.listenAddr && !isSelf {
+						go m.connectPeer(ctx, addr)
+						connected[addr] = true
+						outCount++
 					}
 				}
-				continue
 			}
+			continue
+		}
 
 			if outCount >= m.maxOutbound {
 				continue
@@ -1132,17 +1288,44 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 				allSeeds = append(allSeeds, m.params.SeedNodes...)
 			}
 			for _, addr := range allSeeds {
-				if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) {
-					m.connectPeer(ctx, addr)
+				// Use emergency bypass for seeds: at 0 peers, ignore backoff
+				// so the node can recover quickly. At >0 peers, normal backoff
+				// applies — no spamming seeds when we already have connectivity.
+				allow := m.canReconnectSeedEmergency(addr)
+				// If we just lost our best/sync peer mid-IBD, temporarily allow
+				// immediate seed attempts even when we still have some peers.
+				if !allow && m.ibdRecoveryActive() {
+					allow = true
+				}
+				if !connected[addr] && !m.IsBanned(addr) && allow {
+					go m.connectPeer(ctx, addr)
 					connected[addr] = true
 				}
 			}
 
+			// Try stored peers. At 0 peers, attempt up to 3 stored peers per
+			// tick to recover faster. With few outbounds, try more so addr relay
+			// can fill slots (Bitcoin Core opens multiple feeler connections).
+			maxStored := 1
+			if totalPeers == 0 {
+				maxStored = 3
+			} else if outCount < m.maxOutbound && outCount <= 2 {
+				maxStored = 3
+			}
+			attempted := 0
 			if stored, err := m.peerStore.GetPeers(); err == nil {
 				for _, addr := range stored {
-					if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) {
-						m.connectPeer(ctx, addr)
+					if attempted >= maxStored || outCount >= m.maxOutbound {
 						break
+					}
+					m.selfAddrsMu.RLock()
+					_, isSelf := m.selfAddrs[addr]
+					m.selfAddrsMu.RUnlock()
+					if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) && !isSelf {
+						go m.connectPeer(ctx, addr)
+						connected[addr] = true
+						attempted++
+						outCount++
 					}
 				}
 			}
@@ -1152,6 +1335,13 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 
 func (m *Manager) connectPeer(ctx context.Context, addr string) {
 	if addr == m.listenAddr {
+		return
+	}
+
+	m.selfAddrsMu.RLock()
+	_, isSelf := m.selfAddrs[addr]
+	m.selfAddrsMu.RUnlock()
+	if isSelf {
 		return
 	}
 
@@ -1226,9 +1416,19 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 				"component", "p2p", "addr", peer.Addr(), "panic", fmt.Sprintf("%v", r))
 			m.addMisbehavior(peer, 100, fmt.Sprintf("handler panic: %v", r))
 		}
+		disconnectedAddr := peer.Addr()
+		disconnectedBestH := peer.BestHeight()
+		m.mu.RLock()
+		wasBestPeer := disconnectedBestH >= m.bestPeerHeight && m.bestPeerHeight > 0
+		m.mu.RUnlock()
+
+		m.syncStateMu.RLock()
+		state := m.syncState
+		m.syncStateMu.RUnlock()
+		_, tipH := m.chain.Tip()
+
 		peer.Close()
 		m.mu.Lock()
-		disconnectedAddr := peer.Addr()
 		delete(m.peers, disconnectedAddr)
 		m.mu.Unlock()
 		// Note: addrBudgetPerIP is intentionally NOT cleaned up on disconnect.
@@ -1244,6 +1444,22 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 			logging.L.Warn("fast sync peer disconnected",
 				"component", "p2p", "peer", disconnectedAddr)
 			m.fastSyncPeer = ""
+			m.triggerIBDRecovery("fast_sync_peer_disconnected", disconnectedAddr)
+		}
+		// Clear sync peer references so the next peer selected gets the
+		// rate-limit exemption and header sync can pick a new peer.
+		m.syncPeerAddrMu.Lock()
+		if m.syncPeerAddr == disconnectedAddr {
+			m.syncPeerAddr = ""
+			m.triggerIBDRecovery("sync_peer_disconnected", disconnectedAddr)
+		}
+		m.syncPeerAddrMu.Unlock()
+		if m.headerSyncPeerAddr == disconnectedAddr {
+			m.headerSyncPeerAddr = ""
+			m.triggerIBDRecovery("header_sync_peer_disconnected", disconnectedAddr)
+		}
+		if wasBestPeer {
+			m.triggerIBDRecovery("best_peer_disconnected", disconnectedAddr)
 		}
 		m.mu.Lock()
 		var best uint32
@@ -1259,11 +1475,14 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 			remaining := len(m.peers)
 			m.mu.RUnlock()
 			logging.L.Debug("[dbg] peer disconnected",
-				"addr", peer.Addr(),
+				"addr", disconnectedAddr,
 				"inbound", peer.IsInbound(),
+				"peer_best_h", disconnectedBestH,
+				"state", state.String(),
+				"tip_height", tipH,
 				"remaining_peers", remaining)
 		} else {
-			logging.L.Debug("peer disconnected", "component", "p2p", "addr", peer.Addr())
+			logging.L.Debug("peer disconnected", "component", "p2p", "addr", disconnectedAddr)
 		}
 		metrics.Global.PeersDisconnects.Add(1)
 		metrics.Global.PeersConnected.Add(-1)
@@ -1330,7 +1549,11 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 		peer.SendMessage(protocol.CmdSendHeaders, nil)
 	}
 
-	m.sendGetAddr(peer)
+	// During IBD, avoid getaddr/addr chatter which can trigger strict peer
+	// message rate limits. Peer discovery isn't needed to complete sync.
+	if !m.IsSyncing() {
+		m.sendGetAddr(peer)
+	}
 
 	for {
 		select {
@@ -1347,20 +1570,25 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 			return
 		}
 
-		// Rate-limit only unsolicited traffic. Request messages (getheaders,
-		// getdata, getblocks) and their responses (headers, block) are
-		// legitimate during sync on both sides of the connection. Bitcoin
-		// Core does not rate-limit these.
-		if !peer.CheckRateLimit() {
-			cmd := hdr.CommandString()
-			exempt := cmd == protocol.CmdBlock || cmd == protocol.CmdHeaders ||
-				cmd == protocol.CmdGetHeaders || cmd == protocol.CmdGetData ||
-				cmd == protocol.CmdGetBlocks || cmd == protocol.CmdPing ||
-				cmd == protocol.CmdPong
-			if !exempt {
-				m.addMisbehavior(peer, 10, "message rate limit exceeded")
-				if peer.BanScore() >= BanThreshold {
-					return
+		// Bitcoin Core parity: do not banscore/ban peers for high message rate
+		// during IBD. Sync traffic can be bursty and banning seeds can strand
+		// small networks.
+		if !m.IsSyncing() {
+			// Rate-limit only unsolicited traffic. Request messages (getheaders,
+			// getdata, getblocks) and their responses (headers, block) are
+			// legitimate during sync on both sides of the connection. Bitcoin
+			// Core does not rate-limit these.
+			if !peer.CheckRateLimit() {
+				cmd := hdr.CommandString()
+				exempt := cmd == protocol.CmdBlock || cmd == protocol.CmdHeaders ||
+					cmd == protocol.CmdGetHeaders || cmd == protocol.CmdGetData ||
+					cmd == protocol.CmdGetBlocks || cmd == protocol.CmdPing ||
+					cmd == protocol.CmdPong
+				if !exempt {
+					m.addMisbehavior(peer, 10, "message rate limit exceeded")
+					if peer.BanScore() >= BanThreshold {
+						return
+					}
 				}
 			}
 		}
@@ -1552,6 +1780,9 @@ func (m *Manager) readAndProcessVersion(peer *Peer) error {
 	}
 
 	if theirVersion.Nonce == m.localNonce {
+		m.selfAddrsMu.Lock()
+		m.selfAddrs[peer.Addr()] = struct{}{}
+		m.selfAddrsMu.Unlock()
 		return fmt.Errorf("self-connection detected")
 	}
 
@@ -1728,31 +1959,89 @@ func (m *Manager) handleMessage(ctx context.Context, peer *Peer, hdr *protocol.M
 }
 
 func (m *Manager) handleInv(peer *Peer, inv *protocol.InvMsg) {
-	// Bitcoin Core skips ALL inventory during IBD (fBlocksOnly + IBD check).
-	// Block INVs conflict with the header-first pipeline.
-	// Tx INVs waste bandwidth — mempool entries will be immediately
-	// superseded by blocks being connected.
-	isIBD := m.IsSyncing()
-	if isIBD {
+	// Bitcoin Core behavior:
+	// - During header sync, ignore block invs (header-first pipeline).
+	// - During IBD block sync, do process block invs to drive getdata.
+	// - During IBD, ignore tx invs (they'll come in blocks anyway).
+	m.syncStateMu.RLock()
+	state := m.syncState
+	m.syncStateMu.RUnlock()
+
+	if state == SyncStateHeaderSync {
 		return
 	}
 
 	var needed []protocol.InvVector
 	var alreadyHaveBlocks, alreadyHaveTxs int
+
+	now := time.Now()
+	m.legacyMu.Lock()
+	// Prune timed-out legacy in-flight entries.
+	if len(m.legacyInFlight) > 0 {
+		for h, t := range m.legacyInFlight {
+			if now.Sub(t) > legacyInFlightTimeout {
+				delete(m.legacyInFlight, h)
+			}
+		}
+	}
+	availableLegacy := legacyMaxInFlight - len(m.legacyInFlight)
+	m.legacyMu.Unlock()
+
+	// In legacy BLOCK_SYNC (no scheduler), request blocks in a bounded window.
+	legacyIBD := state == SyncStateBlockSync && m.blockScheduler == nil && m.fastSyncPeer == ""
+
+	_, tipH := m.chain.Tip()
 	for _, iv := range inv.Inventory {
 		peer.AddKnownInventory(iv.Hash)
 		switch iv.Type {
 		case protocol.InvTypeBlock:
-			if !m.chain.HasBlockOnChain(iv.Hash) {
-				needed = append(needed, iv)
-			} else {
+			// Version only carries start_height once; inv/header gossip is how
+			// we learn a peer moved forward. BlockScheduler.AssignWork skips
+			// heights above peer.BestHeight() — if we never update it, a miner
+			// ahead of us looks stuck at handshake height and we assign zero
+			// getdata while still in BLOCK_SYNC.
+			if m.headerIndex != nil {
+				if node := m.headerIndex.GetHeader(iv.Hash); node != nil {
+					peer.SetStartHeightIfGreater(node.Height)
+				}
+			}
+			if !legacyIBD && m.IsSyncing() {
+				// In scheduler/fast-sync mode, we should not be driven by inv.
 				alreadyHaveBlocks++
+				continue
+			}
+			if m.chain.HasBlockOnChain(iv.Hash) {
+				alreadyHaveBlocks++
+				continue
+			}
+			if legacyIBD {
+				m.legacyMu.Lock()
+				_, inFlight := m.legacyInFlight[iv.Hash]
+				m.legacyMu.Unlock()
+				if inFlight {
+					continue
+				}
+
+				// If we have header index info, bias toward blocks that are
+				// plausibly connectable soon (tip+1, tip+2, ...), like Bitcoin.
+				// Unknown heights are still allowed, but deprioritized below.
+				if m.headerIndex != nil {
+					if node := m.headerIndex.GetHeader(iv.Hash); node != nil {
+						if node.Height <= tipH {
+							continue
+						}
+					}
+				}
+			} else {
+				needed = append(needed, iv)
 			}
 		case protocol.InvTypeTx:
+			if m.IsSyncing() {
+				alreadyHaveTxs++
+				continue
+			}
 			if !m.mempool.HasTx(iv.Hash) {
 				needed = append(needed, iv)
-			} else {
-				alreadyHaveTxs++
 			}
 		}
 	}
@@ -1773,7 +2062,99 @@ func (m *Manager) handleInv(peer *Peer, inv *protocol.InvMsg) {
 			"need_txs", neededTxs,
 			"already_blocks", alreadyHaveBlocks,
 			"already_txs", alreadyHaveTxs,
-			"ibd_skip_blocks", isIBD)
+			"state", state.String(),
+			"legacy_ibd", legacyIBD,
+			"legacy_available", availableLegacy)
+	}
+
+	if legacyIBD {
+		// Build a prioritized getdata batch from inv.
+		//
+		// Bitcoin Core parity: prefer a contiguous run starting at tip+1.
+		// Requesting blocks far ahead of the tip creates orphan cascades and
+		// can deadlock near the end of IBD when only a few blocks remain.
+		type hv struct {
+			iv     protocol.InvVector
+			height uint32
+			hasH   bool
+		}
+		hvs := make([]hv, 0, len(inv.Inventory))
+		byHeight := make(map[uint32]protocol.InvVector, len(inv.Inventory))
+		for _, iv := range inv.Inventory {
+			if iv.Type != protocol.InvTypeBlock {
+				continue
+			}
+			if m.chain.HasBlockOnChain(iv.Hash) {
+				continue
+			}
+			m.legacyMu.Lock()
+			_, inFlight := m.legacyInFlight[iv.Hash]
+			m.legacyMu.Unlock()
+			if inFlight {
+				continue
+			}
+			if m.headerIndex != nil {
+				if node := m.headerIndex.GetHeader(iv.Hash); node != nil {
+					// For contiguous selection, keep the last seen hash for a
+					// height (inv may contain duplicates).
+					byHeight[node.Height] = iv
+					hvs = append(hvs, hv{iv: iv, height: node.Height, hasH: true})
+					continue
+				}
+			}
+			hvs = append(hvs, hv{iv: iv, hasH: false})
+		}
+
+		if availableLegacy <= 0 {
+			return
+		}
+		if availableLegacy > maxGetDataBlockResponses {
+			availableLegacy = maxGetDataBlockResponses
+		}
+
+		needed = needed[:0]
+
+		// 1) Contiguous run from tip+1 (best).
+		next := tipH + 1
+		for len(needed) < availableLegacy {
+			iv, ok := byHeight[next]
+			if !ok {
+				break
+			}
+			needed = append(needed, iv)
+			next++
+		}
+
+		// 2) If we couldn't build a contiguous run (e.g. no height metadata),
+		// fall back to requesting known heights in ascending order to at least
+		// make progress without selecting far-future blocks.
+		if len(needed) == 0 {
+			sort.Slice(hvs, func(i, j int) bool {
+				// Prefer known heights, then lower height first.
+				if hvs[i].hasH != hvs[j].hasH {
+					return hvs[i].hasH
+				}
+				if hvs[i].hasH && hvs[j].hasH {
+					return hvs[i].height < hvs[j].height
+				}
+				return false
+			})
+			if availableLegacy > len(hvs) {
+				availableLegacy = len(hvs)
+			}
+			for i := 0; i < availableLegacy; i++ {
+				needed = append(needed, hvs[i].iv)
+			}
+		}
+
+		if len(needed) == 0 {
+			return
+		}
+		m.legacyMu.Lock()
+		for _, iv := range needed {
+			m.legacyInFlight[iv.Hash] = now
+		}
+		m.legacyMu.Unlock()
 	}
 
 	if len(needed) > 0 {
@@ -1845,6 +2226,12 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	blockHash := crypto.HashBlockHeader(&block.Header)
 	peer.AddKnownInventory(blockHash)
 
+	// If this block was requested via legacy getblocks/inv sync, mark it as
+	// no longer in-flight so subsequent inv batches can fill the window.
+	m.legacyMu.Lock()
+	delete(m.legacyInFlight, blockHash)
+	m.legacyMu.Unlock()
+
 	if m.seenBlocks.AddOrHas(blockHash) {
 		// If the block scheduler is waiting on this hash, the seenBlocks
 		// entry is stale (set before the scheduler existed, e.g. during
@@ -1854,9 +2241,15 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 			m.seenBlocks.Remove(blockHash)
 		} else {
 			if logging.DebugMode {
+				m.syncStateMu.RLock()
+				st := m.syncState
+				m.syncStateMu.RUnlock()
+				_, tipH := m.chain.Tip()
 				logging.L.Debug("[dbg] handleBlock: already seen, skipping",
 					"hash", blockHash.ReverseString()[:16],
-					"peer", peer.Addr())
+					"peer", peer.Addr(),
+					"sync_state", st.String(),
+					"our_tip", tipH)
 			}
 			return
 		}
@@ -1938,9 +2331,13 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 		return
 	}
 
-	// During BLOCK_SYNC with a scheduler, route through the scheduler.
+	// During BLOCK_SYNC with a scheduler, route through the scheduler only.
+	// Do not fall through to ProcessBlock: missing parents are normal until the
+	// scheduler drains in order; ProcessBlock would treat them as orphans and
+	// spam getdata for each parent (relay often delivers blocks out of order).
 	if state == SyncStateBlockSync && m.blockScheduler != nil {
-		if m.blockScheduler.BlockReceived(blockHash, block, peer.Addr()) {
+		if m.blockScheduler.BlockReceived(blockHash, block, peer.Addr()) ||
+			m.blockScheduler.TryStageUnsolicited(blockHash, block, peer.Addr()) {
 			// Bitcoin Core parity: FindNextBlocksToDownload is called on
 			// every block receipt. Immediately assign new work to the
 			// delivering peer to eliminate idle gaps between requests.
@@ -1957,12 +2354,26 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 			}
 			return
 		}
+		// Block was neither in-flight nor accepted as unsolicited. Remove from
+		// seenBlocks so it can be re-received after the scheduler completes
+		// (e.g. when the node transitions to SYNCED and needs this block for
+		// orphan resolution). Without this, the block is permanently stuck in
+		// seenBlocks and can never be processed.
+		m.seenBlocks.Remove(blockHash)
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] BLOCK_SYNC: dropped block (not in-flight, not staged as unsolicited) — removed from seenBlocks",
+				"hash", blockHash.ReverseString()[:16],
+				"peer", peer.Addr())
+		}
+		return
 	}
 
 	// During header sync, unsolicited blocks would create orphan cascades
 	// since we don't have their parents yet. Drop them silently — the block
 	// scheduler will fetch them in order once headers are complete.
+	// Remove from seenBlocks so the block can be re-received after sync.
 	if state == SyncStateHeaderSync {
+		m.seenBlocks.Remove(blockHash)
 		bestH := uint32(0)
 		if m.headerIndex != nil {
 			bestH = m.headerIndex.BestHeaderHeight()
@@ -1987,14 +2398,43 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 	}
 
 	// During IBD (legacy path), push to the processing queue.
+	// Use a select so we never block the read loop — a blocked read loop
+	// prevents pings from being answered, causing the remote peer to
+	// disconnect us with "connection reset".
 	if m.IsSyncing() && m.blockScheduler == nil {
-		m.ibdBlockQueue <- &ibdBlockItem{block: block, peer: peer}
+		select {
+		case m.ibdBlockQueue <- &ibdBlockItem{block: block, peer: peer}:
+		case <-peer.Done():
+			return
+		case <-m.ctx.Done():
+			return
+		}
+		// In legacy sync, avoid spamming getblocks on every block receipt.
+		// Let inv/getdata fill the in-flight window and only poke getblocks
+		// when we're running low.
 		if peer.BestHeight() > 0 {
-			m.requestBlocks(peer)
+			m.legacyMu.Lock()
+			inFlight := len(m.legacyInFlight)
+			m.legacyMu.Unlock()
+			if inFlight < legacyMaxInFlight/4 {
+				m.requestBlocks(peer)
+			}
 		}
 		return
 	}
 
+	if logging.DebugMode {
+		m.syncStateMu.RLock()
+		st := m.syncState
+		m.syncStateMu.RUnlock()
+		_, tipH := m.chain.Tip()
+		logging.L.Debug("[dbg] handleBlock: calling ProcessBlock (non-scheduler path)",
+			"hash", blockHash.ReverseString()[:16],
+			"parent", block.Header.PrevBlock.ReverseString()[:16],
+			"peer", peer.Addr(),
+			"sync_state", st.String(),
+			"our_tip", tipH)
+	}
 	height, err := m.chain.ProcessBlock(block)
 	if err != nil {
 		if errors.Is(err, chain.ErrSideChain) {
@@ -2011,10 +2451,12 @@ func (m *Manager) handleBlock(peer *Peer, block *types.Block) {
 		}
 		m.seenBlocks.Remove(blockHash)
 		if errors.Is(err, chain.ErrOrphanBlock) {
+			_, tipH := m.chain.Tip()
 			logging.L.Info("orphan block, requesting parent from peer", "component", "p2p",
 				"hash", blockHash.ReverseString(),
 				"parent", block.Header.PrevBlock.ReverseString(),
-				"addr", peer.Addr())
+				"addr", peer.Addr(),
+				"our_tip", tipH)
 			m.requestOrphanParent(peer, block.Header.PrevBlock)
 			m.requestBlocks(peer)
 			return
@@ -2271,6 +2713,12 @@ func (m *Manager) addrBroadcastLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// During IBD, avoid unsolicited addr chatter. It provides no sync
+			// value and can trigger strict peer message rate limits.
+			if m.IsSyncing() {
+				continue
+			}
+
 			addrs := m.gatherAddresses(10)
 			if len(addrs) == 0 {
 				continue
@@ -2694,6 +3142,30 @@ func (m *Manager) handleSyncInitial() {
 		// SYNCED here skips proper catch-up and matches "solo" incorrectly
 		// during startup (chaos: seeds behind the mining majority).
 		if m.chain.IsTipStale() {
+			// Prefer header-first sync even when peers report the same height.
+			// A stale tip implies we may be missing blocks/headers even if
+			// peers haven't (or can't) advertise a higher height yet.
+			if peer := m.selectHeaderSyncPeer(); peer != nil {
+				m.headerSyncPeerAddr = peer.Addr()
+				m.headerSyncSince = time.Now()
+				m.lastHeaderHeight = m.headerIndex.BestHeaderHeight()
+				m.headerSyncStalls = 0
+				m.headerSyncCaughtUp = false
+
+				m.syncPeerAddrMu.Lock()
+				m.syncPeerAddr = peer.Addr()
+				m.syncPeerSince = time.Now()
+				m.syncPeerAddrMu.Unlock()
+
+				logging.SyncAuditDebug("handleSyncInitial: stale tip — entering HEADER_SYNC (same-height peers)",
+					"peer", peer.Addr(),
+					"peer_height", peer.BestHeight(),
+					"our_height", ourHeight)
+				m.transitionSyncState(SyncStateHeaderSync)
+				m.requestHeaders(peer)
+				return
+			}
+
 			if logging.DebugMode {
 				logging.L.Debug("[dbg] handleSyncInitial: stale tip, no peer ahead — staying INITIAL",
 					"best_peer_height", bestHeight,
@@ -2927,8 +3399,22 @@ func (m *Manager) handleHeaderSyncTick() {
 		_, tipH := m.chain.Tip()
 		m.blockSyncLastProgress = time.Now()
 		m.blockSyncLastHeight = tipH
+		m.resetBlockSyncRecoveryCounters()
 
-		if m.fastSyncFallback {
+		// If we're still far behind the best headers, prioritize bulk download.
+		// Once we are close (<=1000 blocks), switch to the scheduler which
+		// handles ordering/parent dependencies better.
+		behind := int64(currentHeight) - int64(tipH)
+		useBulk := behind > 1000
+
+		if m.fastSyncFallback || !useBulk {
+			if !useBulk {
+				logging.L.Info("header sync complete, transitioning to block sync (parallel scheduler — close to tip)",
+					"component", "p2p",
+					"header_height", currentHeight,
+					"tip_height", tipH,
+					"behind", behind)
+			}
 			logging.L.Info("header sync complete, transitioning to block sync (parallel scheduler — fast sync previously failed)",
 				"component", "p2p", "header_height", currentHeight)
 			m.blockScheduler = NewBlockScheduler(m.headerIndex, m.chain)
@@ -2959,6 +3445,91 @@ func (m *Manager) handleHeaderSyncTick() {
 	}
 }
 
+// applyBlockDownloadRecovery clears the orphan pool, resets the block scheduler
+// from the current chain tip, and scrubs seenBlocks for expected hashes.
+// Returns orphans cleared. Does not log — callers add context.
+func (m *Manager) applyBlockDownloadRecovery() int {
+	if m.blockScheduler == nil {
+		return 0
+	}
+	n := m.chain.ClearOrphanBlocks()
+	m.blockScheduler.Reset()
+	for _, h := range m.blockScheduler.ExpectedHashes() {
+		m.seenBlocks.Remove(h)
+	}
+	m.blockSyncLastProgress = time.Now()
+
+	// Request fresh headers from all connected peers so the header index
+	// can discover if it's on a losing fork. Bitcoin Core re-evaluates chain
+	// state during CheckBlockDownloadTimeout; for a small network we
+	// explicitly re-request headers to learn about any fork we missed.
+	if m.headerIndex != nil {
+		m.mu.RLock()
+		peers := make([]*Peer, 0, len(m.peers))
+		for _, p := range m.peers {
+			peers = append(peers, p)
+		}
+		m.mu.RUnlock()
+		for _, p := range peers {
+			m.requestHeaders(p)
+		}
+	}
+
+	return n
+}
+
+// resetBlockSyncRecoveryCounters clears stall/orphan-heuristic state after the
+// chain tip advances (fresh progress).
+func (m *Manager) resetBlockSyncRecoveryCounters() {
+	m.blockSyncRecoveriesSinceTip = 0
+	m.resetOrphanRepeatHeuristic()
+}
+
+func (m *Manager) resetOrphanRepeatHeuristic() {
+	m.blockSyncOrphanFailHash = types.ZeroHash
+	m.blockSyncOrphanFailCount = 0
+	m.blockSyncOrphanFailSince = time.Time{}
+}
+
+// recordBlockSyncRecoveryEvent counts recoveries without tip movement and, after
+// a bounded number, triggers IBD seed recovery (small network; Core relies on
+// many peers — we poke seeds rarely). Returns the new counter (0 if reset after
+// escalation) and whether IBD recovery was triggered.
+func (m *Manager) recordBlockSyncRecoveryEvent(context string) (recoveries int, ibdEscalated bool) {
+	m.blockSyncRecoveriesSinceTip++
+	recoveries = m.blockSyncRecoveriesSinceTip
+	if m.blockSyncRecoveriesSinceTip >= maxBlockSyncRecoveriesBeforeIBDPoke {
+		m.triggerIBDRecovery("block sync recovery escalation ("+context+")", "")
+		m.blockSyncRecoveriesSinceTip = 0
+		return 0, true
+	}
+	return recoveries, false
+}
+
+// reconcileBlockDownloadWithChainTip resets scheduler and orphan state when the
+// scheduler's next-connect height diverges from chain tip+1. That can happen
+// after a prior bug or validation failure path advanced staging without a
+// matching main-chain tip (Bitcoin Core keeps tip and block-download cursors
+// consistent; we recover instead of leaving an irrecoverable gap).
+func (m *Manager) reconcileBlockDownloadWithChainTip(reason string) {
+	if m.blockScheduler == nil {
+		return
+	}
+	_, tip := m.chain.Tip()
+	next := m.blockScheduler.Stats().NextHeight
+	if next == tip+1 {
+		return
+	}
+	cleared := m.applyBlockDownloadRecovery()
+	logging.L.Warn("[sync] block download state out of alignment with chain tip — recovering",
+		"component", "p2p",
+		"reason", reason,
+		"chain_tip", tip,
+		"scheduler_next_height", next,
+		"expected_next", tip+1,
+		"orphans_cleared", cleared)
+}
+
 // handleBlockSyncTick drives the block download phase on each tick.
 func (m *Manager) handleBlockSyncTick() {
 	// Fast sync path: sequential download from a single peer.
@@ -2968,12 +3539,38 @@ func (m *Manager) handleBlockSyncTick() {
 	}
 
 	if m.blockScheduler == nil {
-		if logging.DebugMode {
-			logging.L.Debug("[dbg] handleBlockSyncTick: no scheduler, using legacy path")
+		// Fast sync peer disconnected before the scheduler was created.
+		// Create one now rather than falling to the legacy path, which
+		// transitions to SYNCED prematurely when there are 0 peers.
+		if m.headerIndex != nil && m.headerIndex.BestHeaderHeight() > 0 {
+			_, tipH := m.chain.Tip()
+			hdrH := m.headerIndex.BestHeaderHeight()
+			if hdrH > tipH {
+				logging.L.Info("creating block scheduler after fast sync peer loss",
+					"component", "p2p", "tip_height", tipH, "header_height", hdrH)
+				m.fastSyncFallback = true
+				m.blockScheduler = NewBlockScheduler(m.headerIndex, m.chain)
+				m.blockScheduler.Populate()
+				m.blockSyncLastProgress = time.Now()
+				m.blockSyncLastHeight = tipH
+				for _, h := range m.blockScheduler.ExpectedHashes() {
+					m.seenBlocks.Remove(h)
+				}
+				// Fall through to scheduler logic below.
+			} else {
+				m.transitionSyncState(SyncStateSynced)
+				return
+			}
+		} else {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] handleBlockSyncTick: no scheduler, using legacy path")
+			}
+			m.handleLegacyBlockSync()
+			return
 		}
-		m.handleLegacyBlockSync()
-		return
 	}
+
+	m.reconcileBlockDownloadWithChainTip("block sync tick")
 
 	// 1. Check for timed-out requests.
 	timedOut := m.blockScheduler.HandleTimeout()
@@ -2983,32 +3580,103 @@ func (m *Manager) handleBlockSyncTick() {
 			"height", entry.Height)
 	}
 
-	// 2. Drain ready blocks and connect them in order.
-	ready := m.blockScheduler.DrainReady()
-	if logging.DebugMode && len(ready) > 0 {
-		logging.L.Debug("[dbg] handleBlockSyncTick: processing ready blocks",
-			"count", len(ready))
-	}
-	for _, staged := range ready {
+	// 2. Drain and connect one block at a time (commit after validation).
+	readyProcessed := 0
+drainLoop:
+	for {
+		ready := m.blockScheduler.DrainReady()
+		if len(ready) == 0 {
+			break
+		}
+		if logging.DebugMode {
+			logging.L.Debug("[dbg] handleBlockSyncTick: processing ready block", "batch", 1)
+		}
+		staged := ready[0]
 		block := staged.Block
 		height, err := m.chain.ProcessBlock(block)
 		if err != nil {
 			blockHash := crypto.HashBlockHeader(&block.Header)
 			if errors.Is(err, chain.ErrSideChain) {
+				m.resetOrphanRepeatHeuristic()
 				if logging.DebugMode {
 					logging.L.Debug("[dbg] handleBlockSyncTick: side chain block",
 						"hash", blockHash.ReverseString()[:16],
 						"height", height)
 				}
+				// If this block is on the header index's best chain, it was
+				// downloaded as part of fork resolution. Don't requeue — it's
+				// stored as a side chain block and will trigger a reorg once
+				// cumulative work exceeds the current tip.
+				onBestHeaderChain := false
+				if m.headerIndex != nil {
+					if node := m.headerIndex.GetHeader(blockHash); node != nil {
+						if at := m.headerIndex.GetHeaderByHeight(node.Height); at != nil && at.Hash == blockHash {
+							onBestHeaderChain = true
+						}
+					}
+				}
+				if !onBestHeaderChain {
+					requeueHeight := uint32(0)
+					if m.headerIndex != nil {
+						if node := m.headerIndex.GetHeader(blockHash); node != nil {
+							requeueHeight = node.Height
+						}
+					}
+					m.blockScheduler.RequeueBlock(blockHash, requeueHeight)
+				}
+				m.seenBlocks.Remove(blockHash)
 				continue
 			}
 			errStr := err.Error()
 			if strings.Contains(errStr, "already in chain") {
+				if m.headerIndex != nil {
+					if node := m.headerIndex.GetHeader(blockHash); node != nil {
+						if at := m.headerIndex.GetHeaderByHeight(node.Height); at != nil && at.Hash == blockHash {
+							m.blockScheduler.UpdateNextConnectHeight(node.Height)
+						}
+					}
+				}
 				continue
+			}
+			// Orphan / parent-missing at the scheduler tip: repeated failures mean
+			// the orphan pool or download window is wedged — recover like a stall.
+			if strings.Contains(strings.ToLower(errStr), "orphan") {
+				now := time.Now()
+				if blockHash != m.blockSyncOrphanFailHash || now.Sub(m.blockSyncOrphanFailSince) > blockSyncOrphanRepeatWindow {
+					m.blockSyncOrphanFailHash = blockHash
+					m.blockSyncOrphanFailCount = 1
+					m.blockSyncOrphanFailSince = now
+				} else {
+					m.blockSyncOrphanFailCount++
+				}
+				if m.blockSyncOrphanFailCount >= blockSyncOrphanRepeatThreshold {
+					failN := m.blockSyncOrphanFailCount
+					n := m.applyBlockDownloadRecovery()
+					rec, esc := m.recordBlockSyncRecoveryEvent("repeated_scheduler_orphan")
+					m.resetOrphanRepeatHeuristic()
+					logging.L.Warn("[sync] repeated scheduler orphan at tip — full recovery",
+						"component", "p2p",
+						"hash", blockHash.ReverseString(),
+						"peer", staged.PeerAddr,
+						"orphans_cleared", n,
+						"failures", failN,
+						"recoveries_since_tip", rec,
+						"ibd_recovery_escalated", esc)
+					break drainLoop
+				}
+			} else {
+				m.blockSyncOrphanFailHash = types.ZeroHash
+				m.blockSyncOrphanFailCount = 0
 			}
 			logging.L.Error("block from scheduler failed validation", "component", "p2p",
 				"hash", blockHash.ReverseString(), "peer", staged.PeerAddr, "error", err)
-			m.blockScheduler.RequeueBlock(blockHash, 0)
+			requeueHeight := uint32(0)
+			if m.headerIndex != nil {
+				if node := m.headerIndex.GetHeader(blockHash); node != nil {
+					requeueHeight = node.Height
+				}
+			}
+			m.blockScheduler.RequeueBlock(blockHash, requeueHeight)
 			m.seenBlocks.Remove(blockHash)
 			m.mu.RLock()
 			if badPeer, ok := m.peers[staged.PeerAddr]; ok {
@@ -3021,8 +3689,22 @@ func (m *Manager) handleBlockSyncTick() {
 			}
 			continue
 		}
+		readyProcessed++
+		m.resetOrphanRepeatHeuristic()
 		m.NotifyBlockAccepted(&block.Header)
 		m.blockScheduler.UpdateNextConnectHeight(height)
+		m.mu.RLock()
+		if dlPeer, ok := m.peers[staged.PeerAddr]; ok {
+			m.mu.RUnlock()
+			dlPeer.SetStartHeightIfGreater(height)
+		} else {
+			m.mu.RUnlock()
+		}
+		m.mu.Lock()
+		if height > m.bestPeerHeight {
+			m.bestPeerHeight = height
+		}
+		m.mu.Unlock()
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] handleBlockSyncTick: block connected",
 				"height", height,
@@ -3038,26 +3720,28 @@ func (m *Manager) handleBlockSyncTick() {
 		m.mempool.RemoveTxs(confirmedHashes)
 	}
 
-	// 2b. Track block sync progress; detect stalls.
+	// 2b. Track block sync progress; detect stalls (no tip advance within timeout).
 	_, currentTipHeight := m.chain.Tip()
 	if currentTipHeight > m.blockSyncLastHeight {
 		m.blockSyncLastHeight = currentTipHeight
 		m.blockSyncLastProgress = time.Now()
+		m.resetBlockSyncRecoveryCounters()
 	} else if time.Since(m.blockSyncLastProgress) > blockSyncStallTimeout {
 		stats := m.blockScheduler.Stats()
+		stallDur := time.Since(m.blockSyncLastProgress)
+		orphCleared := m.applyBlockDownloadRecovery()
+		rec, esc := m.recordBlockSyncRecoveryEvent("stall_timeout")
 		logging.L.Warn("block sync stalled, resetting scheduler",
 			"component", "p2p",
 			"stuck_height", m.blockSyncLastHeight,
-			"stall_duration", time.Since(m.blockSyncLastProgress),
+			"stall_duration", stallDur,
 			"needed", stats.Needed,
 			"in_flight", stats.InFlight,
 			"staging", stats.Staging,
-			"next_connect", stats.NextHeight)
-		m.blockScheduler.Reset()
-		for _, h := range m.blockScheduler.ExpectedHashes() {
-			m.seenBlocks.Remove(h)
-		}
-		m.blockSyncLastProgress = time.Now()
+			"next_connect", stats.NextHeight,
+			"orphans_cleared", orphCleared,
+			"recoveries_since_tip", rec,
+			"ibd_recovery_escalated", esc)
 	}
 
 	// 3. Assign new work to peers.
@@ -3068,6 +3752,7 @@ func (m *Manager) handleBlockSyncTick() {
 	}
 	m.mu.RUnlock()
 
+	preAssignStats := m.blockScheduler.Stats()
 	m.blockScheduler.SortPeersByScore(peers)
 
 	totalAssigned := 0
@@ -3087,18 +3772,54 @@ func (m *Manager) handleBlockSyncTick() {
 		peer.SendMessage(protocol.CmdGetData, buf.Bytes())
 	}
 
+	if totalAssigned == 0 && preAssignStats.Needed > 0 && preAssignStats.InFlight == 0 {
+		var peerInfo []string
+		for _, p := range peers {
+			peerInfo = append(peerInfo, fmt.Sprintf("%s:h=%d", p.Addr(), p.BestHeight()))
+		}
+		logging.L.Warn("[dbg] handleBlockSyncTick: ZERO assignments despite needed blocks — peer heights too low?",
+			"component", "sync_diag",
+			"needed", preAssignStats.Needed,
+			"next_connect", preAssignStats.NextHeight,
+			"peer_heights", peerInfo)
+
+		// Recovery: peer BestHeight values are stale. Request headers
+		// from all connected peers so that handleHeaders can refresh
+		// their BestHeight via SetStartHeightIfGreater.
+		for _, p := range peers {
+			m.requestHeaders(p)
+		}
+	}
+
 	if logging.DebugMode {
 		stats := m.blockScheduler.Stats()
+		hdrH := uint32(0)
+		if m.headerIndex != nil {
+			hdrH = m.headerIndex.BestHeaderHeight()
+		}
 		logging.L.Debug("[dbg] handleBlockSyncTick: tick summary",
 			"tip_height", currentTipHeight,
-			"ready_processed", len(ready),
+			"ready_processed", readyProcessed,
 			"timeouts", len(timedOut),
 			"assigned_this_tick", totalAssigned,
 			"peers", len(peers),
 			"needed", stats.Needed,
 			"in_flight", stats.InFlight,
 			"staging", stats.Staging,
-			"next_connect", stats.NextHeight)
+			"next_connect", stats.NextHeight,
+			"best_header", hdrH)
+		if stats.Needed == 0 && stats.InFlight == 0 && stats.Staging == 0 && hdrH > currentTipHeight {
+			var peerHeightInfo []string
+			for _, p := range peers {
+				peerHeightInfo = append(peerHeightInfo, fmt.Sprintf("%s:h=%d", p.Addr(), p.BestHeight()))
+			}
+			logging.L.Warn("[dbg] handleBlockSyncTick: STALL — scheduler empty but headers ahead of tip",
+				"component", "sync_diag",
+				"tip", currentTipHeight,
+				"best_header", hdrH,
+				"next_connect", stats.NextHeight,
+				"peer_heights", peerHeightInfo)
+		}
 	}
 
 	// 4. Check completion.
@@ -3211,6 +3932,26 @@ func (m *Manager) handleFastSyncTick() {
 	bestHeaderHeight := m.headerIndex.BestHeaderHeight()
 	_, tipHeight := m.chain.Tip()
 
+	// When we're close to the tip, switch to the scheduler which is better at
+	// handling edge cases and reduces orphan churn.
+	if bestHeaderHeight > tipHeight && (bestHeaderHeight-tipHeight) <= 1000 {
+		logging.L.Info("fast sync near tip, switching to parallel scheduler",
+			"component", "p2p",
+			"tip_height", tipHeight,
+			"header_height", bestHeaderHeight,
+			"remaining", bestHeaderHeight-tipHeight)
+		m.fastSyncPeer = ""
+		m.fastSyncFallback = true
+		m.blockScheduler = NewBlockScheduler(m.headerIndex, m.chain)
+		m.blockScheduler.Populate()
+		m.blockSyncLastProgress = time.Now()
+		m.blockSyncLastHeight = tipHeight
+		for _, h := range m.blockScheduler.ExpectedHashes() {
+			m.seenBlocks.Remove(h)
+		}
+		return
+	}
+
 	// Check if fast sync is complete.
 	if tipHeight >= bestHeaderHeight {
 		logging.L.Info("fast sync complete",
@@ -3263,27 +4004,27 @@ func (m *Manager) handleFastSyncTick() {
 			batchEnd = bestHeaderHeight
 		}
 
-		hashes := m.headerIndex.HeadersToFetch(m.fastSyncNextHeight, int(batchEnd-m.fastSyncNextHeight+1))
-		if len(hashes) == 0 {
+		entries := m.headerIndex.HeadersToFetch(m.fastSyncNextHeight, int(batchEnd-m.fastSyncNextHeight+1))
+		if len(entries) == 0 {
 			break
 		}
 
-		invVecs := make([]protocol.InvVector, len(hashes))
-		for i, h := range hashes {
-			invVecs[i] = protocol.InvVector{Type: protocol.InvTypeBlock, Hash: h}
+		invVecs := make([]protocol.InvVector, len(entries))
+		for i, e := range entries {
+			invVecs[i] = protocol.InvVector{Type: protocol.InvTypeBlock, Hash: e.Hash}
 		}
 		getData := protocol.GetDataMsg{Inventory: invVecs}
 		var buf bytes.Buffer
 		getData.Encode(&buf)
 		peer.SendMessage(protocol.CmdGetData, buf.Bytes())
 
-		m.fastSyncInFlight += len(hashes)
-		m.fastSyncNextHeight += uint32(len(hashes))
+		m.fastSyncInFlight += len(entries)
+		m.fastSyncNextHeight += uint32(len(entries))
 
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] handleFastSyncTick: requested batch",
 				"peer", peer.Addr(),
-				"batch_size", len(hashes),
+				"batch_size", len(entries),
 				"next_height", m.fastSyncNextHeight,
 				"in_flight", m.fastSyncInFlight,
 				"tip_height", tipHeight,
@@ -3316,6 +4057,7 @@ func (m *Manager) handleSyncedTick() {
 
 	m.mu.RLock()
 	var bestHeight uint32
+	var peerHeightDiag []string
 	for _, p := range m.peers {
 		v := p.Version()
 		if v == nil || v.Version < 2 {
@@ -3325,10 +4067,27 @@ func (m *Manager) handleSyncedTick() {
 		if ph > bestHeight {
 			bestHeight = ph
 		}
+		if logging.DebugMode {
+			peerHeightDiag = append(peerHeightDiag, fmt.Sprintf("%s:h=%d", p.Addr(), ph))
+		}
 	}
 	m.mu.RUnlock()
 
 	tipStale := m.chain.IsTipStale()
+
+	hdrH := uint32(0)
+	if m.headerIndex != nil {
+		hdrH = m.headerIndex.BestHeaderHeight()
+	}
+	if logging.DebugMode {
+		logging.L.Debug("[dbg] handleSyncedTick: gap check",
+			"our_height", ourHeight,
+			"best_peer_height_v2", bestHeight,
+			"best_header", hdrH,
+			"tip_stale", tipStale,
+			"peer_count_v2", len(peerHeightDiag),
+			"peer_heights", peerHeightDiag)
+	}
 
 	// Far behind peers on a fork: tip timestamps stay recent, so IsTipStale is
 	// false — must still re-sync (matches chaos divergence: same spread as checks).
@@ -3340,6 +4099,28 @@ func (m *Manager) handleSyncedTick() {
 		gap = bestHeight - ourHeight
 	}
 	reSync := (tipStale && bestHeight > ourHeight+2) || (gap >= forkRecoveryGap)
+
+	// Also re-sync if the header index is significantly ahead of our tip,
+	// even if peer BestHeight values are stale. Header index is updated by
+	// header announcements and is more reliable than peer self-reports.
+	var hdrGap uint32
+	if hdrH > ourHeight {
+		hdrGap = hdrH - ourHeight
+	}
+	if !reSync && hdrGap >= forkRecoveryGap {
+		logging.L.Warn("[dbg] handleSyncedTick: header index ahead but peer heights stale — triggering re-sync",
+			"component", "sync_diag",
+			"our_height", ourHeight,
+			"best_header", hdrH,
+			"header_gap", hdrGap,
+			"best_peer_height_v2", bestHeight,
+			"peer_gap", gap,
+			"peer_heights", peerHeightDiag)
+		reSync = true
+		if hdrH > bestHeight {
+			bestHeight = hdrH
+		}
+	}
 
 	if reSync {
 		logging.SyncAuditDebug("SYNCED tick: re-entering full sync",
@@ -3534,6 +4315,16 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 	if added > 0 {
 		bestH := m.headerIndex.BestHeaderHeight()
 		peer.SetSyncedHeaders(int32(bestH))
+
+		// Bitcoin parity: a peer that delivers valid headers at height N
+		// necessarily has blocks up to N. Update its BestHeight so the
+		// block scheduler can assign work to this peer for those heights.
+		lastHdr := msg.Headers[len(msg.Headers)-1]
+		lastHash := crypto.HashBlockHeader(&lastHdr)
+		if node := m.headerIndex.GetHeader(lastHash); node != nil {
+			peer.SetStartHeightIfGreater(node.Height)
+		}
+
 		logging.L.Info("headers received", "component", "p2p",
 			"peer", peer.Addr(), "added", added, "batch_size", len(msg.Headers), "best_header", bestH)
 
@@ -3648,7 +4439,11 @@ func (m *Manager) handleGetHeaders(peer *Peer, msg *protocol.GetHeadersMsg) {
 func (m *Manager) requestBlocks(peer *Peer) {
 	addr := peer.Addr()
 	m.lastSyncReqPerPeerMu.Lock()
-	if !m.IsSyncing() && time.Since(m.lastSyncReqPerPeer[addr]) < 500*time.Millisecond {
+	last := m.lastSyncReqPerPeer[addr]
+	// Even during IBD, avoid tight getblocks loops (Bitcoin has inflight
+	// tracking and won't re-ask continuously). Use a small spacing so we can
+	// still recover quickly when invs are missing.
+	if time.Since(last) < legacyGetBlocksMinSpacing {
 		m.lastSyncReqPerPeerMu.Unlock()
 		logging.L.Debug("requestBlocks throttled", "component", "p2p", "peer", addr)
 		return

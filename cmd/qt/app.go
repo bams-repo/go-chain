@@ -85,6 +85,11 @@ func (a *App) startup(ctx context.Context) {
 		return
 	}
 
+	if v := strings.TrimSpace(os.Getenv("FAIRCHAIN_MINING")); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+		n.SetMining(true)
+		logging.L.Info("mining enabled via FAIRCHAIN_MINING", "network", cfg.Network)
+	}
+
 	a.node = n
 
 	nickPath := ircNickPath(n.Config())

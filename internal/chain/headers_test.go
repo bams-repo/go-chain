@@ -262,19 +262,22 @@ func TestHeaderIndexHeadersToFetch(t *testing.T) {
 		parent = &hdr
 	}
 
-	hashes := idx.HeadersToFetch(5, 10)
-	if len(hashes) != 10 {
-		t.Fatalf("expected 10 hashes, got %d", len(hashes))
+	entries := idx.HeadersToFetch(5, 10)
+	if len(entries) != 10 {
+		t.Fatalf("expected 10 entries, got %d", len(entries))
 	}
 
-	for i, h := range hashes {
-		node := idx.GetHeader(h)
+	for i, entry := range entries {
+		node := idx.GetHeader(entry.Hash)
 		if node == nil {
-			t.Fatalf("hash %d not found in index", i)
+			t.Fatalf("entry %d not found in index", i)
 		}
 		expectedHeight := uint32(5 + i)
+		if entry.Height != expectedHeight {
+			t.Fatalf("entry %d: expected height %d, got %d", i, expectedHeight, entry.Height)
+		}
 		if node.Height != expectedHeight {
-			t.Fatalf("hash %d: expected height %d, got %d", i, expectedHeight, node.Height)
+			t.Fatalf("entry %d: node height %d does not match expected %d", i, node.Height, expectedHeight)
 		}
 	}
 }

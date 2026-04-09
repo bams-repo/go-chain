@@ -7,6 +7,7 @@
 package p2p
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -21,7 +22,7 @@ const (
 	DefaultMaxInFlightPerPeer = 16
 	DefaultMaxGlobalInFlight  = 512
 	DefaultMaxStagingSize     = 1024
-	DefaultRequestTimeout     = 30 * time.Second
+	DefaultRequestTimeout     = 10 * time.Second
 )
 
 // BlockScheduler coordinates parallel block body downloads from multiple peers
@@ -45,6 +46,13 @@ type BlockScheduler struct {
 	requestTimeout     time.Duration
 
 	nextConnectHeight uint32
+
+	// forkQueue holds blocks from a divergent best-header chain that must be
+	// downloaded and fed to ProcessBlock before normal sequential download
+	// resumes. These blocks trigger a reorg when their cumulative work
+	// exceeds the current main chain.
+	forkQueue         []schedulerEntry
+	forkNextDrain     int
 }
 
 type schedulerEntry struct {
@@ -111,7 +119,7 @@ func (s *BlockScheduler) Populate() {
 }
 
 func (s *BlockScheduler) populateLocked() {
-	_, tipHeight := s.chain.Tip()
+	tipHash, tipHeight := s.chain.Tip()
 	s.nextConnectHeight = tipHeight + 1
 	bestHeaderHeight := s.headerIndex.BestHeaderHeight()
 
@@ -124,32 +132,82 @@ func (s *BlockScheduler) populateLocked() {
 		"in_flight", len(s.inFlight),
 		"staging", len(s.staging))
 
+	// Detect fork divergence: if the committed chain's tip is on a different
+	// fork than the header index's best chain, blocks fetched starting at
+	// tipHeight+1 will be orphans (their parent is on the other fork).
+	// Build a fork queue of blocks from the fork point to tipHeight on the
+	// best header chain. ProcessBlock will store them as side-chain blocks
+	// and trigger a reorg when cumulative work exceeds the current tip.
+	s.forkQueue = nil
+	s.forkNextDrain = 0
+	if tipHeight > 0 {
+		headerAtTip := s.headerIndex.GetHeaderByHeight(tipHeight)
+		if headerAtTip != nil && headerAtTip.Hash != tipHash {
+			forkHeight := s.findForkPoint(tipHeight)
+			forkEntries := s.headerIndex.HeadersToFetch(forkHeight+1, int(tipHeight-forkHeight))
+			for _, entry := range forkEntries {
+				if !s.chain.HasBlockOnChain(entry.Hash) {
+					s.forkQueue = append(s.forkQueue, schedulerEntry{Hash: entry.Hash, Height: entry.Height})
+				}
+			}
+			if len(s.forkQueue) > 0 {
+				logging.L.Warn("[sync] scheduler detected fork divergence — queued fork blocks for reorg",
+					"component", "p2p",
+					"tip_height", tipHeight,
+					"tip_hash", tipHash.ReverseString()[:16],
+					"header_hash", headerAtTip.Hash.ReverseString()[:16],
+					"fork_height", forkHeight,
+					"fork_blocks", len(s.forkQueue))
+				// Also add fork entries to the needed queue so AssignWork
+				// can request them from peers.
+				for _, entry := range s.forkQueue {
+					s.needed = append(s.needed, entry)
+				}
+			}
+		}
+	}
+
 	alreadyQueued := make(map[types.Hash]struct{}, len(s.needed))
 	for _, e := range s.needed {
 		alreadyQueued[e.Hash] = struct{}{}
 	}
 
-	hashes := s.headerIndex.HeadersToFetch(s.nextConnectHeight, int(bestHeaderHeight-tipHeight))
+	entries := s.headerIndex.HeadersToFetch(s.nextConnectHeight, int(bestHeaderHeight-tipHeight))
 	newCount := 0
-	for i, h := range hashes {
-		height := s.nextConnectHeight + uint32(i)
-		if _, ok := alreadyQueued[h]; ok {
+	for _, entry := range entries {
+		if _, ok := alreadyQueued[entry.Hash]; ok {
 			continue
 		}
-		if _, ok := s.inFlight[h]; ok {
+		if _, ok := s.inFlight[entry.Hash]; ok {
 			continue
 		}
-		if _, ok := s.staging[h]; ok {
+		if _, ok := s.staging[entry.Hash]; ok {
 			continue
 		}
-		s.needed = append(s.needed, schedulerEntry{Hash: h, Height: height})
+		s.needed = append(s.needed, schedulerEntry{Hash: entry.Hash, Height: entry.Height})
 		newCount++
 	}
 
 	logging.P2PSyncDebug("scheduler.Populate done",
-		"fetched_hashes", len(hashes),
+		"fetched_hashes", len(entries),
 		"new_queued", newCount,
 		"total_needed", len(s.needed))
+}
+
+// findForkPoint walks backward from the given height to find the last height
+// where the committed main chain and the header index's best chain agree.
+func (s *BlockScheduler) findForkPoint(fromHeight uint32) uint32 {
+	for h := fromHeight; h > 0; h-- {
+		mainHash, ok := s.chain.MainChainHashAtHeight(h)
+		if !ok {
+			continue
+		}
+		headerNode := s.headerIndex.GetHeaderByHeight(h)
+		if headerNode != nil && headerNode.Hash == mainHash {
+			return h
+		}
+	}
+	return 0
 }
 
 // Reset clears all in-flight requests, staging, and the needed queue, then
@@ -206,6 +264,8 @@ func (s *BlockScheduler) AssignWork(peerAddr string, limit int, peerBestHeight u
 
 	var assigned []types.Hash
 	var remaining []schedulerEntry
+	skippedTooHigh := 0
+	var minSkippedHeight, maxSkippedHeight uint32
 
 	for _, entry := range s.needed {
 		if len(assigned) >= available {
@@ -218,6 +278,13 @@ func (s *BlockScheduler) AssignWork(peerAddr string, limit int, peerBestHeight u
 		}
 		if entry.Height > peerBestHeight {
 			remaining = append(remaining, entry)
+			skippedTooHigh++
+			if minSkippedHeight == 0 || entry.Height < minSkippedHeight {
+				minSkippedHeight = entry.Height
+			}
+			if entry.Height > maxSkippedHeight {
+				maxSkippedHeight = entry.Height
+			}
 			continue
 		}
 
@@ -243,6 +310,16 @@ func (s *BlockScheduler) AssignWork(peerAddr string, limit int, peerBestHeight u
 			"global_in_flight", len(s.inFlight),
 			"peer_in_flight", stats.InFlight,
 			"staging", len(s.staging))
+	}
+
+	if skippedTooHigh > 0 {
+		logging.L.Debug("[dbg] scheduler.AssignWork: skipped blocks above peer height",
+			"peer", peerAddr,
+			"peer_best_height", peerBestHeight,
+			"skipped_count", skippedTooHigh,
+			"skipped_height_range", fmt.Sprintf("%d..%d", minSkippedHeight, maxSkippedHeight),
+			"assigned", len(assigned),
+			"next_connect", s.nextConnectHeight)
 	}
 
 	return assigned
@@ -299,68 +376,137 @@ func (s *BlockScheduler) BlockReceived(hash types.Hash, block *types.Block, peer
 	return true
 }
 
-// DrainReady returns blocks from staging that can be connected to the chain
-// in order (starting from nextConnectHeight). Returns them in height order
-// with peer attribution for misbehavior tracking.
+// TryStageUnsolicited accepts a block that was not in-flight (e.g. relayed ahead
+// of our getdata window). If the block matches the validated best header chain
+// at or after the next connect height, it is staged and any matching entry is
+// removed from the needed queue. Returns false if the block should be ignored
+// (unknown header, not on best chain, staging full, or already past nextConnect).
+func (s *BlockScheduler) TryStageUnsolicited(blockHash types.Hash, block *types.Block, peerAddr string) bool {
+	if crypto.HashBlockHeader(&block.Header) != blockHash {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node := s.headerIndex.GetHeader(blockHash)
+	if node == nil {
+		return false
+	}
+	atHeight := s.headerIndex.GetHeaderByHeight(node.Height)
+	if atHeight == nil || atHeight.Hash != blockHash {
+		return false
+	}
+	if node.Height < s.nextConnectHeight {
+		return false
+	}
+	if _, ok := s.staging[blockHash]; ok {
+		return true
+	}
+	if _, ok := s.inFlight[blockHash]; ok {
+		// Should be handled by BlockReceived; avoid double state.
+		return false
+	}
+	if len(s.staging) >= s.maxStagingSize {
+		return false
+	}
+
+	if len(s.needed) > 0 {
+		dst := s.needed[:0]
+		for _, e := range s.needed {
+			if e.Hash != blockHash {
+				dst = append(dst, e)
+			}
+		}
+		s.needed = dst
+	}
+
+	s.staging[blockHash] = &stagedBlock{Block: block, PeerAddr: peerAddr}
+	logging.P2PSyncDebug("scheduler.TryStageUnsolicited: staged",
+		"hash", blockHash.ReverseString()[:16],
+		"height", node.Height,
+		"next_connect", s.nextConnectHeight,
+		"peer", peerAddr,
+		"staging_count", len(s.staging))
+	return true
+}
+
+// DrainReady returns the single next block that can be connected at
+// nextConnectHeight, if it is present in staging. Unlike a multi-block batch,
+// nextConnectHeight is not advanced here — only after ProcessBlock succeeds
+// (UpdateNextConnectHeight), matching Bitcoin Core's commit-after-validation
+// ordering and avoiding scheduler/chain tip skew when validation fails.
+//
+// When a fork queue is active (divergent best-header chain), fork blocks are
+// drained first in order. ProcessBlock stores them as side-chain blocks and
+// triggers a reorg when cumulative work exceeds the current tip.
 func (s *BlockScheduler) DrainReady() []stagedBlock {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var ready []stagedBlock
-	startHeight := s.nextConnectHeight
-
-	for {
-		node := s.headerIndex.GetHeaderByHeight(s.nextConnectHeight)
-		if node == nil {
-			if len(ready) == 0 {
-				logging.P2PSyncDebug("scheduler.DrainReady: no header node at height",
-					"height", s.nextConnectHeight,
-					"staging_count", len(s.staging))
-			}
-			break
+	// Priority: drain fork queue blocks first to trigger reorg.
+	if s.forkNextDrain < len(s.forkQueue) {
+		entry := s.forkQueue[s.forkNextDrain]
+		staged, ok := s.staging[entry.Hash]
+		if ok {
+			delete(s.staging, entry.Hash)
+			s.forkNextDrain++
+			logging.P2PSyncDebug("scheduler.DrainReady: fork block ready",
+				"height", entry.Height,
+				"hash", entry.Hash.ReverseString()[:16],
+				"fork_progress", s.forkNextDrain,
+				"fork_total", len(s.forkQueue))
+			return []stagedBlock{*staged}
 		}
+		// Fork block not yet in staging — wait for it.
+		return nil
+	}
 
-		staged, ok := s.staging[node.Hash]
-		if !ok {
-			if len(ready) == 0 {
-				logging.P2PSyncDebug("scheduler.DrainReady: block not in staging",
-					"height", s.nextConnectHeight,
-					"hash", node.Hash.ReverseString()[:16],
-					"staging_count", len(s.staging),
-					"in_flight", len(s.inFlight))
-			}
-			// If staging is more than half full but the next sequential
-			// block is missing, flush staging back to needed to break the
-			// deadlock where staging is full, AssignWork is blocked, but
-			// the next block can never be drained.
-			if len(s.staging) > s.maxStagingSize/2 {
-				flushed := len(s.staging)
-				for hash := range s.staging {
-					s.needed = append(s.needed, schedulerEntry{Hash: hash, Height: 0})
-					delete(s.staging, hash)
+	node := s.headerIndex.GetHeaderByHeight(s.nextConnectHeight)
+	if node == nil {
+		if len(s.staging) > 0 {
+			logging.P2PSyncDebug("scheduler.DrainReady: no header node at height",
+				"height", s.nextConnectHeight,
+				"staging_count", len(s.staging))
+		}
+		return nil
+	}
+
+	staged, ok := s.staging[node.Hash]
+	if !ok {
+		logging.P2PSyncDebug("scheduler.DrainReady: block not in staging",
+			"height", s.nextConnectHeight,
+			"hash", node.Hash.ReverseString()[:16],
+			"staging_count", len(s.staging),
+			"in_flight", len(s.inFlight))
+		// If staging is more than half full but the next sequential block is
+		// missing, flush staging back to needed so AssignWork can resume
+		// (same deadlock break as before, now with single-block drain).
+		if len(s.staging) > s.maxStagingSize/2 {
+			flushed := len(s.staging)
+			for hash := range s.staging {
+				height := uint32(0)
+				if node := s.headerIndex.GetHeader(hash); node != nil {
+					height = node.Height
 				}
-				logging.L.Warn("[sync] staging deadlock detected, flushed staging to needed",
-					"flushed", flushed,
-					"in_flight", len(s.inFlight),
-					"next_connect", s.nextConnectHeight)
+				s.needed = append(s.needed, schedulerEntry{Hash: hash, Height: height})
+				delete(s.staging, hash)
 			}
-			break
+			logging.L.Warn("[sync] staging deadlock detected, flushed staging to needed",
+				"flushed", flushed,
+				"in_flight", len(s.inFlight),
+				"next_connect", s.nextConnectHeight)
 		}
-
-		delete(s.staging, node.Hash)
-		ready = append(ready, *staged)
-		s.nextConnectHeight++
+		return nil
 	}
 
-	if len(ready) > 0 {
-		logging.P2PSyncDebug("scheduler.DrainReady",
-			"drained", len(ready),
-			"from_height", startHeight,
-			"to_height", s.nextConnectHeight-1,
-			"remaining_staging", len(s.staging))
-	}
+	delete(s.staging, node.Hash)
+	logging.P2PSyncDebug("scheduler.DrainReady: prepared next block",
+		"height", s.nextConnectHeight,
+		"hash", node.Hash.ReverseString()[:16],
+		"remaining_staging", len(s.staging))
 
-	return ready
+	return []stagedBlock{*staged}
 }
 
 // RequeueBlock moves a block hash back to the needed queue after a validation
@@ -512,13 +658,14 @@ func (s *BlockScheduler) StagingCount() int {
 	return len(s.staging)
 }
 
-// UpdateNextConnectHeight advances the scheduler's notion of the chain tip
-// after blocks have been successfully connected.
+// UpdateNextConnectHeight advances the scheduler's next height after a block at
+// `height` has been successfully connected to the main chain.
 func (s *BlockScheduler) UpdateNextConnectHeight(height uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev := s.nextConnectHeight
-	if height >= s.nextConnectHeight {
+	// Next block to attach is always height+1 once height is on the main chain.
+	if height+1 > s.nextConnectHeight {
 		s.nextConnectHeight = height + 1
 	}
 	logging.P2PSyncDebug("scheduler.UpdateNextConnectHeight",

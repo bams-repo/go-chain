@@ -45,6 +45,14 @@ const (
 	maxForkDepth uint32 = 2016
 )
 
+// HeaderFetchEntry pairs a block hash with its height for the block download
+// scheduler. Returning both prevents height miscalculation when the best-chain
+// height index has gaps.
+type HeaderFetchEntry struct {
+	Hash   types.Hash
+	Height uint32
+}
+
 // Throttle HeadersToFetch debug — the block scheduler calls this every tick.
 var headersToFetchLogMu sync.Mutex
 var lastHeadersToFetchLog time.Time
@@ -306,44 +314,65 @@ func (idx *HeaderIndex) pruneStaleForks() {
 	}
 }
 
+// addHeadersSubBatchSize controls how many headers are validated under a single
+// lock acquisition. PoW validation (sha256mem) is expensive (~20ms/header), so
+// holding the write lock for an entire 2000-header batch starves P2P operations
+// that need read access (Tip, HasBlock, IsTipStale, etc.). Processing in small
+// sub-batches lets the P2P layer interleave reads between validation bursts.
+const addHeadersSubBatchSize = 50
+
 // AddHeaders validates and adds a batch of headers in order.
 // Each header must connect to the previous. Stops at the first invalid header.
 // Returns the count of successfully added headers and the first error (if any).
 func (idx *HeaderIndex) AddHeaders(headers []types.BlockHeader, nowUnix uint32) (int, error) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
 	added := 0
 	dupes := 0
 	rejected := 0
-	for i := range headers {
-		_, err := idx.addHeaderLocked(&headers[i], nowUnix)
-		if err != nil {
-			if errors.Is(err, ErrDuplicateHeader) {
-				dupes++
-				continue
-			}
-			if errors.Is(err, ErrRejectedHeader) {
-				rejected++
-				continue
-			}
-			logging.ChainSyncDebug("AddHeaders: hard error",
-				"index", i,
-				"error", err,
-				"added_so_far", added,
-				"best_height", idx.bestHeader.Height)
-			return added, err
+
+	for start := 0; start < len(headers); start += addHeadersSubBatchSize {
+		end := start + addHeadersSubBatchSize
+		if end > len(headers) {
+			end = len(headers)
 		}
-		added++
+
+		idx.mu.Lock()
+		for i := start; i < end; i++ {
+			_, err := idx.addHeaderLocked(&headers[i], nowUnix)
+			if err != nil {
+				if errors.Is(err, ErrDuplicateHeader) {
+					dupes++
+					continue
+				}
+				if errors.Is(err, ErrRejectedHeader) {
+					rejected++
+					continue
+				}
+				bestH := idx.bestHeader.Height
+				idx.mu.Unlock()
+				logging.ChainSyncDebug("AddHeaders: hard error",
+					"index", i,
+					"error", err,
+					"added_so_far", added,
+					"best_height", bestH)
+				return added, err
+			}
+			added++
+		}
+		idx.mu.Unlock()
 	}
+
+	idx.mu.RLock()
+	bestH := idx.bestHeader.Height
+	indexSz := len(idx.byHash)
+	idx.mu.RUnlock()
 
 	logging.ChainSyncDebug("AddHeaders complete",
 		"batch_size", len(headers),
 		"added", added,
 		"dupes", dupes,
 		"rejected", rejected,
-		"best_height", idx.bestHeader.Height,
-		"index_size", len(idx.byHash))
+		"best_height", bestH,
+		"index_size", indexSz)
 	return added, nil
 }
 
@@ -428,18 +457,18 @@ func (idx *HeaderIndex) HeaderLocator() []types.Hash {
 // HeadersToFetch returns an ordered list of header hashes between startHeight
 // and the best header tip that do not yet have full block data.
 // Used by the block download scheduler.
-func (idx *HeaderIndex) HeadersToFetch(startHeight uint32, limit int) []types.Hash {
+func (idx *HeaderIndex) HeadersToFetch(startHeight uint32, limit int) []HeaderFetchEntry {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	var result []types.Hash
+	var result []HeaderFetchEntry
 	bestH := idx.bestHeader.Height
 	nilCount := 0
 
 	for h := startHeight; h <= bestH && len(result) < limit; h++ {
 		node := idx.getHeaderByHeightLocked(h)
 		if node != nil {
-			result = append(result, node.Hash)
+			result = append(result, HeaderFetchEntry{Hash: node.Hash, Height: h})
 		} else {
 			nilCount++
 		}

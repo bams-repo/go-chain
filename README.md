@@ -87,7 +87,12 @@ Requires Go, Node.js 20+, and WebKit2GTK (Linux). See `./configure --help` for d
 
 ## Join the Testnet
 
-A public testnet is running with seed nodes across multiple regions. To join:
+A public testnet is running with seed nodes across multiple regions. Built-in testnet seeds (P2P port `19334`) are:
+
+- `95.179.203.47:19334` (London)
+- `207.246.117.14:19334` (Miami)
+
+To join:
 
 ```bash
 # Download the latest release
@@ -99,6 +104,9 @@ A public testnet is running with seed nodes across multiple regions. To join:
 # Or build and run the GUI wallet (defaults to testnet)
 ./configure --with-qt && make build
 ./bin/fairchain-qt
+
+# Wallet: verbose node logging (debug window + stderr)
+FAIRCHAIN_DEBUG=1 ./bin/fairchain-qt
 ```
 
 ## What's Implemented
