@@ -516,12 +516,16 @@ func (m *Manager) ShouldMine() bool {
 		return true
 	case SyncStateInitial:
 		_, ourHeight := m.chain.Tip()
+		now := time.Now()
 		m.mu.RLock()
 		peerCount := len(m.peers)
 		var bestPeerHeight uint32
 		for _, p := range m.peers {
 			v := p.Version()
 			if v == nil || v.Version < 2 {
+				continue
+			}
+			if cooldown, ok := m.headerSyncFailedPeers[p.Addr()]; ok && now.Before(cooldown) {
 				continue
 			}
 			if h := p.BestHeight(); h > bestPeerHeight {
@@ -3052,14 +3056,22 @@ func (m *Manager) syncLoop(ctx context.Context) {
 	}
 }
 
-// peerBestHeightV2 returns the maximum advertised height among v2+ peers.
+// peerBestHeightV2 returns the maximum advertised height among v2+ peers,
+// excluding peers on the header-sync failed cooldown list. Without this
+// exclusion, a single peer advertising a fraudulent height (e.g. 37,487 when
+// the real tip is ~30,800) keeps the node permanently in IBD and prevents
+// mining — even after the peer has been rotated away from header sync.
 func (m *Manager) peerBestHeightV2() uint32 {
+	now := time.Now()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var best uint32
 	for _, p := range m.peers {
 		v := p.Version()
 		if v == nil || v.Version < 2 {
+			continue
+		}
+		if cooldown, ok := m.headerSyncFailedPeers[p.Addr()]; ok && now.Before(cooldown) {
 			continue
 		}
 		ph := p.BestHeight()
@@ -3114,6 +3126,7 @@ func (m *Manager) isInitialBlockDownload() bool {
 // compares our height to peers so we do not mark SYNCED while still behind.
 func (m *Manager) handleSyncInitial() {
 	_, ourHeight := m.chain.Tip()
+	now := time.Now()
 
 	m.mu.RLock()
 	var bestHeight uint32
@@ -3132,6 +3145,12 @@ func (m *Manager) handleSyncInitial() {
 			continue
 		}
 		ph := p.BestHeight()
+		if cooldown, ok := m.headerSyncFailedPeers[p.Addr()]; ok && now.Before(cooldown) {
+			if logging.DebugMode {
+				peerHeights = append(peerHeights, fmt.Sprintf("%s:%d(v%d,failed)", p.Addr(), ph, v.Version))
+			}
+			continue
+		}
 		if ph > bestHeight {
 			bestHeight = ph
 		}
@@ -4126,6 +4145,7 @@ func (m *Manager) handleFastSyncTick() {
 // many blocks ahead (fork recovery — our tip can look "fresh" on a losing fork).
 func (m *Manager) handleSyncedTick() {
 	_, ourHeight := m.chain.Tip()
+	now := time.Now()
 
 	m.mu.RLock()
 	var bestHeight uint32
@@ -4136,6 +4156,12 @@ func (m *Manager) handleSyncedTick() {
 			continue
 		}
 		ph := p.BestHeight()
+		if cooldown, ok := m.headerSyncFailedPeers[p.Addr()]; ok && now.Before(cooldown) {
+			if logging.DebugMode {
+				peerHeightDiag = append(peerHeightDiag, fmt.Sprintf("%s:h=%d(failed)", p.Addr(), ph))
+			}
+			continue
+		}
 		if ph > bestHeight {
 			bestHeight = ph
 		}
