@@ -61,6 +61,16 @@ type Peer struct {
 	// Total headers received from this peer (DoS tracking).
 	headersReceived int32 // atomic counter
 
+	// Bitcoin Core parity (ConsiderEviction): highest header height this peer
+	// has actually proven by delivering valid headers. Distinct from BestHeight
+	// which is the self-reported version message height.
+	provenHeaderHeight atomic.Uint32
+
+	// Chain-sync eviction state: deadline by which the peer must prove its
+	// claimed chain with headers, and whether a final getheaders was sent.
+	chainSyncDeadline time.Time
+	chainSyncWarned   bool
+
 	// Misbehavior scoring (Bitcoin Core parity: ban at 100).
 	banScore int32 // atomic-style but guarded by mu for compound ops
 
@@ -195,6 +205,24 @@ func (p *Peer) BestHeight() uint32 {
 		return 0
 	}
 	return p.version.StartHeight
+}
+
+// ProvenHeaderHeight returns the highest header height this peer has proven
+// by delivering valid headers (as opposed to self-reported BestHeight).
+func (p *Peer) ProvenHeaderHeight() uint32 { return p.provenHeaderHeight.Load() }
+
+// SetProvenHeaderHeightIfGreater atomically updates the proven header height
+// if the new value exceeds the current one.
+func (p *Peer) SetProvenHeaderHeightIfGreater(h uint32) {
+	for {
+		old := p.provenHeaderHeight.Load()
+		if h <= old {
+			return
+		}
+		if p.provenHeaderHeight.CompareAndSwap(old, h) {
+			return
+		}
+	}
 }
 
 // --- Liveness ---

@@ -107,6 +107,13 @@ type Manager struct {
 	lastHeaderHeight   uint32
 	headerSyncStalls   int
 	headerSyncCaughtUp bool
+	headerSyncDeadline time.Time // cumulative download deadline for current sync peer
+
+	// Bitcoin Core parity: peers that stalled during header sync are excluded
+	// from re-selection until a cooldown expires. Prevents the highest-height
+	// peer from being immediately re-picked after rotation (the root cause of
+	// the "stuck on a lying peer" bug).
+	headerSyncFailedPeers map[string]time.Time // addr -> cooldown expiry
 
 	// Rate-limited audit: blocks received during HEADER_SYNC are dropped on purpose.
 	headerSyncDropLogMu        sync.Mutex
@@ -209,7 +216,7 @@ const (
 	addrBudgetWindow = 24 * time.Hour
 
 	// Header-first sync constants.
-	headerSyncStallTimeout = 30 * time.Second
+	headerSyncStallTimeout = 15 * time.Second
 	blockSyncStallTimeout  = 15 * time.Second
 	// After this many block-download recoveries without tip movement, poke seed
 	// reconnection (small network; Core has many DNS seeds — we escalate rarely).
@@ -219,9 +226,26 @@ const (
 	// (analogous to dropping bad mapBlocksInFlight state).
 	blockSyncOrphanRepeatWindow    = 40 * time.Second
 	blockSyncOrphanRepeatThreshold = 3
-	maxStallsBeforeRotate          = 3
-	maxStallsBeforeBan             = 10
+	maxStallsBeforeRotate          = 2
+	maxStallsBeforeBan             = 6
 	maxHeadersPerPeer      = 100000
+
+	// Bitcoin Core parity: cooldown before a failed header sync peer can be
+	// re-selected. Core achieves this implicitly via disconnect + fSyncStarted
+	// gating; we use an explicit cooldown since we don't disconnect on rotate.
+	headerSyncFailedCooldown = 5 * time.Minute
+
+	// Bitcoin Core parity (ConsiderEviction): disconnect outbound peers that
+	// claim a chain height they never prove with headers. Core uses 20min +
+	// 2min; smaller values for a small network where stalls are more damaging.
+	chainSyncTimeout      = 10 * time.Minute
+	chainSyncResponseTime = 2 * time.Minute
+
+	// Bitcoin Core parity (HEADERS_DOWNLOAD_TIMEOUT): cumulative deadline for
+	// a header sync peer to deliver headers. Core uses 15min base + 1ms per
+	// expected header; smaller base for a small network.
+	headerDownloadTimeoutBase      = 5 * time.Minute
+	headerDownloadTimeoutPerHeader = time.Millisecond
 
 	// Fast sync: request blocks in large sequential batches from one peer.
 	// The serving peer caps at maxGetDataBlockResponses (500) per getdata,
@@ -375,8 +399,9 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		ibdQueueDone:       make(chan struct{}),
 		syncState:          SyncStateInitial,
 		headerIndex:        headerIndex,
-		legacyInFlight:     make(map[types.Hash]time.Time),
-		selfAddrs:          make(map[string]struct{}),
+		legacyInFlight:        make(map[types.Hash]time.Time),
+		selfAddrs:             make(map[string]struct{}),
+		headerSyncFailedPeers: make(map[string]time.Time),
 	}
 
 	if opts != nil {
@@ -2948,6 +2973,7 @@ func (m *Manager) syncLoop(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var lastSyncDebugLog time.Time
+	var lastEvictionCheck time.Time
 
 	for {
 		select {
@@ -2960,6 +2986,15 @@ func (m *Manager) syncLoop(ctx context.Context) {
 			m.syncStateMu.RLock()
 			state := m.syncState
 			m.syncStateMu.RUnlock()
+
+			// Bitcoin Core parity: periodically check for peers that claim
+			// tall chains but never prove them (ConsiderEviction + evict
+			// extra outbounds). Core runs this every 45s.
+			if time.Since(lastEvictionCheck) >= 45*time.Second {
+				lastEvictionCheck = time.Now()
+				m.considerEviction()
+				m.pruneHeaderSyncFailedPeers()
+			}
 
 			if time.Since(lastSyncDebugLog) >= 2*time.Second {
 				lastSyncDebugLog = time.Now()
@@ -3151,6 +3186,11 @@ func (m *Manager) handleSyncInitial() {
 				m.lastHeaderHeight = m.headerIndex.BestHeaderHeight()
 				m.headerSyncStalls = 0
 				m.headerSyncCaughtUp = false
+				gap := uint32(0)
+				if peer.BestHeight() > m.lastHeaderHeight {
+					gap = peer.BestHeight() - m.lastHeaderHeight
+				}
+				m.headerSyncDeadline = time.Now().Add(headerDownloadTimeoutBase + headerDownloadTimeoutPerHeader*time.Duration(gap))
 
 				m.syncPeerAddrMu.Lock()
 				m.syncPeerAddr = peer.Addr()
@@ -3218,6 +3258,11 @@ func (m *Manager) handleSyncInitial() {
 		m.lastHeaderHeight = m.headerIndex.BestHeaderHeight()
 		m.headerSyncStalls = 0
 		m.headerSyncCaughtUp = false
+		gap := uint32(0)
+		if peer.BestHeight() > m.lastHeaderHeight {
+			gap = peer.BestHeight() - m.lastHeaderHeight
+		}
+		m.headerSyncDeadline = time.Now().Add(headerDownloadTimeoutBase + headerDownloadTimeoutPerHeader*time.Duration(gap))
 
 		m.syncPeerAddrMu.Lock()
 		m.syncPeerAddr = peer.Addr()
@@ -3304,6 +3349,15 @@ func (m *Manager) handleHeaderSyncTick() {
 		m.headerSyncStalls = 0
 		m.headerSyncCaughtUp = false
 
+		// Bitcoin Core parity: cumulative header download deadline. Core uses
+		// HEADERS_DOWNLOAD_TIMEOUT_BASE + 1ms * expected_headers. We compute
+		// the expected gap from the peer's claimed height.
+		gap := uint32(0)
+		if peer.BestHeight() > m.lastHeaderHeight {
+			gap = peer.BestHeight() - m.lastHeaderHeight
+		}
+		m.headerSyncDeadline = time.Now().Add(headerDownloadTimeoutBase + headerDownloadTimeoutPerHeader*time.Duration(gap))
+
 		m.syncPeerAddrMu.Lock()
 		m.syncPeerAddr = peer.Addr()
 		m.syncPeerSince = time.Now()
@@ -3314,14 +3368,15 @@ func (m *Manager) handleHeaderSyncTick() {
 	}
 
 	// Check for stall.
+	now := time.Now()
 	currentHeight := m.headerIndex.BestHeaderHeight()
 	if currentHeight > m.lastHeaderHeight {
 		m.lastHeaderHeight = currentHeight
-		m.headerSyncSince = time.Now()
+		m.headerSyncSince = now
 		m.headerSyncStalls = 0
-	} else if time.Since(m.headerSyncSince) > headerSyncStallTimeout {
+	} else if now.Sub(m.headerSyncSince) > headerSyncStallTimeout {
 		m.headerSyncStalls++
-		m.headerSyncSince = time.Now()
+		m.headerSyncSince = now
 
 		if logging.DebugMode {
 			logging.L.Debug("[dbg] handleHeaderSyncTick: stall detected",
@@ -3336,6 +3391,7 @@ func (m *Manager) handleHeaderSyncTick() {
 			logging.L.Warn("disconnecting header sync peer due to excessive stalls",
 				"component", "p2p", "peer", syncPeer.Addr(),
 				"stalls", m.headerSyncStalls)
+			m.headerSyncFailedPeers[syncPeer.Addr()] = now.Add(headerSyncFailedCooldown)
 			syncPeer.Close()
 			m.headerSyncPeerAddr = ""
 			return
@@ -3344,10 +3400,26 @@ func (m *Manager) handleHeaderSyncTick() {
 			logging.L.Warn("rotating header sync peer due to stall",
 				"component", "p2p", "old_peer", syncPeer.Addr(),
 				"stalls", m.headerSyncStalls)
+			m.headerSyncFailedPeers[syncPeer.Addr()] = now.Add(headerSyncFailedCooldown)
 			m.headerSyncPeerAddr = ""
 			return
 		}
 		m.requestHeaders(syncPeer)
+		return
+	}
+
+	// Bitcoin Core parity: cumulative header download deadline. If the sync
+	// peer has not delivered enough headers within the scaled timeout, treat
+	// it as failed and rotate. This catches peers that trickle just enough
+	// to avoid per-stall rotation but never actually make real progress.
+	if !m.headerSyncDeadline.IsZero() && now.After(m.headerSyncDeadline) {
+		logging.L.Warn("header sync peer exceeded cumulative download deadline",
+			"component", "p2p", "peer", syncPeer.Addr(),
+			"header_height", currentHeight,
+			"last_progress_height", m.lastHeaderHeight,
+			"deadline_elapsed", now.Sub(m.headerSyncDeadline.Add(-headerDownloadTimeoutBase)))
+		m.headerSyncFailedPeers[syncPeer.Addr()] = now.Add(headerSyncFailedCooldown)
+		m.headerSyncPeerAddr = ""
 		return
 	}
 
@@ -4179,6 +4251,92 @@ func (m *Manager) handleSyncedTick() {
 
 // --- Header sync peer selection ---
 
+// considerEviction checks all outbound v2+ peers for chain-sync timeout.
+// Bitcoin Core's ConsiderEviction disconnects outbound peers that claim a tall
+// chain (via version message) but never prove it by delivering headers within
+// CHAIN_SYNC_TIMEOUT + HEADERS_RESPONSE_TIME. This prevents a single lying
+// peer from monopolizing the "best peer" slot indefinitely.
+func (m *Manager) considerEviction() {
+	_, ourHeight := m.chain.Tip()
+	now := time.Now()
+
+	m.mu.RLock()
+	var candidates []*Peer
+	for _, p := range m.peers {
+		if p.IsInbound() || !m.peerSupportsHeaders(p) {
+			continue
+		}
+		claimed := p.BestHeight()
+		proven := p.ProvenHeaderHeight()
+		if claimed > ourHeight && claimed > proven+100 {
+			candidates = append(candidates, p)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, p := range candidates {
+		p.mu.Lock()
+		if p.chainSyncDeadline.IsZero() {
+			p.chainSyncDeadline = now.Add(chainSyncTimeout)
+			p.chainSyncWarned = false
+			p.mu.Unlock()
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] considerEviction: set chain-sync deadline",
+					"peer", p.Addr(),
+					"claimed_height", p.BestHeight(),
+					"proven_height", p.ProvenHeaderHeight(),
+					"deadline", chainSyncTimeout)
+			}
+			continue
+		}
+
+		if now.Before(p.chainSyncDeadline) {
+			p.mu.Unlock()
+			continue
+		}
+
+		if !p.chainSyncWarned {
+			p.chainSyncWarned = true
+			p.chainSyncDeadline = now.Add(chainSyncResponseTime)
+			p.mu.Unlock()
+			logging.L.Warn("chain-sync timeout: sending final getheaders before eviction",
+				"component", "p2p", "peer", p.Addr(),
+				"claimed_height", p.BestHeight(),
+				"proven_height", p.ProvenHeaderHeight(),
+				"grace_period", chainSyncResponseTime)
+			m.requestHeaders(p)
+			continue
+		}
+
+		p.mu.Unlock()
+		logging.L.Warn("evicting peer: claimed chain height never proven with headers",
+			"component", "p2p", "peer", p.Addr(),
+			"claimed_height", p.BestHeight(),
+			"proven_height", p.ProvenHeaderHeight())
+		m.headerSyncFailedPeers[p.Addr()] = now.Add(headerSyncFailedCooldown)
+		p.Close()
+	}
+}
+
+// resetChainSyncDeadline clears the chain-sync eviction state for a peer,
+// called when the peer proves progress (delivers valid headers).
+func (m *Manager) resetChainSyncDeadline(peer *Peer) {
+	peer.mu.Lock()
+	peer.chainSyncDeadline = time.Time{}
+	peer.chainSyncWarned = false
+	peer.mu.Unlock()
+}
+
+// pruneHeaderSyncFailedPeers removes expired entries from the failed peers map.
+func (m *Manager) pruneHeaderSyncFailedPeers() {
+	now := time.Now()
+	for addr, expiry := range m.headerSyncFailedPeers {
+		if now.After(expiry) {
+			delete(m.headerSyncFailedPeers, addr)
+		}
+	}
+}
+
 func (m *Manager) peerSupportsHeaders(peer *Peer) bool {
 	v := peer.Version()
 	return v != nil && v.Version >= 2
@@ -4186,6 +4344,7 @@ func (m *Manager) peerSupportsHeaders(peer *Peer) bool {
 
 func (m *Manager) selectHeaderSyncPeer() *Peer {
 	_, ourHeight := m.chain.Tip()
+	now := time.Now()
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -4193,6 +4352,14 @@ func (m *Manager) selectHeaderSyncPeer() *Peer {
 	var bestHeight uint32
 	for _, p := range m.peers {
 		if !m.peerSupportsHeaders(p) {
+			continue
+		}
+		if cooldown, ok := m.headerSyncFailedPeers[p.Addr()]; ok && now.Before(cooldown) {
+			if logging.DebugMode {
+				logging.L.Debug("[dbg] selectHeaderSyncPeer: skipping failed peer",
+					"peer", p.Addr(),
+					"cooldown_remaining", time.Until(cooldown).Round(time.Second))
+			}
 			continue
 		}
 		ph := p.BestHeight()
@@ -4319,10 +4486,13 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 		// Bitcoin parity: a peer that delivers valid headers at height N
 		// necessarily has blocks up to N. Update its BestHeight so the
 		// block scheduler can assign work to this peer for those heights.
+		// Also update ProvenHeaderHeight for ConsiderEviction tracking.
 		lastHdr := msg.Headers[len(msg.Headers)-1]
 		lastHash := crypto.HashBlockHeader(&lastHdr)
 		if node := m.headerIndex.GetHeader(lastHash); node != nil {
 			peer.SetStartHeightIfGreater(node.Height)
+			peer.SetProvenHeaderHeightIfGreater(node.Height)
+			m.resetChainSyncDeadline(peer)
 		}
 
 		logging.L.Info("headers received", "component", "p2p",
