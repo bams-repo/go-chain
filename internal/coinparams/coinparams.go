@@ -86,5 +86,5 @@ const (
 	//          "lwma"       (zawy12 LWMA-1, per-block weighted moving average),
 	//          "dgw"        (Dark Gravity Wave v3, per-block averaging, Dash-style),
 	//          "digishield" (DigiShield v3, per-block asymmetric dampening, Dogecoin/Zcash-style)
-	DifficultyAlgorithm = "bitcoin"
+	DifficultyAlgorithm = "lwma"
 )

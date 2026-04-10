@@ -21,21 +21,35 @@ export function GetIRCStatus():Promise<Record<string, any>>;
 
 export function GetIRCUsers():Promise<Array<string>>;
 
+export function GetMiningConfig():Promise<Record<string, any>>;
+
 export function GetMiningStatus():Promise<Record<string, any>>;
 
 export function GetNetworkTotals():Promise<Record<string, any>>;
+
+export function GetNodeConfig():Promise<Record<string, any>>;
 
 export function GetPeerCount():Promise<number>;
 
 export function GetPeerList():Promise<Array<Record<string, any>>>;
 
+export function GetStratumStatus():Promise<Record<string, any>>;
+
 export function GetSyncProgress():Promise<number>;
 
 export function GetSyncStatus():Promise<Record<string, any>>;
 
+export function GetUpdateStatus():Promise<Record<string, any>>;
+
 export function GetWalletAddress():Promise<string>;
 
+export function InstallService():Promise<string>;
+
+export function IsServiceInstalled():Promise<boolean>;
+
 export function ListRPCMethods():Promise<Array<string>>;
+
+export function OpenDataDir():Promise<void>;
 
 export function RescanBlockchain():Promise<string>;
 
@@ -45,4 +59,14 @@ export function SendIRCMessage(arg1:string):Promise<void>;
 
 export function SetMining(arg1:boolean):Promise<void>;
 
+export function SetMiningConfig(arg1:number,arg2:number):Promise<void>;
+
+export function StartStratum(arg1:number):Promise<void>;
+
+export function StopStratum():Promise<void>;
+
+export function TestPort():Promise<Record<string, any>>;
+
 export function ToggleMining():Promise<Record<string, any>>;
+
+export function UninstallService():Promise<string>;

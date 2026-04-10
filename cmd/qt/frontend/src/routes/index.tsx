@@ -5,6 +5,7 @@ import { Overview } from "@/pages/overview";
 import { Social } from "@/pages/social";
 import { Coming } from "@/pages/Coming";
 import { NodeMap } from "@/pages/node-map";
+import { Mining } from "@/pages/mining";
 
 export default function AppRoutes() {
   return (
@@ -14,6 +15,7 @@ export default function AppRoutes() {
           <Route path="/" element={<Overview />} />
           <Route path="/social" element={<Social />} />
           <Route path="/node-map" element={<NodeMap />} />
+          <Route path="/mining" element={<Mining />} />
           <Route path="*" element={<Coming />} />
         </Route>
       </Route>

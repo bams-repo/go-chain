@@ -28,9 +28,8 @@ type Hasher struct{}
 func New() *Hasher { return &Hasher{} }
 
 func (h *Hasher) PoWHash(data []byte) types.Hash {
-	// Salt is the input data itself — each header is unique due to prevblock+nonce+timestamp.
 	out := argon2.IDKey(data, data, TimeCost, MemoryCost, Parallelism, KeyLen)
-	return types.HashFromBytes(out)
+	return types.HashFromBytes(out).Reversed()
 }
 
 func (h *Hasher) Name() string { return "argon2id" }

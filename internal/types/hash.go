@@ -101,6 +101,17 @@ func (h Hash) LessOrEqual(other Hash) bool {
 	return h == other || h.Less(other)
 }
 
+// Reversed returns a copy of the hash with bytes in reverse order.
+// Use this to convert between big-endian algorithm output and the
+// little-endian internal byte order expected by Less / LessOrEqual.
+func (h Hash) Reversed() Hash {
+	var r Hash
+	for i := 0; i < HashSize; i++ {
+		r[i] = h[HashSize-1-i]
+	}
+	return r
+}
+
 // Encode writes the hash to a byte slice in canonical order.
 func (h Hash) Encode(buf []byte) {
 	copy(buf[:HashSize], h[:])

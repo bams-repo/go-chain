@@ -58,8 +58,12 @@ type Peer struct {
 	// BIP 130: peer prefers block announcements via headers instead of inv.
 	prefersHeaders int32 // atomic: 1 = peer sent sendheaders
 
-	// Total headers received from this peer (DoS tracking).
-	headersReceived int32 // atomic counter
+	// Headers-per-window DoS tracking: sliding window counter that resets
+	// every headerWindowDuration. Bitcoin Core only limits per-message count
+	// (MaxHeadersPerMsg); this provides additional protection against peers
+	// that send an unreasonable volume of unsolicited header messages.
+	headersReceived int32     // headers received in current window
+	headerWindowStart time.Time // start of current sliding window
 
 	// Bitcoin Core parity (ConsiderEviction): highest header height this peer
 	// has actually proven by delivering valid headers. Distinct from BestHeight
@@ -121,6 +125,12 @@ const (
 	// Rate limiting: max messages per window.
 	RateLimitWindow   = 10 * time.Second
 	RateLimitMaxMsgs  = 500
+
+	// Per-peer header DoS: max headers received in a sliding window.
+	// Generous enough for full IBD (2000 headers/batch × many batches)
+	// but catches runaway request loops. Window resets every 20 minutes.
+	headerWindowDuration = 20 * time.Minute
+	headerWindowMax      = 500_000
 
 	// MinPeerProtoVersion is the lowest wire protocol version we accept.
 	MinPeerProtoVersion uint32 = 4
@@ -310,15 +320,28 @@ func (p *Peer) PrefersHeaders() bool {
 	return atomic.LoadInt32(&p.prefersHeaders) == 1
 }
 
-// AddHeadersReceived atomically increments the headers-received counter
-// and returns the new total.
+// AddHeadersReceived adds n to the sliding-window header counter and returns
+// the current window total. The window resets every headerWindowDuration.
 func (p *Peer) AddHeadersReceived(n int32) int32 {
-	return atomic.AddInt32(&p.headersReceived, n)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	if now.Sub(p.headerWindowStart) > headerWindowDuration {
+		p.headersReceived = 0
+		p.headerWindowStart = now
+	}
+	p.headersReceived += n
+	return p.headersReceived
 }
 
-// HeadersReceived returns the total number of headers received from this peer.
+// HeadersReceived returns the headers received in the current window.
 func (p *Peer) HeadersReceived() int32 {
-	return atomic.LoadInt32(&p.headersReceived)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Since(p.headerWindowStart) > headerWindowDuration {
+		return 0
+	}
+	return p.headersReceived
 }
 
 // --- Misbehavior scoring ---

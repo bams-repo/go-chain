@@ -33,11 +33,12 @@ func TestPoWHashKnownVector(t *testing.T) {
 	h := New()
 
 	// SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-	// SHA256(above bytes) = 5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456
+	// SHA256(above bytes) = 5df6e0e2...9456 (BE)
+	// PoWHash returns LE (reversed): 56944c5d...f65d
 	input := []byte{}
 	got := h.PoWHash(input)
 
-	expected, _ := hex.DecodeString("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456")
+	expected, _ := hex.DecodeString("56944c5d3f98413ef45cf54545538103cc9f298e0575820ad3591376e2e0f65d")
 	var want types.Hash
 	copy(want[:], expected)
 

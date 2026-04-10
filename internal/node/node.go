@@ -29,6 +29,7 @@ import (
 	"github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/rpc"
 	"github.com/bams-repo/fairchain/internal/store"
+	"github.com/bams-repo/fairchain/internal/stratum"
 	"github.com/bams-repo/fairchain/internal/timeadjust"
 	"github.com/bams-repo/fairchain/internal/types"
 	"github.com/bams-repo/fairchain/internal/wallet"
@@ -37,12 +38,14 @@ import (
 // Options controls optional node behaviour. Callers (daemon, GUI) set these
 // based on their own CLI flags or UI state.
 type Options struct {
-	MiningEnabled bool
-	NoRPCAuth     bool
-	NoSeedNodes   bool
-	ConnectOnly   []string
-	RPCTLSCert    string
-	RPCTLSKey     string
+	MiningEnabled   bool
+	MiningThreads   int // 0 = all CPUs
+	MiningPowerLimit int // 1–100, 0 = default (100)
+	NoRPCAuth       bool
+	NoSeedNodes     bool
+	ConnectOnly     []string
+	RPCTLSCert      string
+	RPCTLSKey       string
 }
 
 // Node encapsulates the full node lifecycle: stores, chain, mempool, P2P,
@@ -66,6 +69,7 @@ type Node struct {
 	rpc     *rpc.Server
 	miner       *miner.Miner
 	minerCancel context.CancelFunc
+	stratum     *stratum.Server
 
 	cancel context.CancelFunc
 }
@@ -299,7 +303,11 @@ func (n *Node) startMiner(ctx context.Context) error {
 		metrics.Global.BlocksMined.Add(1)
 		logging.L.Info("mined block accepted", "hash", blockHash.ReverseString(), "height", height)
 		p2pMgr.BroadcastBlock(blockHash, block)
-	})
+	}, n.opts.MiningThreads)
+
+	if n.opts.MiningPowerLimit > 0 && n.opts.MiningPowerLimit < 100 {
+		m.SetPowerLimit(n.opts.MiningPowerLimit)
+	}
 
 	n.miner = m
 	go m.Run(ctx)
@@ -353,6 +361,95 @@ func (n *Node) HashrateReady() bool {
 	return n.miner.HashrateReady()
 }
 
+// MiningWorkers returns the current miner thread count, or 0 if not mining.
+func (n *Node) MiningWorkers() int {
+	if n.miner == nil {
+		return 0
+	}
+	return n.miner.Workers()
+}
+
+// MiningPowerLimit returns the current power limit percentage, or 100 if not mining.
+func (n *Node) MiningPowerLimit() int {
+	if n.miner == nil {
+		return 100
+	}
+	return n.miner.PowerLimit()
+}
+
+// SetMiningPowerLimit adjusts CPU throttling at runtime. pct is clamped to [1, 100].
+func (n *Node) SetMiningPowerLimit(pct int) {
+	if n.miner != nil {
+		n.miner.SetPowerLimit(pct)
+	}
+	n.opts.MiningPowerLimit = pct
+}
+
+// SetMiningThreads changes the thread count. Requires a miner restart to take
+// effect — the caller should stop and re-start mining after calling this.
+func (n *Node) SetMiningThreads(threads int) {
+	n.opts.MiningThreads = threads
+}
+
+// StartStratum starts the embedded stratum server on the given address.
+func (n *Node) StartStratum(ctx context.Context, listenAddr string) error {
+	if n.stratum != nil && n.stratum.Running() {
+		return fmt.Errorf("stratum server already running")
+	}
+
+	rewardScript := n.wallet.GetDefaultP2PKHScript()
+	if rewardScript == nil {
+		return fmt.Errorf("wallet has no keys for mining reward")
+	}
+
+	bc := n.chain
+	mp := n.mempool
+	p2pMgr := n.p2p
+
+	cfg := stratum.DefaultConfig()
+	cfg.ListenAddr = listenAddr
+
+	srv := stratum.New(cfg, bc, mp, n.params, n.engine.Hasher(), rewardScript, func(block *types.Block) {
+		height, err := bc.ProcessBlock(block)
+		if err != nil {
+			logging.L.Warn("stratum block rejected", "error", err)
+			return
+		}
+		p2pMgr.NotifyBlockAccepted(&block.Header)
+		var confirmedHashes []types.Hash
+		for _, tx := range block.Transactions {
+			txHash, hashErr := crypto.HashTransaction(&tx)
+			if hashErr == nil {
+				confirmedHashes = append(confirmedHashes, txHash)
+			}
+		}
+		mp.RemoveTxs(confirmedHashes)
+		blockHash := crypto.HashBlockHeader(&block.Header)
+		metrics.Global.BlocksMined.Add(1)
+		logging.L.Info("stratum block accepted", "hash", blockHash.ReverseString(), "height", height)
+		p2pMgr.BroadcastBlock(blockHash, block)
+	})
+
+	if err := srv.Start(ctx); err != nil {
+		return err
+	}
+	n.stratum = srv
+	return nil
+}
+
+// StopStratum stops the embedded stratum server.
+func (n *Node) StopStratum() {
+	if n.stratum != nil {
+		n.stratum.Stop()
+		n.stratum = nil
+	}
+}
+
+// Stratum returns the stratum server instance, or nil if not running.
+func (n *Node) Stratum() *stratum.Server {
+	return n.stratum
+}
+
 // Stop performs a graceful shutdown: persist mempool, dump peers, close stores.
 func (n *Node) Stop() error {
 	log := logging.L
@@ -360,6 +457,11 @@ func (n *Node) Stop() error {
 	if n.minerCancel != nil {
 		n.minerCancel()
 		n.minerCancel = nil
+	}
+
+	if n.stratum != nil {
+		n.stratum.Stop()
+		n.stratum = nil
 	}
 
 	if n.cancel != nil {

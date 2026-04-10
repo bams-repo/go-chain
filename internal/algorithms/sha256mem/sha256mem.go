@@ -61,7 +61,7 @@ func (h *Hasher) PoWHash(data []byte) types.Hash {
 	memPool.Put(memPtr)
 
 	final := sha256.Sum256(acc[:])
-	return types.Hash(final)
+	return types.Hash(final).Reversed()
 }
 
 func mixPassA(acc [32]byte, mem *[][32]byte) [32]byte {

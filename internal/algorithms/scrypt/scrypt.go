@@ -33,7 +33,7 @@ func (h *Hasher) PoWHash(data []byte) types.Hash {
 	if err != nil {
 		panic("scrypt.Key failed with consensus parameters: " + err.Error())
 	}
-	return types.HashFromBytes(out)
+	return types.HashFromBytes(out).Reversed()
 }
 
 func (h *Hasher) Name() string { return "scrypt" }

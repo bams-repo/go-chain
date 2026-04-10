@@ -53,6 +53,11 @@ type Miner struct {
 	allowMining func() bool
 	workers     int
 
+	// powerLimit controls CPU throttling as a percentage (1–100). At 100% the
+	// miner hashes continuously; at 50% each worker sleeps as long as it works;
+	// lower values insert proportionally longer sleeps. Defaults to 100.
+	powerLimit atomic.Int32
+
 	hashCount     atomic.Uint64
 	hashrate      atomic.Uint64
 	hashrateReady atomic.Bool
@@ -66,15 +71,18 @@ type Miner struct {
 
 // New creates a new Miner. ts may be nil, in which case raw local time is used.
 // allowMining may be nil (always mine); otherwise mining runs only when it returns true.
-func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.ChainParams, rewardScript []byte, ts TimeSource, allowMining func() bool, onBlock func(*types.Block)) *Miner {
+// numWorkers sets the thread count; 0 means use all available CPUs.
+func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.ChainParams, rewardScript []byte, ts TimeSource, allowMining func() bool, onBlock func(*types.Block), numWorkers int) *Miner {
 	if ts == nil {
 		ts = localClock{}
 	}
-	workers := runtime.NumCPU()
-	if workers < 1 {
-		workers = 1
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
 	}
-	return &Miner{
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	m := &Miner{
 		chain:         c,
 		engine:        e,
 		mempool:       mp,
@@ -83,8 +91,10 @@ func New(c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p *params.Chai
 		timeSource:    ts,
 		allowMining:   allowMining,
 		onBlock:       onBlock,
-		workers:       workers,
+		workers:       numWorkers,
 	}
+	m.powerLimit.Store(100)
+	return m
 }
 
 // Hashrate returns the approximate hashes per second (EWMA, ~60s time constant).
@@ -95,6 +105,36 @@ func (m *Miner) Hashrate() uint64 {
 // HashrateReady returns true once enough samples exist for a meaningful average.
 func (m *Miner) HashrateReady() bool {
 	return m.hashrateReady.Load()
+}
+
+// Workers returns the current thread count.
+func (m *Miner) Workers() int {
+	return m.workers
+}
+
+// PowerLimit returns the current power limit percentage (1–100).
+func (m *Miner) PowerLimit() int {
+	return int(m.powerLimit.Load())
+}
+
+// SetPowerLimit adjusts CPU throttling at runtime. pct is clamped to [1, 100].
+func (m *Miner) SetPowerLimit(pct int) {
+	if pct < 1 {
+		pct = 1
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	m.powerLimit.Store(int32(pct))
+}
+
+// MaxWorkers returns the number of logical CPUs available.
+func MaxWorkers() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 // Run starts the mining loop. It blocks until ctx is cancelled.
@@ -351,6 +391,8 @@ func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, 
 					batch = remaining
 				}
 
+				batchStart := time.Now()
+
 				if hasCountedSealer {
 					found, hashes, sealErr := cs.SealHeaderCounted(&wHeader, target, batch)
 					m.hashCount.Add(hashes)
@@ -388,6 +430,13 @@ func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, 
 				currentTip, _ := m.chain.Tip()
 				if currentTip != tipHash {
 					return
+				}
+
+				// Power limit throttling: sleep proportionally to work time.
+				if pct := int(m.powerLimit.Load()); pct < 100 {
+					elapsed := time.Since(batchStart)
+					sleepRatio := float64(100-pct) / float64(pct)
+					time.Sleep(time.Duration(float64(elapsed) * sleepRatio))
 				}
 			}
 		}(header, startNonce, endNonce)

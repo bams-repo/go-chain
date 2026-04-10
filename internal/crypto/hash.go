@@ -19,7 +19,7 @@ import (
 func DoubleSHA256(data []byte) types.Hash {
 	first := sha256.Sum256(data)
 	second := sha256.Sum256(first[:])
-	return types.HashFromBytes(second[:])
+	return types.HashFromBytes(second[:]).Reversed()
 }
 
 // HashBlockHeader computes the double-SHA256 of the canonical 80-byte header.

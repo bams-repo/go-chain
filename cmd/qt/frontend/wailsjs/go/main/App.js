@@ -42,12 +42,20 @@ export function GetIRCUsers() {
   return window['go']['main']['App']['GetIRCUsers']();
 }
 
+export function GetMiningConfig() {
+  return window['go']['main']['App']['GetMiningConfig']();
+}
+
 export function GetMiningStatus() {
   return window['go']['main']['App']['GetMiningStatus']();
 }
 
 export function GetNetworkTotals() {
   return window['go']['main']['App']['GetNetworkTotals']();
+}
+
+export function GetNodeConfig() {
+  return window['go']['main']['App']['GetNodeConfig']();
 }
 
 export function GetPeerCount() {
@@ -58,6 +66,10 @@ export function GetPeerList() {
   return window['go']['main']['App']['GetPeerList']();
 }
 
+export function GetStratumStatus() {
+  return window['go']['main']['App']['GetStratumStatus']();
+}
+
 export function GetSyncProgress() {
   return window['go']['main']['App']['GetSyncProgress']();
 }
@@ -66,12 +78,28 @@ export function GetSyncStatus() {
   return window['go']['main']['App']['GetSyncStatus']();
 }
 
+export function GetUpdateStatus() {
+  return window['go']['main']['App']['GetUpdateStatus']();
+}
+
 export function GetWalletAddress() {
   return window['go']['main']['App']['GetWalletAddress']();
 }
 
+export function InstallService() {
+  return window['go']['main']['App']['InstallService']();
+}
+
+export function IsServiceInstalled() {
+  return window['go']['main']['App']['IsServiceInstalled']();
+}
+
 export function ListRPCMethods() {
   return window['go']['main']['App']['ListRPCMethods']();
+}
+
+export function OpenDataDir() {
+  return window['go']['main']['App']['OpenDataDir']();
 }
 
 export function RescanBlockchain() {
@@ -90,6 +118,26 @@ export function SetMining(arg1) {
   return window['go']['main']['App']['SetMining'](arg1);
 }
 
+export function SetMiningConfig(arg1, arg2) {
+  return window['go']['main']['App']['SetMiningConfig'](arg1, arg2);
+}
+
+export function StartStratum(arg1) {
+  return window['go']['main']['App']['StartStratum'](arg1);
+}
+
+export function StopStratum() {
+  return window['go']['main']['App']['StopStratum']();
+}
+
+export function TestPort() {
+  return window['go']['main']['App']['TestPort']();
+}
+
 export function ToggleMining() {
   return window['go']['main']['App']['ToggleMining']();
+}
+
+export function UninstallService() {
+  return window['go']['main']['App']['UninstallService']();
 }

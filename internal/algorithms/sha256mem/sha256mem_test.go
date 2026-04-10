@@ -69,8 +69,10 @@ func TestPoWHashKnownVector(t *testing.T) {
 
 	// Locked known vector. Any change to constants, fill, mix, or
 	// finalize logic will break this test.
+	// BE output: c44266989d33a18aeefde8a63588433ff51d61a0afddff88fe9b533bc2d19469
+	// PoWHash returns LE (reversed):
 	input := []byte{}
-	want, _ := hex.DecodeString("c44266989d33a18aeefde8a63588433ff51d61a0afddff88fe9b533bc2d19469")
+	want, _ := hex.DecodeString("6994d1c23b539bfe88ffddafa0611df53f438835a6e8fdee8aa1339d986642c4")
 	var expected types.Hash
 	copy(expected[:], want)
 

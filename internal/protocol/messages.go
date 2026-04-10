@@ -40,6 +40,8 @@ const (
 	CmdAddr       = "addr"
 	CmdGetAddr    = "getaddr"
 	CmdReject     = "reject"
+	CmdProbeReq   = "probereq"
+	CmdProbeResp  = "proberesp"
 )
 
 // Inventory vector types.
@@ -85,6 +87,23 @@ type PingMsg struct {
 
 type PongMsg struct {
 	Nonce uint64
+}
+
+// ProbeReqMsg asks a peer to dial back to the sender's advertised listen
+// address and report whether the connection succeeded. The Nonce is echoed
+// in the response so the requester can correlate it. Addr is the IP:port
+// the requester wants probed (typically its own listen address as seen by
+// the remote peer).
+type ProbeReqMsg struct {
+	Nonce uint64
+	Addr  string // IP:port to probe (max 256 bytes on wire)
+}
+
+// ProbeRespMsg is the reply to a ProbeReqMsg. Reachable is 1 if the probe
+// peer could open a TCP connection to the requested address, 0 otherwise.
+type ProbeRespMsg struct {
+	Nonce     uint64
+	Reachable uint8 // 1 = open, 0 = closed/unreachable
 }
 
 // InvMsg announces inventory items.
@@ -504,6 +523,69 @@ func (m *PongMsg) Decode(r io.Reader) error {
 		return err
 	}
 	m.Nonce = binary.LittleEndian.Uint64(buf[:])
+	return nil
+}
+
+// ---- ProbeReqMsg / ProbeRespMsg encoding ----
+
+const maxProbeAddrLen = 256
+
+func (m *ProbeReqMsg) Encode(w io.Writer) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], m.Nonce)
+	if _, err := w.Write(buf[:]); err != nil {
+		return err
+	}
+	addrBytes := []byte(m.Addr)
+	if len(addrBytes) > maxProbeAddrLen {
+		addrBytes = addrBytes[:maxProbeAddrLen]
+	}
+	var lenBuf [2]byte
+	binary.LittleEndian.PutUint16(lenBuf[:], uint16(len(addrBytes)))
+	if _, err := w.Write(lenBuf[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(addrBytes)
+	return err
+}
+
+func (m *ProbeReqMsg) Decode(r io.Reader) error {
+	var buf [8]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return err
+	}
+	m.Nonce = binary.LittleEndian.Uint64(buf[:])
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return err
+	}
+	addrLen := binary.LittleEndian.Uint16(lenBuf[:])
+	if addrLen > maxProbeAddrLen {
+		return fmt.Errorf("probe addr too long: %d", addrLen)
+	}
+	addrBytes := make([]byte, addrLen)
+	if _, err := io.ReadFull(r, addrBytes); err != nil {
+		return err
+	}
+	m.Addr = string(addrBytes)
+	return nil
+}
+
+func (m *ProbeRespMsg) Encode(w io.Writer) error {
+	var buf [9]byte
+	binary.LittleEndian.PutUint64(buf[:8], m.Nonce)
+	buf[8] = m.Reachable
+	_, err := w.Write(buf[:])
+	return err
+}
+
+func (m *ProbeRespMsg) Decode(r io.Reader) error {
+	var buf [9]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return err
+	}
+	m.Nonce = binary.LittleEndian.Uint64(buf[:8])
+	m.Reachable = buf[8]
 	return nil
 }
 

@@ -48,6 +48,7 @@ type NavItem = {
 
 const primaryNav: NavItem[] = [
   { id: "overview", label: "Overview", enabled: true, to: "/", icon: LayoutDashboard },
+  { id: "mining", label: "Mining", enabled: true, to: "/mining", icon: Pickaxe },
   { id: "social", label: "Social", enabled: true, to: "/social", icon: MessagesSquare },
   { id: "node-map", label: "Node Map", enabled: true, to: "/node-map", icon: Map },
 ];
@@ -63,7 +64,6 @@ const upcomingNav: NavItem[] = [
     icon: ScrollText,
   },
   { id: "network", label: "Network", enabled: false, to: "/network", icon: Globe2 },
-  { id: "mining", label: "Mining", enabled: false, to: "/mining", icon: Pickaxe },
   { id: "console", label: "Console", enabled: false, to: "/console", icon: Terminal },
 ];
 

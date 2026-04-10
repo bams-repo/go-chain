@@ -126,6 +126,10 @@ type Manager struct {
 	blockSyncLastProgress time.Time
 	blockSyncLastHeight   uint32
 
+	// Throttle for the "zero assignments" recovery in handleBlockSyncTick.
+	// Prevents flooding peers with requestHeaders every 100ms tick.
+	lastZeroAssignRecovery time.Time
+
 	// Block sync stall / orphan recovery (Bitcoin Core–style re-fetch from valid tip).
 	blockSyncRecoveriesSinceTip int // consecutive recoveries without chain tip advance
 	blockSyncOrphanFailHash     types.Hash
@@ -163,6 +167,21 @@ type Manager struct {
 	// without wasting a TCP dial + handshake round-trip.
 	selfAddrsMu sync.RWMutex
 	selfAddrs   map[string]struct{}
+
+	// Highest semantic version observed from any peer's user agent string.
+	// Used to warn operators when a newer release is available on the network.
+	highestPeerVersionMu sync.RWMutex
+	highestPeerVersion   *version.SemVer
+
+	// Highest wire protocol version observed from any peer during handshake.
+	// When this exceeds our own ProtocolVersion, the wallet is incompatible.
+	highestPeerProtoMu      sync.RWMutex
+	highestPeerProtoVersion uint32
+
+	// Probe mechanism: pending probe requests awaiting a response from a peer.
+	// Keyed by nonce so the response can be routed back to the caller.
+	probeMu       sync.Mutex
+	probeWaiters  map[uint64]chan bool
 
 	ctx      context.Context
 	listener net.Listener
@@ -228,7 +247,6 @@ const (
 	blockSyncOrphanRepeatThreshold = 3
 	maxStallsBeforeRotate          = 2
 	maxStallsBeforeBan             = 6
-	maxHeadersPerPeer      = 100000
 
 	// Bitcoin Core parity: cooldown before a failed header sync peer can be
 	// re-selected. Core achieves this implicitly via disconnect + fSyncStarted
@@ -402,6 +420,7 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		legacyInFlight:        make(map[types.Hash]time.Time),
 		selfAddrs:             make(map[string]struct{}),
 		headerSyncFailedPeers: make(map[string]time.Time),
+		probeWaiters:          make(map[uint64]chan bool),
 	}
 
 	if opts != nil {
@@ -436,6 +455,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	go m.mempoolExpiryLoop(ctx)
 	go m.ibdProcessLoop(ctx)
 	go m.peerStorePruneLoop(ctx)
+	go m.versionWarningLoop(ctx)
 	if logging.DebugMode {
 		go m.topologyLoop(ctx)
 	}
@@ -744,6 +764,37 @@ func (m *Manager) isLocalLoopback() bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// isSelfListenAddr returns true if addr points to this node's own listen port.
+// It handles the common case where listenAddr is "0.0.0.0:port" but the peer
+// store or seed list contains the node's public IP with the same port.
+func (m *Manager) isSelfListenAddr(addr string) bool {
+	_, listenPort, err := net.SplitHostPort(m.listenAddr)
+	if err != nil {
+		return false
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || port != listenPort {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // DisconnectNode disconnects a peer by address. Returns an error if not found.
 func (m *Manager) DisconnectNode(addr string) error {
 	m.mu.RLock()
@@ -876,6 +927,20 @@ func (m *Manager) BanPeer(addr string) {
 	m.banned[ip] = time.Now().Add(BanDuration)
 	m.banMu.Unlock()
 	logging.L.Warn("peer banned", "component", "p2p", "ip", ip, "duration", BanDuration)
+}
+
+// BannedCount returns the number of currently active bans (expired entries excluded).
+func (m *Manager) BannedCount() int {
+	m.banMu.RLock()
+	defer m.banMu.RUnlock()
+	now := time.Now()
+	count := 0
+	for _, expiry := range m.banned {
+		if now.Before(expiry) {
+			count++
+		}
+	}
+	return count
 }
 
 // IsBanned checks if an IP is currently banned.
@@ -1367,6 +1432,12 @@ func (m *Manager) connectPeer(ctx context.Context, addr string) {
 		return
 	}
 
+	// Also skip if the target has the same port as our listener and the host
+	// resolves to a local interface (catches 0.0.0.0 vs public-IP mismatch).
+	if m.isSelfListenAddr(addr) {
+		return
+	}
+
 	m.selfAddrsMu.RLock()
 	_, isSelf := m.selfAddrs[addr]
 	m.selfAddrsMu.RUnlock()
@@ -1603,16 +1674,18 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 		// during IBD. Sync traffic can be bursty and banning seeds can strand
 		// small networks.
 		if !m.IsSyncing() {
-			// Rate-limit only unsolicited traffic. Request messages (getheaders,
-			// getdata, getblocks) and their responses (headers, block) are
-			// legitimate during sync on both sides of the connection. Bitcoin
-			// Core does not rate-limit these.
+			// Rate-limit only truly unsolicited/abusive traffic. Core protocol
+			// messages used for sync, relay, and liveness are exempt — Bitcoin
+			// Core does not rate-limit inv, tx, block, headers, or any of the
+			// request/response commands.
 			if !peer.CheckRateLimit() {
 				cmd := hdr.CommandString()
 				exempt := cmd == protocol.CmdBlock || cmd == protocol.CmdHeaders ||
 					cmd == protocol.CmdGetHeaders || cmd == protocol.CmdGetData ||
 					cmd == protocol.CmdGetBlocks || cmd == protocol.CmdPing ||
-					cmd == protocol.CmdPong
+					cmd == protocol.CmdPong || cmd == protocol.CmdInv ||
+					cmd == protocol.CmdTx || cmd == protocol.CmdProbeReq ||
+					cmd == protocol.CmdProbeResp
 				if !exempt {
 					m.addMisbehavior(peer, 10, "message rate limit exceeded")
 					if peer.BanScore() >= BanThreshold {
@@ -1811,6 +1884,14 @@ func (m *Manager) readAndProcessVersion(peer *Peer) error {
 	if theirVersion.Nonce == m.localNonce {
 		m.selfAddrsMu.Lock()
 		m.selfAddrs[peer.Addr()] = struct{}{}
+		// Also store the host with the default listen port so the reconnect
+		// loop stops dialing our own listen address. peer.Addr() contains the
+		// ephemeral port which won't match the listen-port form used by seeds
+		// and the peer store.
+		if host, _, err := net.SplitHostPort(peer.Addr()); err == nil {
+			listenForm := net.JoinHostPort(host, strconv.Itoa(int(m.params.DefaultPort)))
+			m.selfAddrs[listenForm] = struct{}{}
+		}
 		m.selfAddrsMu.Unlock()
 		return fmt.Errorf("self-connection detected")
 	}
@@ -1824,11 +1905,194 @@ func (m *Manager) readAndProcessVersion(peer *Peer) error {
 
 	peer.SetVersion(&theirVersion)
 
+	m.checkPeerVersion(theirVersion.UserAgent)
+	m.trackPeerProtoVersion(theirVersion.Version)
+
 	if m.timeSampler != nil && theirVersion.Timestamp != 0 {
 		m.timeSampler.AddSample(peer.Addr(), theirVersion.Timestamp)
 	}
 
 	return nil
+}
+
+// checkPeerVersion extracts the semver from a peer's user agent and updates
+// highestPeerVersion if the peer is running a newer release.
+func (m *Manager) checkPeerVersion(userAgent string) {
+	verStr, ok := version.ExtractVersionFromUserAgent(userAgent)
+	if !ok {
+		return
+	}
+	peerVer, ok := version.ParseSemVer(verStr)
+	if !ok {
+		return
+	}
+
+	m.highestPeerVersionMu.Lock()
+	defer m.highestPeerVersionMu.Unlock()
+	if m.highestPeerVersion == nil || peerVer.IsNewerThan(*m.highestPeerVersion) {
+		m.highestPeerVersion = &peerVer
+	}
+}
+
+// HighestPeerVersion returns the highest semantic version observed from any
+// connected peer's user agent, or nil if no version has been parsed yet.
+func (m *Manager) HighestPeerVersion() *version.SemVer {
+	m.highestPeerVersionMu.RLock()
+	defer m.highestPeerVersionMu.RUnlock()
+	if m.highestPeerVersion == nil {
+		return nil
+	}
+	v := *m.highestPeerVersion
+	return &v
+}
+
+// IsUpdateAvailable returns true when at least one peer on the network is
+// running a newer version than this node.
+func (m *Manager) IsUpdateAvailable() bool {
+	pv := m.HighestPeerVersion()
+	if pv == nil {
+		return false
+	}
+	return pv.IsNewerThan(version.Current())
+}
+
+// trackPeerProtoVersion records the highest wire protocol version seen from
+// any peer. Called during handshake before the min-version check so that even
+// peers we reject (because *they* are too old) still contribute.
+func (m *Manager) trackPeerProtoVersion(v uint32) {
+	m.highestPeerProtoMu.Lock()
+	defer m.highestPeerProtoMu.Unlock()
+	if v > m.highestPeerProtoVersion {
+		m.highestPeerProtoVersion = v
+	}
+}
+
+// HighestPeerProtoVersion returns the highest wire protocol version observed
+// from any peer during handshake, or 0 if no peers have been seen yet.
+func (m *Manager) HighestPeerProtoVersion() uint32 {
+	m.highestPeerProtoMu.RLock()
+	defer m.highestPeerProtoMu.RUnlock()
+	return m.highestPeerProtoVersion
+}
+
+// IsProtocolOutdated returns true when a peer on the network advertised a
+// wire protocol version higher than ours, meaning this wallet is incompatible
+// with the latest network rules and must be updated.
+func (m *Manager) IsProtocolOutdated() bool {
+	return m.HighestPeerProtoVersion() > protocol.ProtocolVersion
+}
+
+// --- Probe mechanism ---
+
+// handleProbeReq is called when a peer asks us to check if an address is
+// reachable. We open a short-lived TCP connection to the requested addr,
+// then reply with a ProbeRespMsg indicating the result. The probe is
+// intentionally limited to a brief TCP dial — no handshake — to minimize
+// abuse potential. We only probe addresses that look like valid IP:port
+// pairs and refuse to probe private/loopback ranges.
+func (m *Manager) handleProbeReq(peer *Peer, req *protocol.ProbeReqMsg) {
+	host, port, err := net.SplitHostPort(req.Addr)
+	if err != nil {
+		m.sendProbeResp(peer, req.Nonce, false)
+		return
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
+		m.sendProbeResp(peer, req.Nonce, false)
+		return
+	}
+
+	conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort(host, port), 5*time.Second)
+	if dialErr != nil {
+		m.sendProbeResp(peer, req.Nonce, false)
+		return
+	}
+	conn.Close()
+	m.sendProbeResp(peer, req.Nonce, true)
+}
+
+func (m *Manager) sendProbeResp(peer *Peer, nonce uint64, reachable bool) {
+	resp := protocol.ProbeRespMsg{Nonce: nonce}
+	if reachable {
+		resp.Reachable = 1
+	}
+	var buf bytes.Buffer
+	resp.Encode(&buf)
+	peer.SendMessage(protocol.CmdProbeResp, buf.Bytes())
+}
+
+// handleProbeResp delivers a probe result to the goroutine waiting on this nonce.
+func (m *Manager) handleProbeResp(resp *protocol.ProbeRespMsg) {
+	m.probeMu.Lock()
+	ch, ok := m.probeWaiters[resp.Nonce]
+	if ok {
+		delete(m.probeWaiters, resp.Nonce)
+	}
+	m.probeMu.Unlock()
+	if ok {
+		ch <- resp.Reachable == 1
+	}
+}
+
+// ProbeReachability asks a random connected peer to dial back to this node's
+// listen address and report whether the connection succeeded. Returns true if
+// the port is open, false otherwise. The caller should provide a context with
+// a timeout (recommended 10-15s). If no peers are connected, returns false.
+func (m *Manager) ProbeReachability(ctx context.Context, externalAddr string) (bool, error) {
+	m.mu.RLock()
+	var candidates []*Peer
+	for _, p := range m.peers {
+		if !p.IsInbound() {
+			candidates = append(candidates, p)
+		}
+	}
+	m.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return false, fmt.Errorf("no outbound peers available for probe")
+	}
+
+	// Pick a random peer
+	var nonce uint64
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		nonce = uint64(time.Now().UnixNano())
+	} else {
+		nonce = binary.LittleEndian.Uint64(b)
+	}
+
+	ch := make(chan bool, 1)
+	m.probeMu.Lock()
+	m.probeWaiters[nonce] = ch
+	m.probeMu.Unlock()
+
+	defer func() {
+		m.probeMu.Lock()
+		delete(m.probeWaiters, nonce)
+		m.probeMu.Unlock()
+	}()
+
+	// Pick a random outbound peer
+	idx := 0
+	if len(candidates) > 1 {
+		rndBytes := make([]byte, 1)
+		rand.Read(rndBytes)
+		idx = int(rndBytes[0]) % len(candidates)
+	}
+	peer := candidates[idx]
+
+	req := protocol.ProbeReqMsg{Nonce: nonce, Addr: externalAddr}
+	var buf bytes.Buffer
+	req.Encode(&buf)
+	peer.SendMessage(protocol.CmdProbeReq, buf.Bytes())
+
+	select {
+	case result := <-ch:
+		return result, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 
 // --- Message handling ---
@@ -1981,6 +2245,22 @@ func (m *Manager) handleMessage(ctx context.Context, peer *Peer, hdr *protocol.M
 
 	case protocol.CmdGetAddr:
 		m.handleGetAddr(peer)
+
+	case protocol.CmdProbeReq:
+		var req protocol.ProbeReqMsg
+		if err := req.Decode(r); err != nil {
+			m.addMisbehavior(peer, 1, "malformed probereq")
+			return
+		}
+		go m.handleProbeReq(peer, &req)
+
+	case protocol.CmdProbeResp:
+		var resp protocol.ProbeRespMsg
+		if err := resp.Decode(r); err != nil {
+			m.addMisbehavior(peer, 1, "malformed proberesp")
+			return
+		}
+		m.handleProbeResp(&resp)
 
 	default:
 		logging.L.Debug("unknown command", "component", "p2p", "cmd", cmd, "addr", peer.Addr())
@@ -3864,21 +4144,22 @@ drainLoop:
 	}
 
 	if totalAssigned == 0 && preAssignStats.Needed > 0 && preAssignStats.InFlight == 0 {
-		var peerInfo []string
-		for _, p := range peers {
-			peerInfo = append(peerInfo, fmt.Sprintf("%s:h=%d", p.Addr(), p.BestHeight()))
-		}
-		logging.L.Warn("[dbg] handleBlockSyncTick: ZERO assignments despite needed blocks — peer heights too low?",
-			"component", "sync_diag",
-			"needed", preAssignStats.Needed,
-			"next_connect", preAssignStats.NextHeight,
-			"peer_heights", peerInfo)
+		now := time.Now()
+		if now.Sub(m.lastZeroAssignRecovery) >= 30*time.Second {
+			m.lastZeroAssignRecovery = now
+			var peerInfo []string
+			for _, p := range peers {
+				peerInfo = append(peerInfo, fmt.Sprintf("%s:h=%d", p.Addr(), p.BestHeight()))
+			}
+			logging.L.Warn("[dbg] handleBlockSyncTick: ZERO assignments despite needed blocks — peer heights too low?",
+				"component", "sync_diag",
+				"needed", preAssignStats.Needed,
+				"next_connect", preAssignStats.NextHeight,
+				"peer_heights", peerInfo)
 
-		// Recovery: peer BestHeight values are stale. Request headers
-		// from all connected peers so that handleHeaders can refresh
-		// their BestHeight via SetStartHeightIfGreater.
-		for _, p := range peers {
-			m.requestHeaders(p)
+			for _, p := range peers {
+				m.requestHeaders(p)
+			}
 		}
 	}
 
@@ -4461,10 +4742,11 @@ func (m *Manager) handleHeaders(peer *Peer, msg *protocol.HeadersMsg) {
 		return
 	}
 
-	// DoS: check per-peer header count.
+	// DoS: sliding-window per-peer header count. Resets every
+	// headerWindowDuration so legitimate long syncs are not penalized.
 	total := peer.AddHeadersReceived(int32(len(msg.Headers)))
-	if total > int32(maxHeadersPerPeer) {
-		m.addMisbehavior(peer, 100, "peer exceeded max headers limit")
+	if total > int32(headerWindowMax) {
+		m.addMisbehavior(peer, 100, "peer exceeded max headers limit (window)")
 		return
 	}
 
@@ -4829,6 +5111,35 @@ func (m *Manager) peerStorePruneLoop(ctx context.Context) {
 				}
 			}
 			m.addrBudgetMu.Unlock()
+		}
+	}
+}
+
+// versionWarningLoop periodically checks whether any peer advertised a newer
+// version and emits a WARN-level log directing the operator to update.
+func (m *Manager) versionWarningLoop(ctx context.Context) {
+	const interval = 5 * time.Minute
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if m.IsProtocolOutdated() {
+				logging.L.Error("wallet protocol version is outdated — this node cannot sync with the network, please update immediately",
+					"component", "p2p",
+					"local_protocol", protocol.ProtocolVersion,
+					"network_protocol", m.HighestPeerProtoVersion(),
+					"releases", version.ReleasesURL)
+			} else if m.IsUpdateAvailable() {
+				pv := m.HighestPeerVersion()
+				logging.L.Warn("a newer version is available on the network — please update",
+					"component", "p2p",
+					"local_version", version.String(),
+					"network_version", pv.String(),
+					"releases", version.ReleasesURL)
+			}
 		}
 	}
 }

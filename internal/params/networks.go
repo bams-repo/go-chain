@@ -49,19 +49,23 @@ var Mainnet = &ChainParams{
 	// Coinbase: "fairchain genesis"
 	// Timestamp: 1774175035 (2026-03-22T10:23:55Z)
 	// Display hash: ed66675f3d5ca4cb16b1623252fbdfe49dbde4c021277ae0b026d09823a4cf56
+	// Pre-mined genesis block (sha256mem, LE hash convention).
+	// Coinbase: "fairchain genesis"
+	// Timestamp: 1774175035 (2026-03-22T10:23:55Z)
+	// Display hash: e9ecf800a77d1f85dfd263d690e5d13d3682b72a6d9537dc33fe6cad2fb545c2
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
 			PrevBlock: types.ZeroHash,
 			MerkleRoot: types.Hash{
-				0xc6, 0xea, 0x1e, 0x0a, 0x6d, 0xea, 0x9b, 0x63,
-				0x63, 0xfa, 0x0d, 0xf0, 0xa0, 0x54, 0xf8, 0xbd,
-				0x59, 0x76, 0x65, 0xb8, 0x8c, 0x2c, 0x23, 0x59,
-				0x67, 0x21, 0xf4, 0x25, 0x2d, 0x06, 0xd5, 0x2f,
+				0x2f, 0xd5, 0x06, 0x2d, 0x25, 0xf4, 0x21, 0x67,
+				0x59, 0x23, 0x2c, 0x8c, 0xb8, 0x65, 0x76, 0x59,
+				0xbd, 0xf8, 0x54, 0xa0, 0xf0, 0x0d, 0xfa, 0x63,
+				0x63, 0x9b, 0xea, 0x6d, 0x0a, 0x1e, 0xea, 0xc6,
 			},
 			Timestamp: 1774175035,
-			Bits:      0x1e7ce359,
-			Nonce:     2147491670,
+			Bits:      0x2007ffff,
+			Nonce:     77,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -78,10 +82,10 @@ var Mainnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0x56, 0xcf, 0xa4, 0x23, 0x98, 0xd0, 0x26, 0xb0,
-		0xe0, 0x7a, 0x27, 0x21, 0xc0, 0xe4, 0xbd, 0x9d,
-		0xe4, 0xdf, 0xfb, 0x52, 0x32, 0x62, 0xb1, 0x16,
-		0xcb, 0xa4, 0x5c, 0x3d, 0x5f, 0x67, 0x66, 0xed,
+		0xc2, 0x45, 0xb5, 0x2f, 0xad, 0x6c, 0xfe, 0x33,
+		0xdc, 0x37, 0x95, 0x6d, 0x2a, 0xb7, 0x82, 0x36,
+		0x3d, 0xd1, 0xe5, 0x90, 0xd6, 0x63, 0xd2, 0xdf,
+		0x85, 0x1f, 0x7d, 0xa7, 0x00, 0xf8, 0xec, 0xe9,
 	},
 
 	TargetBlockSpacing:  10 * time.Minute,
@@ -90,10 +94,9 @@ var Mainnet = &ChainParams{
 	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
-	// Difficulty calibrated for sha256mem dual-mix (~20–30 H/s per core class CPU; varies by SHA-NI).
-	// InitialBits may need recalibration if PoW parameters change again.
-	InitialBits:      0x1e7ce359,
-	MinBits:          0x1f7fffff, // Floor ≈ 8x easier than initial; allows difficulty to recover after hash rate drops
+	// Easy initial difficulty — LWMA adjusts quickly to real hash rate.
+	InitialBits:      0x2007ffff,
+	MinBits:          0x207fffff,
 	NoRetarget:       false,
 
 	MaxBlockSize:     1_000_000,
@@ -127,42 +130,43 @@ var Mainnet = &ChainParams{
 	},
 }
 
-// Testnet is the public test network with easier difficulty.
+// Testnet is the public test network.
+// v1 (testnet1): 10-minute blocks, LWMA difficulty, LE hash convention.
 var Testnet = &ChainParams{
 	Name:         "testnet",
-	DataDirName:  "testnet0",
-	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x02},
+	DataDirName:  "testnet1",
+	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x03},
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
 
-	// Pre-mined genesis block (sha256mem: 64 MiB sequential fill + dual SHA256 mix).
-	// Coinbase: "fairchain genesis"
-	// Timestamp: 1774176069 (2026-03-22T10:41:09Z)
-	// Display hash: 2a8f71957c5911c51e45ea71fb8a68b0c8cb5e37c71b355df3dc51b321dba373
+	// Pre-mined genesis block (sha256mem, LE hash convention).
+	// Coinbase: "fairchain testnet1 genesis"
+	// Timestamp: 1744325400 (2025-04-10T22:30:00Z)
+	// Display hash: 1c0d0bec5e6687df1d67239378a42f95c89a4c547d112d8c80a33c2b81580d71
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
 			PrevBlock: types.ZeroHash,
 			MerkleRoot: types.Hash{
-				0x6a, 0xde, 0x73, 0x5c, 0xa4, 0x68, 0xa0, 0x80,
-				0x82, 0x9c, 0x27, 0x77, 0x5c, 0x87, 0x65, 0x99,
-				0x96, 0x8d, 0xfb, 0x47, 0xc3, 0xa4, 0xa7, 0xbf,
-				0xb3, 0x83, 0x0e, 0x8e, 0x0c, 0xe3, 0xdf, 0x29,
+				0xb1, 0x88, 0x4d, 0xb0, 0x63, 0x4b, 0xe0, 0x81,
+				0x08, 0x02, 0x9f, 0x73, 0xfe, 0x53, 0xdc, 0xb0,
+				0x93, 0xeb, 0x40, 0xdd, 0xf7, 0x54, 0x23, 0x6c,
+				0x65, 0xbc, 0x4f, 0x2f, 0xc2, 0x1e, 0xe5, 0xe2,
 			},
-			Timestamp: 1774176069,
-			Bits:      0x2000ea44,
-			Nonce:     268435471,
+			Timestamp: 1744325400,
+			Bits:      0x2007ffff,
+			Nonce:     10,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
 			Inputs: []types.TxInput{{
 				PreviousOutPoint: types.CoinbaseOutPoint,
-				SignatureScript:  []byte("fairchain genesis"),
+				SignatureScript:  []byte("fairchain testnet1 genesis"),
 				Sequence:         0xFFFFFFFF,
 			}},
 			Outputs: []types.TxOutput{
 				{
-					Value:    50_0000_00,
+					Value:    50_0000_0000,
 					PkScript: []byte{0x00},
 				},
 				{
@@ -174,47 +178,40 @@ var Testnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0x73, 0xa3, 0xdb, 0x21, 0xb3, 0x51, 0xdc, 0xf3,
-		0x5d, 0x35, 0x1b, 0xc7, 0x37, 0x5e, 0xcb, 0xc8,
-		0xb0, 0x68, 0x8a, 0xfb, 0x71, 0xea, 0x45, 0x1e,
-		0xc5, 0x11, 0x59, 0x7c, 0x95, 0x71, 0x8f, 0x2a,
+		0x71, 0x0d, 0x58, 0x81, 0x2b, 0x3c, 0xa3, 0x80,
+		0x8c, 0x2d, 0x11, 0x7d, 0x54, 0x4c, 0x9a, 0xc8,
+		0x95, 0x2f, 0xa4, 0x78, 0x93, 0x23, 0x67, 0x1d,
+		0xdf, 0x87, 0x66, 0x5e, 0xec, 0x0b, 0x0d, 0x1c,
 	},
 
-	TargetBlockSpacing:  5 * time.Second,
-	RetargetInterval:    20,
-	TargetTimespan:      20 * 5 * time.Second, // 20 blocks × 5s
-	MaxTimeFutureDrift:  2 * time.Minute,
+	TargetBlockSpacing:  10 * time.Minute,
+	RetargetInterval:    45, // LWMA window size: 45 blocks (~7.5 hours)
+	TargetTimespan:      45 * 10 * time.Minute,
+	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
-	// Difficulty calibrated for sha256mem dual-mix (order ~10–30 H/s per core on testnet hardware).
-	// 0x2000ea44 is 4× easier target than the prior testnet (0x1f3a910b).
-	InitialBits:              0x2000ea44,
-	MinBits:                  0x207fffff, // Floor: trivial difficulty (same as regtest)
+	InitialBits:              0x2007ffff, // Very easy — same as regtest floor
+	MinBits:                  0x207fffff, // Floor: trivial difficulty
 	NoRetarget:               false,
 	AllowMinDifficultyBlocks: true,
 
 	MaxBlockSize:     2_000_000,
 	MaxBlockTxCount:  10_000,
 
-	// Economic scaling: testnet is 100x block-height accelerated relative to
-	// mainnet for issuance comparisons (e.g., testnet 100,000 ~= mainnet 1,000).
-	// To keep monetary state aligned by that mapping:
-	//   - per-block subsidy is 1/100 of mainnet
-	//   - halving interval is 100x mainnet
-	InitialSubsidy:          50_0000_00,
-	SubsidyHalvingInterval:  21_000_000,
+	InitialSubsidy:          50_0000_0000,
+	SubsidyHalvingInterval:  210_000,
 
-	CoinbaseMaturity: 10,
+	CoinbaseMaturity: 100,
 
 	MaxReorgDepth: 1000,
 
-	TimewarpGracePeriod: 10 * time.Minute, // BIP-94: generous for 5s blocks but prevents extreme manipulation
+	TimewarpGracePeriod: 10 * time.Minute,
 	PeerStoreMaxSize:    1024,
 
 	MaxMempoolSize:    5000,
-	MinRelayTxFee:     100,
-	MinRelayTxFeeRate: 1, // 1 sat/byte minimum
-	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
+	MinRelayTxFee:     1000,
+	MinRelayTxFeeRate: 1,
+	MempoolExpiry:     336 * time.Hour,
 
 	SeedNodes: []string{
 		"95.179.203.47:19334",  // seednode_london
@@ -223,8 +220,8 @@ var Testnet = &ChainParams{
 
 	ActivationHeights: map[string]uint32{
 		"locktime":      1,
-		"mindiffblocks": 15_000,
-		"timewarp":      12_000,
+		"mindiffblocks": 1,
+		"timewarp":      1,
 	},
 }
 

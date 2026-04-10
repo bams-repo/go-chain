@@ -17,11 +17,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/config"
 	"github.com/bams-repo/fairchain/internal/logging"
+	"github.com/bams-repo/fairchain/internal/miner"
 	"github.com/bams-repo/fairchain/internal/node"
 	"github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/types"
@@ -38,6 +40,14 @@ type App struct {
 	irc         *ircClient
 	trayEnd     func()
 	startupTime time.Time
+
+	// Cached P2P port probe result, refreshed periodically in the background.
+	probeMu     sync.RWMutex
+	probeOpen   bool
+	probeIP     string
+	probePort   string
+	probeError  string
+	probeReady  bool // true once the first probe has completed
 }
 
 func NewApp() *App {
@@ -91,6 +101,8 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	a.node = n
+
+	go a.probeLoop(ctx)
 
 	nickPath := ircNickPath(n.Config())
 	savedNick := loadIRCNick(nickPath)
@@ -330,6 +342,32 @@ func (a *App) GetSyncStatus() (map[string]interface{}, error) {
 		"progress":       progress,
 		"lastBlockTime":  lastBlockTime,
 	}, nil
+}
+
+// GetUpdateStatus returns whether a newer version has been observed on the
+// network. The frontend uses this to display an update banner.
+// It also reports when the wallet's wire protocol is outdated relative to
+// peers, which means the wallet is incompatible with the current network.
+func (a *App) GetUpdateStatus() map[string]interface{} {
+	if a.node == nil {
+		return map[string]interface{}{
+			"available":        false,
+			"protocolOutdated": false,
+			"releasesURL":      version.ReleasesURL,
+		}
+	}
+	p2p := a.node.P2PMgr()
+	available := p2p.IsUpdateAvailable()
+	result := map[string]interface{}{
+		"available":        available,
+		"protocolOutdated": p2p.IsProtocolOutdated(),
+		"localVersion":     version.String(),
+		"releasesURL":      version.ReleasesURL,
+	}
+	if pv := p2p.HighestPeerVersion(); pv != nil {
+		result["networkVersion"] = pv.String()
+	}
+	return result
 }
 
 // GetDebugInfo returns comprehensive node information for the debug window.
@@ -684,6 +722,108 @@ func (a *App) ToggleMining() (map[string]interface{}, error) {
 	}, nil
 }
 
+// GetMiningConfig returns the full mining configuration for the Mining tab.
+func (a *App) GetMiningConfig() map[string]interface{} {
+	maxThreads := miner.MaxWorkers()
+	result := map[string]interface{}{
+		"mining":        false,
+		"hashrate":      uint64(0),
+		"hashrateReady": false,
+		"threads":       maxThreads,
+		"maxThreads":    maxThreads,
+		"powerLimit":    100,
+	}
+	if a.node == nil {
+		return result
+	}
+	result["mining"] = a.node.IsMining()
+	result["hashrate"] = a.node.GetHashrate()
+	result["hashrateReady"] = a.node.HashrateReady()
+	result["threads"] = a.node.MiningWorkers()
+	result["powerLimit"] = a.node.MiningPowerLimit()
+	if !a.node.IsMining() {
+		result["threads"] = maxThreads
+	}
+	return result
+}
+
+// SetMiningConfig updates mining parameters. If threads change, the miner is
+// restarted to pick up the new count.
+func (a *App) SetMiningConfig(threads int, powerLimit int) error {
+	if a.node == nil {
+		return fmt.Errorf("node not initialized")
+	}
+	a.node.SetMiningPowerLimit(powerLimit)
+
+	wasMining := a.node.IsMining()
+	currentThreads := a.node.MiningWorkers()
+
+	if threads != currentThreads && wasMining {
+		a.node.SetMiningThreads(threads)
+		a.node.SetMining(false)
+		a.node.SetMining(true)
+	} else {
+		a.node.SetMiningThreads(threads)
+	}
+	return nil
+}
+
+// StartStratum starts the embedded stratum server.
+func (a *App) StartStratum(port int) error {
+	if a.node == nil {
+		return fmt.Errorf("node not initialized")
+	}
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	return a.node.StartStratum(a.ctx, addr)
+}
+
+// StopStratum stops the embedded stratum server.
+func (a *App) StopStratum() {
+	if a.node != nil {
+		a.node.StopStratum()
+	}
+}
+
+// GetStratumStatus returns the stratum server state and worker list.
+func (a *App) GetStratumStatus() map[string]interface{} {
+	result := map[string]interface{}{
+		"running":     false,
+		"listenAddr":  "",
+		"workers":     []interface{}{},
+		"sharesValid": int64(0),
+		"sharesStale": int64(0),
+		"blocksFound": int64(0),
+	}
+	if a.node == nil {
+		return result
+	}
+	srv := a.node.Stratum()
+	if srv == nil {
+		return result
+	}
+	stats := srv.Stats()
+	for k, v := range stats {
+		result[k] = v
+	}
+	workers := srv.Workers()
+	workerList := make([]map[string]interface{}, len(workers))
+	for i, w := range workers {
+		workerList[i] = map[string]interface{}{
+			"name":          w.Name,
+			"addr":          w.Addr,
+			"connectedAt":   w.ConnectedAt,
+			"sharesValid":   w.SharesValid,
+			"sharesStale":   w.SharesStale,
+			"sharesInvalid": w.SharesInvalid,
+			"difficulty":    w.Difficulty,
+			"lastShareAt":   w.LastShareAt,
+			"hashrate":      w.Hashrate,
+		}
+	}
+	result["workerList"] = workerList
+	return result
+}
+
 // ConnectIRC manually attempts to connect to the configured IRC network.
 func (a *App) ConnectIRC() error {
 	if a.irc == nil {
@@ -735,6 +875,246 @@ func (a *App) ChangeIRCNick(nick string) error {
 		return fmt.Errorf("social chat not initialized")
 	}
 	return a.irc.ChangeNick(nick)
+}
+
+// probeLoop runs the P2P reachability probe on startup and then every 60s.
+// It waits a short period after startup for peers to connect before the first
+// probe, since the probe requires at least one outbound peer.
+func (a *App) probeLoop(ctx context.Context) {
+	// Wait for peers to connect before first probe.
+	select {
+	case <-time.After(15 * time.Second):
+	case <-ctx.Done():
+		return
+	}
+
+	a.runProbe(ctx)
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			a.runProbe(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// runProbe resolves the public IP and asks a connected peer to dial back.
+func (a *App) runProbe(ctx context.Context) {
+	cfg := a.node.Config()
+	_, portStr, _ := net.SplitHostPort(cfg.ListenAddr)
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	publicIP := resolvePublicIP(client)
+
+	if publicIP == "" {
+		a.probeMu.Lock()
+		a.probeOpen = false
+		a.probeIP = ""
+		a.probePort = portStr
+		a.probeError = "could not determine public IP"
+		a.probeReady = true
+		a.probeMu.Unlock()
+		return
+	}
+
+	probeAddr := net.JoinHostPort(publicIP, portStr)
+	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+
+	reachable, err := a.node.P2PMgr().ProbeReachability(probeCtx, probeAddr)
+
+	a.probeMu.Lock()
+	a.probeIP = publicIP
+	a.probePort = portStr
+	a.probeOpen = reachable
+	a.probeReady = true
+	if err != nil {
+		a.probeError = err.Error()
+	} else {
+		a.probeError = ""
+	}
+	a.probeMu.Unlock()
+
+	if reachable {
+		logging.L.Info("P2P port probe: reachable", "addr", probeAddr)
+	} else {
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		logging.L.Info("P2P port probe: not reachable", "addr", probeAddr, "error", errMsg)
+	}
+}
+
+// GetNodeConfig returns node configuration and status information for the
+// overview page's Node Configuration card.
+func (a *App) GetNodeConfig() map[string]interface{} {
+	if a.node == nil {
+		return map[string]interface{}{
+			"listenPort":    0,
+			"dataDir":       "",
+			"diskUsageMB":   0,
+			"maxInbound":    0,
+			"maxOutbound":   0,
+			"miningEnabled": false,
+			"hashrate":      uint64(0),
+			"hashrateReady": false,
+			"bannedCount":   0,
+			"reachable":     false,
+			"uptime":        0,
+		}
+	}
+
+	cfg := a.node.Config()
+	p2p := a.node.P2PMgr()
+
+	_, portStr, _ := net.SplitHostPort(cfg.ListenAddr)
+
+	var diskMB float64
+	dataDir := cfg.NetworkDataDir()
+	filepath.Walk(dataDir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			diskMB += float64(info.Size())
+		}
+		return nil
+	})
+	diskMB = diskMB / (1024 * 1024)
+
+	uptime := int64(time.Since(a.startupTime).Seconds())
+
+	a.probeMu.RLock()
+	reachable := a.probeOpen
+	a.probeMu.RUnlock()
+
+	return map[string]interface{}{
+		"listenPort":    portStr,
+		"dataDir":       dataDir,
+		"diskUsageMB":   int64(diskMB),
+		"maxInbound":    cfg.MaxInbound,
+		"maxOutbound":   cfg.MaxOutbound,
+		"miningEnabled": a.node.IsMining(),
+		"hashrate":      a.node.GetHashrate(),
+		"hashrateReady": a.node.HashrateReady(),
+		"bannedCount":   p2p.BannedCount(),
+		"reachable":     reachable,
+		"uptime":        uptime,
+	}
+}
+
+// OpenDataDir opens the node's data directory in the system file manager.
+func (a *App) OpenDataDir() error {
+	if a.node == nil {
+		return fmt.Errorf("node not initialized")
+	}
+	dir := a.node.Config().NetworkDataDir()
+	return openFileManager(dir)
+}
+
+// InstallService registers the wallet as an OS-level service that starts
+// automatically on boot. Returns a human-readable status message.
+func (a *App) InstallService() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine executable path: %w", err)
+	}
+	return installService(exe, coinparams.NameLower)
+}
+
+// UninstallService removes the previously installed OS-level service.
+func (a *App) UninstallService() (string, error) {
+	return uninstallService(coinparams.NameLower)
+}
+
+// IsServiceInstalled checks whether the OS-level auto-start service exists.
+func (a *App) IsServiceInstalled() bool {
+	return isServiceInstalled(coinparams.NameLower)
+}
+
+// TestPort checks whether the node's P2P port is reachable from the internet
+// by asking a connected peer to dial back via the P2P probe protocol. This
+// avoids reliance on external HTTP port-check services. The result also
+// updates the cached probe state used by GetNodeConfig.
+func (a *App) TestPort() map[string]interface{} {
+	if a.node == nil {
+		return map[string]interface{}{
+			"open":     false,
+			"publicIP": "",
+			"port":     "",
+			"error":    "node not initialized",
+		}
+	}
+
+	cfg := a.node.Config()
+	_, portStr, _ := net.SplitHostPort(cfg.ListenAddr)
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	publicIP := resolvePublicIP(client)
+	if publicIP == "" {
+		return map[string]interface{}{
+			"open":     false,
+			"publicIP": "",
+			"port":     portStr,
+			"error":    "could not determine public IP",
+		}
+	}
+
+	probeAddr := net.JoinHostPort(publicIP, portStr)
+	probeCtx, cancel := context.WithTimeout(a.ctx, 12*time.Second)
+	defer cancel()
+
+	reachable, err := a.node.P2PMgr().ProbeReachability(probeCtx, probeAddr)
+
+	// Update the cached state so GetNodeConfig reflects the latest result.
+	a.probeMu.Lock()
+	a.probeOpen = reachable
+	a.probeIP = publicIP
+	a.probePort = portStr
+	a.probeReady = true
+	if err != nil {
+		a.probeError = err.Error()
+	} else {
+		a.probeError = ""
+	}
+	a.probeMu.Unlock()
+
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
+	}
+	return map[string]interface{}{
+		"open":     reachable,
+		"publicIP": publicIP,
+		"port":     portStr,
+		"error":    errStr,
+	}
+}
+
+func resolvePublicIP(client *http.Client) string {
+	urls := []string{
+		"https://api.ipify.org",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	}
+	for _, u := range urls {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 256))
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		if net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+	return ""
 }
 
 func ircNickPath(cfg *config.Config) string {
