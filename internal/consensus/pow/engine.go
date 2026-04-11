@@ -78,12 +78,27 @@ func (e *Engine) ValidateHeader(header *types.BlockHeader, parent *types.BlockHe
 // non-retarget boundaries, if the parent used min-difficulty, we scan back
 // to find the last block with real difficulty to prevent min-difficulty
 // blocks from corrupting the next retarget calculation.
+//
+// Per-block algorithms (LWMA, DGW, DigiShield) always call CalcNextBits
+// every block — the epoch-gating logic only applies to Bitcoin's epoch-based
+// retarget where difficulty is constant between boundaries.
 func (e *Engine) calcExpectedBits(header *types.BlockHeader, parent *types.BlockHeader, height uint32, getAncestor func(uint32) *types.BlockHeader, p *params.ChainParams) uint32 {
 	activationHeight, hasActivation := p.ActivationHeights["mindiffblocks"]
 	if !p.AllowMinDifficultyBlocks || !hasActivation || height < activationHeight {
 		return e.retargeter.CalcNextBits(parent, height-1, getAncestor, p)
 	}
 
+	// Per-block retargeters adjust every block; only apply the min-diff
+	// timestamp gap rule, then always compute fresh difficulty.
+	if e.retargeter.Name() != "bitcoin" {
+		minDiffGap := int64(p.TargetBlockSpacing.Seconds()) * 2
+		if int64(header.Timestamp)-int64(parent.Timestamp) > minDiffGap {
+			return p.MinBits
+		}
+		return e.retargeter.CalcNextBits(parent, height-1, getAncestor, p)
+	}
+
+	// Bitcoin epoch-based: min-diff gap check, then epoch-boundary retarget.
 	minDiffGap := int64(p.TargetBlockSpacing.Seconds()) * 2
 	if int64(header.Timestamp)-int64(parent.Timestamp) > minDiffGap {
 		return p.MinBits
