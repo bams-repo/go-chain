@@ -185,9 +185,9 @@ var Testnet = &ChainParams{
 	},
 
 	TargetBlockSpacing:  10 * time.Minute,
-	RetargetInterval:    45, // LWMA window size: 45 blocks (~7.5 hours)
-	TargetTimespan:      45 * 10 * time.Minute,
-	MaxTimeFutureDrift:  2 * time.Hour,
+	RetargetInterval:    60, // LWMA window size N=60 per zawy12 for T=600 small coins
+	TargetTimespan:      60 * 10 * time.Minute,
+	MaxTimeFutureDrift:  30 * time.Minute, // N*T/20 = 60*600/20 = 1800s per zawy12
 	MinTimestampRule:    "median-11",
 
 	InitialBits:              0x2007ffff, // Very easy — same as regtest floor
@@ -222,7 +222,6 @@ var Testnet = &ChainParams{
 		"locktime":      1,
 		"mindiffblocks": 1,
 		"timewarp":      1,
-		"lwma_v2":       1750, // LWMA v2: N=200 window, per-block clamp, tighter FTL
 	},
 }
 

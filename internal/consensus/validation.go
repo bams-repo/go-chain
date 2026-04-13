@@ -138,16 +138,7 @@ func FullValidateHeader(e Engine, header *types.BlockHeader, parent *types.Block
 // timestamp. This prevents an attacker from resetting timestamps at epoch boundaries
 // to compress the retarget window and inflate difficulty.
 func ValidateHeaderTimestamp(header *types.BlockHeader, parent *types.BlockHeader, height uint32, nowUnix uint32, getAncestor func(height uint32) *types.BlockHeader, tipHeight uint32, p *params.ChainParams) error {
-	ftl := p.MaxTimeFutureDrift
-	// LWMA v2: tighten FTL to N*T/20 per zawy12's recommendation to limit
-	// timestamp manipulation to ~5% of difficulty.
-	if v2Height, ok := p.ActivationHeights["lwma_v2"]; ok && height >= v2Height {
-		lwmaFTL := time.Duration(200*int64(p.TargetBlockSpacing)) / 20
-		if lwmaFTL < ftl {
-			ftl = lwmaFTL
-		}
-	}
-	maxFuture := int64(nowUnix) + int64(ftl/time.Second)
+	maxFuture := int64(nowUnix) + int64(p.MaxTimeFutureDrift/time.Second)
 	if int64(header.Timestamp) > maxFuture {
 		return fmt.Errorf("block timestamp %d too far in future (max %d)", header.Timestamp, maxFuture)
 	}

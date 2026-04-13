@@ -22,11 +22,11 @@ const (
 	Minor = 10
 
 	// Patch is the patch version component (bug fixes).
-	Patch = 2
+	Patch = 3
 
 	// ProtocolVersion is the peer-to-peer wire protocol version.
 	// Increment when the wire format changes in a backward-incompatible way.
-	ProtocolVersion uint32 = 7
+	ProtocolVersion uint32 = 8
 
 	// ClientName identifies this implementation.
 	ClientName = coinparams.NameLower

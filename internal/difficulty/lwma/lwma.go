@@ -40,11 +40,11 @@ func (r *Retargeter) Name() string { return "lwma" }
 // Algorithm (per zawy12's reference):
 //
 //	For each of the last N blocks, compute solve_time[i] = TS[i] - TS[i-1],
-//	clamped to prevent timestamp manipulation. Weight each solve time by its
-//	position (1..N), so recent blocks count more. The weighted sum L is:
-//	  L = sum(i * clamp(solve_time[i], 1, 6*T))  for i in 1..N
+//	clamped to [-6*T, 6*T] to limit timestamp manipulation. Weight each
+//	solve time by its position (1..N), so recent blocks count more:
+//	  L = sum(i * clamp(solve_time[i], -6*T, 6*T))  for i in 1..N
 //	The next target is:
-//	  next_target = avg_target * (k / L)
+//	  next_target = avg_target * L / k
 //	where k = N*(N+1)*T/2 and avg_target is the arithmetic mean of the N
 //	block targets in the window.
 //
@@ -55,17 +55,9 @@ func (r *Retargeter) CalcNextBits(tip *types.BlockHeader, tipHeight uint32, getA
 		return p.InitialBits
 	}
 
-	// LWMA v2 activation: larger window, per-block output clamp.
-	v2Height, v2Active := p.ActivationHeights["lwma_v2"]
-	useV2 := v2Active && tipHeight >= v2Height
-
 	N := p.RetargetInterval
-	if useV2 {
-		N = 200
-	}
 	T := int64(p.TargetBlockSpacing / time.Second)
 
-	// Not enough history yet — return initial difficulty.
 	if tipHeight < N {
 		return p.InitialBits
 	}
@@ -90,36 +82,32 @@ func (r *Retargeter) CalcNextBits(tip *types.BlockHeader, tipHeight uint32, getA
 	// L = sum(i * clamped_solvetime)  for i in 1..N
 	// sumTarget += target[i]          for i in 1..N
 	//
-	// Solve times are clamped to [1, 6*T] per zawy12's recommendation to
-	// prevent timestamp manipulation attacks. Out-of-order timestamps are
-	// handled by enforcing a minimum solve time of 1 second.
+	// Solve times are clamped to [-6*T, 6*T] per zawy12's recommendation.
+	// Negative solve times from out-of-order timestamps are allowed so they
+	// properly reduce the weighted sum (raising difficulty).
 	maxST := 6 * T
+	minST := -6 * T
 	var weightedSolveTimeSum int64
 	sumTarget := new(big.Int)
 
-	prevTS := int64(headers[0].Timestamp)
 	for i := uint32(1); i <= N; i++ {
-		thisTS := int64(headers[i].Timestamp)
-
-		// Safely handle out-of-sequence timestamps.
-		if thisTS <= prevTS {
-			thisTS = prevTS + 1
-		}
-
-		solveTime := thisTS - prevTS
+		solveTime := int64(headers[i].Timestamp) - int64(headers[i-1].Timestamp)
 		if solveTime > maxST {
 			solveTime = maxST
 		}
+		if solveTime < minST {
+			solveTime = minST
+		}
 
 		weightedSolveTimeSum += int64(i) * solveTime
-		prevTS = thisTS
 
 		blockTarget := crypto.CompactToBig(headers[i].Bits)
 		sumTarget.Add(sumTarget, blockTarget)
 	}
 
 	// Floor: prevent the weighted sum from being unreasonably small, which
-	// would cause an extreme difficulty spike. zawy12 uses N*N*T/20.
+	// would cause an extreme difficulty spike. zawy12 uses N*N*T/20
+	// (limits difficulty increase to ~10x per window).
 	minL := int64(N) * int64(N) * T / 20
 	if weightedSolveTimeSum < minL {
 		weightedSolveTimeSum = minL
@@ -129,46 +117,22 @@ func (r *Retargeter) CalcNextBits(tip *types.BlockHeader, tipHeight uint32, getA
 	//   next_D = avg_D * k / L
 	// where k = N*(N+1)*T/2.
 	//
-	// Since we work in target space (target = 1/difficulty), we invert:
+	// In target space (target = 1/difficulty):
 	//   next_target = avg_target * L / k
 	//              = (sumTarget / N) * L / (N*(N+1)*T/2)
 	//              = sumTarget * 2 * L / (N * N * (N+1) * T)
 	//
-	// zawy12 applies a 99/100 factor to slightly overestimate difficulty
-	// (underestimate target), which empirically reduces solve time variance
-	// in small networks. In target space this becomes:
-	//   next_target = sumTarget * 200 * L / (N * N * (N+1) * T * 99)
-
+	// zawy12's adjust=0.99 slightly overestimates difficulty to reduce
+	// solve time variance. In target space: multiply L by 0.99, giving
+	//   next_target = sumTarget * 198 * L / (N * N * (N+1) * T * 100)
 	nBig := int64(N)
 	nPlus1 := int64(N + 1)
-	numerator := new(big.Int).Mul(sumTarget, big.NewInt(200*weightedSolveTimeSum))
-	denominator := big.NewInt(nBig * nBig * nPlus1 * T * 99)
+	numerator := new(big.Int).Mul(sumTarget, big.NewInt(198*weightedSolveTimeSum))
+	denominator := big.NewInt(nBig * nBig * nPlus1 * T * 100)
 	nextTarget := new(big.Int).Div(numerator, denominator)
 
-	// Floor: target must be at least 1.
 	if nextTarget.Sign() <= 0 {
 		nextTarget.SetInt64(1)
-	}
-
-	// LWMA v2: per-block output clamp (BTC Gold style, endorsed by zawy12).
-	// Limits each adjustment to +50% easier / -33% harder relative to the
-	// previous block's target. This prevents the oscillation pattern where
-	// a long solve time causes a massive difficulty drop followed by a
-	// flood of fast blocks.
-	if useV2 {
-		prevTarget := crypto.CompactToBig(tip.Bits)
-		// Cap: next target cannot exceed 150% of previous (difficulty drop limited to ~33%)
-		maxIncrease := new(big.Int).Mul(prevTarget, big.NewInt(150))
-		maxIncrease.Div(maxIncrease, big.NewInt(100))
-		if nextTarget.Cmp(maxIncrease) > 0 {
-			nextTarget = maxIncrease
-		}
-		// Floor: next target cannot be below 67% of previous (difficulty spike limited to ~50%)
-		minDecrease := new(big.Int).Mul(prevTarget, big.NewInt(67))
-		minDecrease.Div(minDecrease, big.NewInt(100))
-		if nextTarget.Cmp(minDecrease) < 0 {
-			nextTarget = minDecrease
-		}
 	}
 
 	// Clamp to minimum difficulty (maximum target).
