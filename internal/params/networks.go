@@ -222,6 +222,7 @@ var Testnet = &ChainParams{
 		"locktime":      1,
 		"mindiffblocks": 1,
 		"timewarp":      1,
+		"lwma_v2":       1750, // LWMA v2: N=200 window, per-block clamp, tighter FTL
 	},
 }
 

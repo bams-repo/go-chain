@@ -55,7 +55,14 @@ func (r *Retargeter) CalcNextBits(tip *types.BlockHeader, tipHeight uint32, getA
 		return p.InitialBits
 	}
 
+	// LWMA v2 activation: larger window, per-block output clamp.
+	v2Height, v2Active := p.ActivationHeights["lwma_v2"]
+	useV2 := v2Active && tipHeight >= v2Height
+
 	N := p.RetargetInterval
+	if useV2 {
+		N = 200
+	}
 	T := int64(p.TargetBlockSpacing / time.Second)
 
 	// Not enough history yet — return initial difficulty.
@@ -141,6 +148,27 @@ func (r *Retargeter) CalcNextBits(tip *types.BlockHeader, tipHeight uint32, getA
 	// Floor: target must be at least 1.
 	if nextTarget.Sign() <= 0 {
 		nextTarget.SetInt64(1)
+	}
+
+	// LWMA v2: per-block output clamp (BTC Gold style, endorsed by zawy12).
+	// Limits each adjustment to +50% easier / -33% harder relative to the
+	// previous block's target. This prevents the oscillation pattern where
+	// a long solve time causes a massive difficulty drop followed by a
+	// flood of fast blocks.
+	if useV2 {
+		prevTarget := crypto.CompactToBig(tip.Bits)
+		// Cap: next target cannot exceed 150% of previous (difficulty drop limited to ~33%)
+		maxIncrease := new(big.Int).Mul(prevTarget, big.NewInt(150))
+		maxIncrease.Div(maxIncrease, big.NewInt(100))
+		if nextTarget.Cmp(maxIncrease) > 0 {
+			nextTarget = maxIncrease
+		}
+		// Floor: next target cannot be below 67% of previous (difficulty spike limited to ~50%)
+		minDecrease := new(big.Int).Mul(prevTarget, big.NewInt(67))
+		minDecrease.Div(minDecrease, big.NewInt(100))
+		if nextTarget.Cmp(minDecrease) < 0 {
+			nextTarget = minDecrease
+		}
 	}
 
 	// Clamp to minimum difficulty (maximum target).
