@@ -191,6 +191,11 @@ type Manager struct {
 	externalAddr   string            // best-known routable IP:port
 	addrRecvVotes  map[string]int    // IP -> vote count from peers
 
+	// Recently-relayed addresses: prevents addr relay amplification loops.
+	// An address relayed in the last 10 minutes is not relayed again.
+	recentRelayMu   sync.Mutex
+	recentRelayAddrs map[string]time.Time
+
 	ctx      context.Context
 	listener net.Listener
 }
@@ -430,6 +435,7 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		headerSyncFailedPeers: make(map[string]time.Time),
 		probeWaiters:          make(map[uint64]chan bool),
 		addrRecvVotes:         make(map[string]int),
+		recentRelayAddrs:      make(map[string]time.Time),
 	}
 
 	if opts != nil {
@@ -1680,9 +1686,11 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 		}
 
 		// Bitcoin Core parity: do not banscore/ban peers for high message rate
-		// during IBD. Sync traffic can be bursty and banning seeds can strand
-		// small networks.
-		if !m.IsSyncing() {
+		// during IBD or before IBD has ever completed. Sync traffic can be
+		// bursty and banning seeds can strand small networks. The finishedIBD
+		// latch ensures rate limiting only activates once we've fully synced
+		// at least once (covers INITIAL, HEADER_SYNC, and BLOCK_SYNC states).
+		if m.finishedIBD && !m.IsSyncing() {
 			// Rate-limit only truly unsolicited/abusive traffic. Core protocol
 			// messages used for sync, relay, and liveness are exempt — Bitcoin
 			// Core does not rate-limit inv, tx, block, headers, or any of the
@@ -1694,7 +1702,8 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 					cmd == protocol.CmdGetBlocks || cmd == protocol.CmdPing ||
 					cmd == protocol.CmdPong || cmd == protocol.CmdInv ||
 					cmd == protocol.CmdTx || cmd == protocol.CmdProbeReq ||
-					cmd == protocol.CmdProbeResp
+					cmd == protocol.CmdProbeResp || cmd == protocol.CmdAddr ||
+					cmd == protocol.CmdGetAddr
 				if !exempt {
 					m.addMisbehavior(peer, 10, "message rate limit exceeded")
 					if peer.BanScore() >= BanThreshold {
@@ -3096,12 +3105,36 @@ func (m *Manager) sendGetAddr(peer *Peer) {
 	peer.SendMessage(protocol.CmdGetAddr, nil)
 }
 
-// relayAddrs immediately forwards a set of addresses to 1-2 random connected
-// peers, excluding the original sender. This matches Bitcoin Core's behavior
-// of relaying fresh addr messages on receipt, enabling rapid peer discovery
-// across the network instead of waiting for the periodic broadcast tick.
+// relayAddrs immediately forwards fresh addresses to 1-2 random connected
+// peers, excluding the original sender. Addresses relayed in the last 10
+// minutes are suppressed to prevent amplification loops. This matches Bitcoin
+// Core's behavior of relaying fresh addr messages on receipt.
 func (m *Manager) relayAddrs(addrs []string, sender *Peer) {
-	msg := protocol.AddrMsg{Addresses: addrs}
+	const relayCooldown = 10 * time.Minute
+
+	// Filter to only truly fresh addresses we haven't relayed recently.
+	m.recentRelayMu.Lock()
+	now := time.Now()
+	// Prune expired entries while we hold the lock.
+	for addr, t := range m.recentRelayAddrs {
+		if now.Sub(t) > relayCooldown {
+			delete(m.recentRelayAddrs, addr)
+		}
+	}
+	var fresh []string
+	for _, a := range addrs {
+		if _, seen := m.recentRelayAddrs[a]; !seen {
+			m.recentRelayAddrs[a] = now
+			fresh = append(fresh, a)
+		}
+	}
+	m.recentRelayMu.Unlock()
+
+	if len(fresh) == 0 {
+		return
+	}
+
+	msg := protocol.AddrMsg{Addresses: fresh}
 	var buf bytes.Buffer
 	msg.Encode(&buf)
 	payload := buf.Bytes()
