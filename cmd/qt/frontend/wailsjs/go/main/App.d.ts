@@ -51,6 +51,8 @@ export function IsServiceInstalled():Promise<boolean>;
 
 export function ListRPCMethods():Promise<Array<string>>;
 
+export function ListTransactions():Promise<Array<Record<string, any>>>;
+
 export function OpenDataDir():Promise<void>;
 
 export function RescanBlockchain():Promise<string>;

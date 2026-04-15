@@ -527,24 +527,41 @@ export function Overview() {
           className="absolute -right-8 -top-8 h-32 w-32 rounded-full opacity-[0.04]"
           style={{ background: "var(--color-btc-gold)" }}
         />
-        <div className="relative z-10">
-          <h3
-            className="mb-1 text-xs font-medium uppercase tracking-wider"
-            style={{ color: "var(--color-btc-text-dim)" }}
-          >
-            Balance
-          </h3>
-          <p className="text-3xl font-bold" style={{ color: "var(--color-btc-text)" }}>
-            {confirmed.toFixed(coinInfo.decimals > 4 ? 4 : coinInfo.decimals)}{" "}
-            <span className="text-lg font-medium" style={{ color: "var(--color-btc-gold)" }}>
-              {coinInfo.ticker}
-            </span>
-          </p>
-          {unconfirmed > 0 && (
-            <p className="mt-1.5 text-sm" style={{ color: "var(--color-btc-gold-light)" }}>
-              +{unconfirmed.toFixed(4)} {coinInfo.ticker} unconfirmed
+        <div className="relative z-10 flex flex-col gap-3">
+          {/* Spendable balance */}
+          <div>
+            <h3
+              className="mb-1 text-[10px] font-semibold uppercase tracking-wider"
+              style={{ color: "var(--color-btc-text-dim)" }}
+            >
+              Spendable Balance
+            </h3>
+            <p className="text-3xl font-bold" style={{ color: "var(--color-btc-text)" }}>
+              {confirmed.toFixed(coinInfo.decimals > 4 ? 4 : coinInfo.decimals)}{" "}
+              <span className="text-lg font-medium" style={{ color: "var(--color-btc-gold)" }}>
+                {coinInfo.ticker}
+              </span>
             </p>
-          )}
+          </div>
+          {/* Unconfirmed balance */}
+          <div
+            className="border-t pt-3"
+            style={{ borderColor: "rgba(255,255,255,0.06)" }}
+          >
+            <h3
+              className="mb-1 text-[10px] font-semibold uppercase tracking-wider"
+              style={{ color: "var(--color-btc-text-dim)" }}
+            >
+              Unconfirmed Balance
+            </h3>
+            <p className="text-xl font-bold" style={{ color: "var(--color-btc-gold-light)" }}>
+              {unconfirmed > 0 ? "+" : ""}
+              {unconfirmed.toFixed(coinInfo.decimals > 4 ? 4 : coinInfo.decimals)}{" "}
+              <span className="text-sm font-medium" style={{ color: "var(--color-btc-gold)" }}>
+                {coinInfo.ticker}
+              </span>
+            </p>
+          </div>
         </div>
       </div>
 

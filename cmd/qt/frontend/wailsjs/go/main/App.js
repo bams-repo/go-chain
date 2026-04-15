@@ -102,6 +102,10 @@ export function ListRPCMethods() {
   return window['go']['main']['App']['ListRPCMethods']();
 }
 
+export function ListTransactions() {
+  return window['go']['main']['App']['ListTransactions']();
+}
+
 export function OpenDataDir() {
   return window['go']['main']['App']['OpenDataDir']();
 }

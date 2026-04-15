@@ -202,6 +202,69 @@ func (a *App) GetBalance() (map[string]interface{}, error) {
 	}, nil
 }
 
+// ListTransactions returns wallet transaction history derived from the UTXO set.
+// Each entry includes category (receive/generate/immature), amount, confirmations,
+// and maturity progress for coinbase outputs.
+func (a *App) ListTransactions() ([]map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	w := a.node.Wallet()
+	bc := a.node.Chain()
+	_, tipHeight := bc.Tip()
+	cbMaturity := a.node.Params().CoinbaseMaturity
+
+	iter := func(fn func(txHash [32]byte, index uint32, value uint64, pkScript []byte, height uint32, isCoinbase bool)) {
+		bc.UtxoSet().ForEach(func(txHash types.Hash, index uint32, entry *utxo.UtxoEntry) {
+			fn(txHash, index, entry.Value, entry.PkScript, entry.Height, entry.IsCoinbase)
+		})
+	}
+
+	utxos := w.FindUnspent(iter, tipHeight)
+	results := make([]map[string]interface{}, 0, len(utxos))
+
+	for _, u := range utxos {
+		txHash := types.Hash(u.TxHash)
+		category := "receive"
+		maturityProgress := 1.0
+		if u.IsCoinbase {
+			if u.Confirmations >= cbMaturity {
+				category = "generate"
+			} else {
+				category = "immature"
+				if cbMaturity > 0 {
+					maturityProgress = float64(u.Confirmations) / float64(cbMaturity)
+				}
+			}
+		}
+
+		results = append(results, map[string]interface{}{
+			"txid":             txHash.ReverseString(),
+			"vout":             u.Index,
+			"address":          u.Address,
+			"category":         category,
+			"amount":           float64(u.Value) / float64(coinparams.CoinsPerBaseUnit),
+			"confirmations":    u.Confirmations,
+			"blockheight":      u.Height,
+			"isCoinbase":       u.IsCoinbase,
+			"maturityProgress": maturityProgress,
+			"maturityTarget":   cbMaturity,
+		})
+	}
+
+	// Sort by height descending (newest first), then by vout.
+	sort.Slice(results, func(i, j int) bool {
+		hi := results[i]["blockheight"].(uint32)
+		hj := results[j]["blockheight"].(uint32)
+		if hi != hj {
+			return hi > hj
+		}
+		return results[i]["vout"].(uint32) < results[j]["vout"].(uint32)
+	})
+
+	return results, nil
+}
+
 // GetPeerCount returns the number of connected peers.
 func (a *App) GetPeerCount() (int, error) {
 	if a.node == nil {

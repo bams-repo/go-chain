@@ -128,6 +128,9 @@ function viewMeta(pathname: string): { title: string; subtitle: string } {
   if (p === "/node-map" || p.startsWith("/node-map/")) {
     return { title: "Node Map", subtitle: "View the node map for the Fairchain network" };
   }
+  if (p === "/transactions" || p.startsWith("/transactions/")) {
+    return { title: "Transactions", subtitle: "Wallet transaction history & maturity" };
+  }
   if (p === "/mining" || p.startsWith("/mining/")) {
     return { title: "Mining", subtitle: "Internal miner & stratum server" };
   }
