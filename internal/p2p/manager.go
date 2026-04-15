@@ -183,6 +183,14 @@ type Manager struct {
 	probeMu       sync.Mutex
 	probeWaiters  map[uint64]chan bool
 
+	// External address discovery (Bitcoin Core parity: addrlocal).
+	// When listening on 0.0.0.0, the node learns its routable IP from the
+	// AddrRecv field peers send in their version messages. A simple vote
+	// across peers prevents a single liar from poisoning our external addr.
+	externalAddrMu sync.RWMutex
+	externalAddr   string            // best-known routable IP:port
+	addrRecvVotes  map[string]int    // IP -> vote count from peers
+
 	ctx      context.Context
 	listener net.Listener
 }
@@ -421,6 +429,7 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 		selfAddrs:             make(map[string]struct{}),
 		headerSyncFailedPeers: make(map[string]time.Time),
 		probeWaiters:          make(map[uint64]chan bool),
+		addrRecvVotes:         make(map[string]int),
 	}
 
 	if opts != nil {
@@ -1846,7 +1855,7 @@ func (m *Manager) sendVersion(peer *Peer) error {
 		Services:    1,
 		Timestamp:   time.Now().Unix(),
 		AddrRecv:    peer.Addr(),
-		AddrFrom:    m.listenAddr,
+		AddrFrom:    m.ExternalAddr(),
 		Nonce:       m.localNonce,
 		UserAgent:   version.UserAgent(),
 		StartHeight: height,
@@ -1905,6 +1914,14 @@ func (m *Manager) readAndProcessVersion(peer *Peer) error {
 
 	peer.SetVersion(&theirVersion)
 
+	// Bitcoin Core parity (addrlocal): learn our external IP from AddrRecv.
+	// When listening on 0.0.0.0, the remote peer tells us what address they
+	// connected to — that's our routable IP. We use a simple vote across
+	// peers to prevent a single malicious peer from poisoning our addr.
+	if theirVersion.AddrRecv != "" {
+		m.learnExternalAddr(theirVersion.AddrRecv)
+	}
+
 	m.checkPeerVersion(theirVersion.UserAgent)
 	m.trackPeerProtoVersion(theirVersion.Version)
 
@@ -1913,6 +1930,60 @@ func (m *Manager) readAndProcessVersion(peer *Peer) error {
 	}
 
 	return nil
+}
+
+// learnExternalAddr uses AddrRecv from a peer's version message to discover
+// our routable external address. This solves the 0.0.0.0 problem: when listening
+// on all interfaces, the node cannot know its public IP. Peers tell us what
+// address they connected to (AddrRecv), and we use majority vote across peers
+// to select the most-reported IP. This matches Bitcoin Core's "addrlocal" logic.
+func (m *Manager) learnExternalAddr(addrRecv string) {
+	host, _, err := net.SplitHostPort(addrRecv)
+	if err != nil {
+		return
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() {
+		return
+	}
+
+	_, listenPort, err := net.SplitHostPort(m.listenAddr)
+	if err != nil {
+		return
+	}
+
+	m.externalAddrMu.Lock()
+	defer m.externalAddrMu.Unlock()
+
+	m.addrRecvVotes[host]++
+
+	// Pick the IP with the most votes.
+	var bestIP string
+	var bestCount int
+	for ip, count := range m.addrRecvVotes {
+		if count > bestCount {
+			bestIP = ip
+			bestCount = count
+		}
+	}
+
+	newAddr := net.JoinHostPort(bestIP, listenPort)
+	if newAddr != m.externalAddr {
+		m.externalAddr = newAddr
+		logging.L.Info("discovered external address", "component", "p2p", "addr", newAddr, "votes", bestCount)
+	}
+}
+
+// ExternalAddr returns the discovered routable address, or the raw listenAddr
+// if no external address has been learned yet.
+func (m *Manager) ExternalAddr() string {
+	m.externalAddrMu.RLock()
+	ext := m.externalAddr
+	m.externalAddrMu.RUnlock()
+	if ext != "" {
+		return ext
+	}
+	return m.listenAddr
 }
 
 // checkPeerVersion extracts the semver from a peer's user agent and updates
@@ -2231,8 +2302,10 @@ func (m *Manager) handleMessage(ctx context.Context, peer *Peer, hdr *protocol.M
 
 		maxPeers := int(m.params.PeerStoreMaxSize)
 		localLB := m.isLocalLoopback()
+		extAddr := m.ExternalAddr()
+		var accepted []string
 		for _, a := range addrs {
-			if m.IsBanned(a) || a == m.listenAddr || validateGossipAddress(a, localLB) != nil {
+			if m.IsBanned(a) || a == m.listenAddr || a == extAddr || validateGossipAddress(a, localLB) != nil {
 				continue
 			}
 			if _, portStr, err := net.SplitHostPort(a); err == nil {
@@ -2241,6 +2314,14 @@ func (m *Manager) handleMessage(ctx context.Context, peer *Peer, hdr *protocol.M
 				}
 			}
 			m.peerStore.PutPeerBounded(a, maxPeers)
+			accepted = append(accepted, a)
+		}
+
+		// Bitcoin Core parity: immediately relay fresh addresses to 1-2 random
+		// peers (excluding the sender). This creates rapid gossip propagation
+		// instead of waiting for the 2-minute broadcast tick or getaddr.
+		if len(accepted) > 0 && !m.IsSyncing() {
+			m.relayAddrs(accepted, peer)
 		}
 
 	case protocol.CmdGetAddr:
@@ -2937,12 +3018,17 @@ func (m *Manager) gatherAddresses(limit int) []string {
 	m.mu.RUnlock()
 
 	stored, _ := m.peerStore.GetPeers()
+	extAddr := m.ExternalAddr()
 
 	seen := make(map[string]struct{})
 	var addrs []string
 
+	isOwnAddr := func(addr string) bool {
+		return addr == m.listenAddr || addr == extAddr
+	}
+
 	addIfValid := func(addr string) bool {
-		if addr == m.listenAddr {
+		if isOwnAddr(addr) {
 			return false
 		}
 		if _, ok := seen[addr]; ok {
@@ -3008,6 +3094,39 @@ func shuffleStrings(s []string) {
 // sendGetAddr sends a getaddr request to a peer.
 func (m *Manager) sendGetAddr(peer *Peer) {
 	peer.SendMessage(protocol.CmdGetAddr, nil)
+}
+
+// relayAddrs immediately forwards a set of addresses to 1-2 random connected
+// peers, excluding the original sender. This matches Bitcoin Core's behavior
+// of relaying fresh addr messages on receipt, enabling rapid peer discovery
+// across the network instead of waiting for the periodic broadcast tick.
+func (m *Manager) relayAddrs(addrs []string, sender *Peer) {
+	msg := protocol.AddrMsg{Addresses: addrs}
+	var buf bytes.Buffer
+	msg.Encode(&buf)
+	payload := buf.Bytes()
+
+	m.mu.RLock()
+	candidates := make([]*Peer, 0, len(m.peers))
+	for _, p := range m.peers {
+		if p != sender {
+			candidates = append(candidates, p)
+		}
+	}
+	m.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return
+	}
+
+	shufflePeers(candidates)
+	relayTo := 2
+	if len(candidates) < relayTo {
+		relayTo = len(candidates)
+	}
+	for i := 0; i < relayTo; i++ {
+		candidates[i].SendLowPriority(protocol.CmdAddr, payload)
+	}
 }
 
 // addrBroadcastLoop periodically sends a small set of known peer addresses to
