@@ -21,6 +21,8 @@ export function GetIRCStatus():Promise<Record<string, any>>;
 
 export function GetIRCUsers():Promise<Array<string>>;
 
+export function GetMainnetLaunchInfo():Promise<Record<string, any>>;
+
 export function GetMiningConfig():Promise<Record<string, any>>;
 
 export function GetMiningStatus():Promise<Record<string, any>>;

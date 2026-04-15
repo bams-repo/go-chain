@@ -42,6 +42,10 @@ export function GetIRCUsers() {
   return window['go']['main']['App']['GetIRCUsers']();
 }
 
+export function GetMainnetLaunchInfo() {
+  return window['go']['main']['App']['GetMainnetLaunchInfo']();
+}
+
 export function GetMiningConfig() {
   return window['go']['main']['App']['GetMiningConfig']();
 }

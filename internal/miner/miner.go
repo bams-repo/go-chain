@@ -173,6 +173,22 @@ func (m *Miner) Run(ctx context.Context) {
 		default:
 		}
 
+		if m.params.MiningStartTime > 0 {
+			now := time.Now().Unix()
+			if now < m.params.MiningStartTime {
+				wait := time.Duration(m.params.MiningStartTime-now) * time.Second
+				logging.L.Info("mining gated until start time",
+					"component", "miner",
+					"starts_in", wait.Round(time.Second))
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(30 * time.Second):
+				}
+				continue
+			}
+		}
+
 		if m.allowMining != nil && !m.allowMining() {
 			select {
 			case <-ctx.Done():

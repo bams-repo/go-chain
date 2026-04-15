@@ -52,7 +52,7 @@ var Mainnet = &ChainParams{
 	// Pre-mined genesis block (sha256mem, LE hash convention).
 	// Coinbase: "fairchain genesis"
 	// Timestamp: 1774175035 (2026-03-22T10:23:55Z)
-	// Display hash: e9ecf800a77d1f85dfd263d690e5d13d3682b72a6d9537dc33fe6cad2fb545c2
+	// Display hash: 1fcb291c4ffa3c9877b325d42f06e187edfae37417e1d2058b626233429aeea6
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
@@ -64,8 +64,8 @@ var Mainnet = &ChainParams{
 				0x63, 0x9b, 0xea, 0x6d, 0x0a, 0x1e, 0xea, 0xc6,
 			},
 			Timestamp: 1774175035,
-			Bits:      0x2007ffff,
-			Nonce:     77,
+			Bits:      0x1f147ade,
+			Nonce:     1101,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -82,10 +82,10 @@ var Mainnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0xc2, 0x45, 0xb5, 0x2f, 0xad, 0x6c, 0xfe, 0x33,
-		0xdc, 0x37, 0x95, 0x6d, 0x2a, 0xb7, 0x82, 0x36,
-		0x3d, 0xd1, 0xe5, 0x90, 0xd6, 0x63, 0xd2, 0xdf,
-		0x85, 0x1f, 0x7d, 0xa7, 0x00, 0xf8, 0xec, 0xe9,
+		0xa6, 0xee, 0x9a, 0x42, 0x33, 0x62, 0x62, 0x8b,
+		0x05, 0xd2, 0xe1, 0x17, 0x74, 0xe3, 0xfa, 0xed,
+		0x87, 0xe1, 0x06, 0x2f, 0xd4, 0x25, 0xb3, 0x77,
+		0x98, 0x3c, 0xfa, 0x4f, 0x1c, 0x29, 0xcb, 0x1f,
 	},
 
 	TargetBlockSpacing:  10 * time.Minute,
@@ -94,8 +94,8 @@ var Mainnet = &ChainParams{
 	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
-	// Easy initial difficulty — LWMA adjusts quickly to real hash rate.
-	InitialBits:      0x2007ffff,
+	// 100x harder than trivial — LWMA adjusts quickly to real hash rate.
+	InitialBits:      0x1f147ade,
 	MinBits:          0x207fffff,
 	NoRetarget:       false,
 
@@ -124,6 +124,8 @@ var Mainnet = &ChainParams{
 		"45.63.16.42:19333",    
 	},
 
+	MiningStartTime: 1777338000, // 2026-04-27 18:00:00 PDT — mainnet mining begins
+
 	ActivationHeights: map[string]uint32{
 		"locktime": 1,
 		"timewarp": 1,
@@ -131,10 +133,10 @@ var Mainnet = &ChainParams{
 }
 
 // Testnet is the public test network.
-// v1 (testnet1): 10-minute blocks, LWMA difficulty, LE hash convention.
+// v10 (testnet10): 20-second blocks, LWMA difficulty, LE hash convention.
 var Testnet = &ChainParams{
 	Name:         "testnet",
-	DataDirName:  "testnet1",
+	DataDirName:  "testnet10",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x03},
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
@@ -142,7 +144,7 @@ var Testnet = &ChainParams{
 	// Pre-mined genesis block (sha256mem, LE hash convention).
 	// Coinbase: "fairchain testnet1 genesis"
 	// Timestamp: 1744325400 (2025-04-10T22:30:00Z)
-	// Display hash: 1c0d0bec5e6687df1d67239378a42f95c89a4c547d112d8c80a33c2b81580d71
+	// Display hash: 242c396cebc08d71ed6de2cd1b17f2641f34d0edd42b57f79dc02f5be286c0c1
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
@@ -154,8 +156,8 @@ var Testnet = &ChainParams{
 				0x65, 0xbc, 0x4f, 0x2f, 0xc2, 0x1e, 0xe5, 0xe2,
 			},
 			Timestamp: 1744325400,
-			Bits:      0x2007ffff,
-			Nonce:     10,
+			Bits:      0x1f666659,
+			Nonce:     1289,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -178,19 +180,19 @@ var Testnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0x71, 0x0d, 0x58, 0x81, 0x2b, 0x3c, 0xa3, 0x80,
-		0x8c, 0x2d, 0x11, 0x7d, 0x54, 0x4c, 0x9a, 0xc8,
-		0x95, 0x2f, 0xa4, 0x78, 0x93, 0x23, 0x67, 0x1d,
-		0xdf, 0x87, 0x66, 0x5e, 0xec, 0x0b, 0x0d, 0x1c,
+		0xc1, 0xc0, 0x86, 0xe2, 0x5b, 0x2f, 0xc0, 0x9d,
+		0xf7, 0x57, 0x2b, 0xd4, 0xed, 0xd0, 0x34, 0x1f,
+		0x64, 0xf2, 0x17, 0x1b, 0xcd, 0xe2, 0x6d, 0xed,
+		0x71, 0x8d, 0xc0, 0xeb, 0x6c, 0x39, 0x2c, 0x24,
 	},
 
-	TargetBlockSpacing:  10 * time.Minute,
-	RetargetInterval:    60, // LWMA window size N=60 per zawy12 for T=600 small coins
-	TargetTimespan:      60 * 10 * time.Minute,
-	MaxTimeFutureDrift:  30 * time.Minute, // N*T/20 = 60*600/20 = 1800s per zawy12
+	TargetBlockSpacing:  20 * time.Second,
+	RetargetInterval:    60, // LWMA window size N=60 per zawy12
+	TargetTimespan:      60 * 20 * time.Second,
+	MaxTimeFutureDrift:  60 * time.Second, // N*T/20 = 60*20/20 = 60s per zawy12
 	MinTimestampRule:    "median-11",
 
-	InitialBits:              0x2007ffff, // Very easy — same as regtest floor
+	InitialBits:              0x1f666659, // 20x harder than original 0x2007ffff
 	MinBits:                  0x207fffff, // Floor: trivial difficulty
 	NoRetarget:               false,
 	AllowMinDifficultyBlocks: true,

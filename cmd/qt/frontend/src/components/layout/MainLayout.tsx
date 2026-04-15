@@ -1,8 +1,10 @@
+import { useEffect, useState } from "react";
 import { Outlet, useLocation } from "react-router-dom";
 import { useCoinInfo } from "@/hooks/useCoinInfo";
 import type { CoinInfo } from "@/lib/types";
 import { Navbar } from "./Navbar";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { GetMainnetLaunchInfo } from "../../../wailsjs/go/main/App";
 
 function NetworkPill({ network }: { network: CoinInfo["network"] }) {
   const label = network === "mainnet" ? "Mainnet" : network === "testnet" ? "Testnet" : "Regtest";
@@ -33,6 +35,85 @@ function NetworkPill({ network }: { network: CoinInfo["network"] }) {
     >
       {label}
     </span>
+  );
+}
+
+function MainnetCountdown() {
+  const [launchEpoch, setLaunchEpoch] = useState(0);
+  const [countdown, setCountdown] = useState({ days: 0, hours: 0, minutes: 0, seconds: 0 });
+  const [launched, setLaunched] = useState(false);
+
+  useEffect(() => {
+    GetMainnetLaunchInfo()
+      .then((info) => {
+        if (info.miningStartTime) setLaunchEpoch(info.miningStartTime as number);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!launchEpoch) return;
+    const tick = () => {
+      const now = Math.floor(Date.now() / 1000);
+      const diff = launchEpoch - now;
+      if (diff <= 0) {
+        setLaunched(true);
+        setCountdown({ days: 0, hours: 0, minutes: 0, seconds: 0 });
+        return;
+      }
+      setLaunched(false);
+      setCountdown({
+        days: Math.floor(diff / 86400),
+        hours: Math.floor((diff % 86400) / 3600),
+        minutes: Math.floor((diff % 3600) / 60),
+        seconds: diff % 60,
+      });
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [launchEpoch]);
+
+  if (!launchEpoch) return null;
+
+  if (launched) {
+    return (
+      <div className="flex items-center gap-1.5">
+        <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="var(--color-btc-green)" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
+          <path d="M22 11.08V12a10 10 0 11-5.93-9.14" />
+          <polyline points="22 4 12 14.01 9 11.01" />
+        </svg>
+        <span className="text-[11px] font-semibold" style={{ color: "var(--color-btc-green)" }}>
+          Mainnet Live
+        </span>
+      </div>
+    );
+  }
+
+  const units = [
+    { value: countdown.days, label: "d" },
+    { value: countdown.hours, label: "h" },
+    { value: countdown.minutes, label: "m" },
+    { value: countdown.seconds, label: "s" },
+  ];
+
+  return (
+    <div className="flex items-center gap-2.5">
+      <span
+        className="text-[10px] font-medium uppercase tracking-wider"
+        style={{ color: "var(--color-btc-text-dim)" }}
+      >
+        Mainnet
+      </span>
+      <div className="flex items-baseline gap-1">
+        {units.map((u) => (
+          <span key={u.label} className="font-mono text-xs font-bold tabular-nums" style={{ color: "var(--color-btc-gold)" }}>
+            {String(u.value).padStart(2, "0")}
+            <span className="text-[10px] font-bold" style={{ color: "var(--color-btc-gold-light)" }}>{u.label}</span>
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -92,6 +173,7 @@ export default function MainLayout() {
                   {subtitle}
                 </p>
               </div>
+              <MainnetCountdown />
               <NetworkPill network={coinInfo.network} />
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain p-5 md:p-6">

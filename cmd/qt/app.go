@@ -555,6 +555,7 @@ func resolveOneGeo(client *http.Client, ip string) map[string]interface{} {
 		},
 	}
 
+	var results []map[string]interface{}
 	for _, p := range providers {
 		resp, err := client.Get(p.url)
 		if err != nil {
@@ -570,10 +571,43 @@ func resolveOneGeo(client *http.Client, ip string) map[string]interface{} {
 			continue
 		}
 		if result := p.parse(payload); result != nil {
-			return result
+			results = append(results, result)
 		}
 	}
-	return nil
+	if len(results) == 0 {
+		return nil
+	}
+	if len(results) == 1 {
+		return results[0]
+	}
+
+	// Multiple providers succeeded — pick the result whose region has
+	// the most agreement. IP geolocation providers sometimes disagree at
+	// the regional level; majority-vote reduces the chance of a single
+	// inaccurate provider placing the dot in the wrong state/country.
+	regionCount := make(map[string]int)
+	for _, r := range results {
+		region := strings.ToLower(strOrEmpty(r["region"]))
+		if region != "" {
+			regionCount[region]++
+		}
+	}
+	bestRegion := ""
+	bestCount := 0
+	for region, count := range regionCount {
+		if count > bestCount {
+			bestCount = count
+			bestRegion = region
+		}
+	}
+	if bestRegion != "" && bestCount > 1 {
+		for _, r := range results {
+			if strings.ToLower(strOrEmpty(r["region"])) == bestRegion {
+				return r
+			}
+		}
+	}
+	return results[0]
 }
 
 func toFloat(v interface{}) (float64, bool) {
@@ -1115,6 +1149,15 @@ func resolvePublicIP(client *http.Client) string {
 		}
 	}
 	return ""
+}
+
+// GetMainnetLaunchInfo returns the mainnet mining start epoch and the current
+// network name so the UI can display a countdown.
+func (a *App) GetMainnetLaunchInfo() map[string]interface{} {
+	return map[string]interface{}{
+		"miningStartTime": params.Mainnet.MiningStartTime,
+		"network":         networkForBuild(),
+	}
 }
 
 func ircNickPath(cfg *config.Config) string {

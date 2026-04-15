@@ -70,6 +70,10 @@ type ChainParams struct {
 	// Seed nodes
 	SeedNodes []string // DNS seeds or static IP:port addresses for peer discovery.
 
+	// MiningStartTime is the earliest Unix timestamp at which mining is
+	// permitted. The miner sleeps until this time. 0 means no restriction.
+	MiningStartTime int64
+
 	// Future consensus upgrade activation heights (placeholders).
 	// Map from feature name to activation block height.
 	ActivationHeights map[string]uint32
