@@ -136,7 +136,7 @@ var Mainnet = &ChainParams{
 // v10 (testnet10): 20-second blocks, LWMA difficulty, LE hash convention.
 var Testnet = &ChainParams{
 	Name:         "testnet",
-	DataDirName:  "testnet10",
+	DataDirName:  "testnet11",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x03},
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
@@ -196,6 +196,7 @@ var Testnet = &ChainParams{
 	MinBits:                  0x207fffff, // Floor: trivial difficulty
 	NoRetarget:               false,
 	AllowMinDifficultyBlocks: true,
+	MinDifficultyGap:         5 * time.Minute,
 
 	MaxBlockSize:     2_000_000,
 	MaxBlockTxCount:  10_000,

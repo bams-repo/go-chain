@@ -88,10 +88,17 @@ func (e *Engine) calcExpectedBits(header *types.BlockHeader, parent *types.Block
 		return e.retargeter.CalcNextBits(parent, height-1, getAncestor, p)
 	}
 
+	// MinDifficultyGap controls how long the network must stall before
+	// min-difficulty kicks in. Defaults to 2*TargetBlockSpacing (Bitcoin
+	// Core behavior) if not explicitly set.
+	minDiffGap := int64(p.MinDifficultyGap.Seconds())
+	if minDiffGap <= 0 {
+		minDiffGap = int64(p.TargetBlockSpacing.Seconds()) * 2
+	}
+
 	// Per-block retargeters adjust every block; only apply the min-diff
 	// timestamp gap rule, then always compute fresh difficulty.
 	if e.retargeter.Name() != "bitcoin" {
-		minDiffGap := int64(p.TargetBlockSpacing.Seconds()) * 2
 		if int64(header.Timestamp)-int64(parent.Timestamp) > minDiffGap {
 			return p.MinBits
 		}
@@ -99,7 +106,6 @@ func (e *Engine) calcExpectedBits(header *types.BlockHeader, parent *types.Block
 	}
 
 	// Bitcoin epoch-based: min-diff gap check, then epoch-boundary retarget.
-	minDiffGap := int64(p.TargetBlockSpacing.Seconds()) * 2
 	if int64(header.Timestamp)-int64(parent.Timestamp) > minDiffGap {
 		return p.MinBits
 	}

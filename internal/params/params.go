@@ -37,7 +37,8 @@ type ChainParams struct {
 	InitialBits              uint32 // Compact target for the genesis block and initial difficulty.
 	MinBits                  uint32 // Minimum difficulty (maximum target) allowed.
 	NoRetarget               bool   // If true, difficulty never changes (regtest mode).
-	AllowMinDifficultyBlocks bool   // Bitcoin testnet rule: reset to MinBits if block gap > 2x spacing.
+	AllowMinDifficultyBlocks bool          // Bitcoin testnet rule: reset to MinBits after a long gap.
+	MinDifficultyGap         time.Duration // Timestamp gap that triggers min-diff. 0 = 2*TargetBlockSpacing.
 
 	// Block limits
 	MaxBlockSize     uint32 // Maximum serialized block size in bytes.

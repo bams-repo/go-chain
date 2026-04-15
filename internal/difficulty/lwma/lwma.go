@@ -90,6 +90,32 @@ func (r *Retargeter) CalcNextBits(tip *types.BlockHeader, tipHeight uint32, getA
 	var weightedSolveTimeSum int64
 	sumTarget := new(big.Int)
 
+	// On networks with AllowMinDifficultyBlocks, blocks that used MinBits
+	// (testnet convenience rule) must not pollute the target average. A
+	// single min-diff block injects a target orders of magnitude above the
+	// real difficulty, inflating sumTarget and making subsequent blocks far
+	// too easy. We substitute the last real (non-min-diff) block's bits for
+	// any min-diff block in the window — matching Bitcoin Core's scan-back
+	// approach adapted for per-block retargeting.
+	isMinDiff := p.AllowMinDifficultyBlocks && p.MinBits != 0
+	var lastRealBits uint32
+	if isMinDiff {
+		// Scan backwards from the window start to find the initial
+		// real-difficulty anchor for substitution.
+		lastRealBits = headers[0].Bits
+		if lastRealBits == p.MinBits {
+			for scanH := windowStart; scanH > 0; scanH-- {
+				h := getAncestor(scanH - 1)
+				if h == nil || h.Bits != p.MinBits {
+					if h != nil {
+						lastRealBits = h.Bits
+					}
+					break
+				}
+			}
+		}
+	}
+
 	for i := uint32(1); i <= N; i++ {
 		solveTime := int64(headers[i].Timestamp) - int64(headers[i-1].Timestamp)
 		if solveTime > maxST {
@@ -101,7 +127,13 @@ func (r *Retargeter) CalcNextBits(tip *types.BlockHeader, tipHeight uint32, getA
 
 		weightedSolveTimeSum += int64(i) * solveTime
 
-		blockTarget := crypto.CompactToBig(headers[i].Bits)
+		bits := headers[i].Bits
+		if isMinDiff && bits == p.MinBits {
+			bits = lastRealBits
+		} else if isMinDiff {
+			lastRealBits = bits
+		}
+		blockTarget := crypto.CompactToBig(bits)
 		sumTarget.Add(sumTarget, blockTarget)
 	}
 
