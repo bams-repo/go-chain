@@ -133,7 +133,7 @@ const (
 	headerWindowMax      = 500_000
 
 	// MinPeerProtoVersion is the lowest wire protocol version we accept.
-	MinPeerProtoVersion uint32 = 8
+	MinPeerProtoVersion uint32 = 10
 
 	// MaxPeerStartHeight rejects peers advertising an implausibly high
 	// chain height, preventing an attacker from forcing permanent IBD mode.

@@ -136,7 +136,7 @@ var Mainnet = &ChainParams{
 // v10 (testnet10): 20-second blocks, LWMA difficulty, LE hash convention.
 var Testnet = &ChainParams{
 	Name:         "testnet",
-	DataDirName:  "testnet11",
+	DataDirName:  "testnet12",
 	NetworkMagic: [4]byte{0xFA, 0x1C, 0xC0, 0x03},
 	DefaultPort:  19334,
 	AddressPrefix: 0x6F,
