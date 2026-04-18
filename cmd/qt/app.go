@@ -59,12 +59,17 @@ func (a *App) startup(ctx context.Context) {
 	a.startupTime = time.Now()
 
 	logLevel := "info"
-	if v := os.Getenv("FAIRCHAIN_DEBUG"); v == "1" || v == "true" || strings.EqualFold(v, "yes") {
+	if v := os.Getenv("FAIRCHAIN_LOGLEVEL"); v != "" {
+		logLevel = strings.ToLower(v)
+	} else if v := os.Getenv("FAIRCHAIN_DEBUG"); v == "1" || v == "true" || strings.EqualFold(v, "yes") {
 		logLevel = "debug"
 	}
 	logging.Init(logLevel, "text")
 	if logLevel == "debug" {
 		logging.EnableDebug()
+	}
+	if logLevel == "stratum" {
+		logging.EnableStratumDebug()
 	}
 
 	cfg := config.DefaultConfig()

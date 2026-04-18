@@ -19,6 +19,12 @@ var (
 	// sync state, and message flow. This goes beyond slog.LevelDebug by
 	// enabling periodic dumps and per-message tracing.
 	DebugMode bool
+
+	// StratumDebugMode enables hyper-verbose stratum server diagnostics:
+	// every JSON message in/out, share validation byte dumps, header
+	// reconstruction details, target comparisons, and job generation.
+	// Activated by log-level "stratum" or FAIRCHAIN_LOGLEVEL=stratum.
+	StratumDebugMode bool
 )
 
 func init() {
@@ -29,11 +35,15 @@ func init() {
 
 // Init replaces the global logger with one configured at the given level and format.
 // format may be "text" (default) or "json" for structured JSON output.
+// Special level "stratum" enables debug-level logging with StratumDebugMode.
 func Init(level string, format ...string) {
 	var lvl slog.Level
 	switch level {
 	case "debug":
 		lvl = slog.LevelDebug
+	case "stratum":
+		lvl = slog.LevelDebug
+		StratumDebugMode = true
 	case "warn":
 		lvl = slog.LevelWarn
 	case "error":
@@ -92,6 +102,26 @@ func SyncAuditDebug(msg string, args ...any) {
 		return
 	}
 	a := append([]any{"component", "sync_audit"}, args...)
+	L.Debug(msg, a...)
+}
+
+// EnableStratumDebug sets StratumDebugMode and forces log level to debug.
+func EnableStratumDebug() {
+	StratumDebugMode = true
+	L = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	slog.SetDefault(L)
+}
+
+// StratumDebug emits verbose stratum server diagnostics: message flow,
+// share validation, header reconstruction, target comparison.
+// No-op unless StratumDebugMode is true.
+func StratumDebug(msg string, args ...any) {
+	if !StratumDebugMode {
+		return
+	}
+	a := append([]any{"component", "stratum_debug"}, args...)
 	L.Debug(msg, a...)
 }
 
