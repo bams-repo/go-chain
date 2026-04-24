@@ -135,7 +135,7 @@ jobs:
         shell: bash
         run: |
           cd cmd/qt
-          wails build -tags webkit2_41 -ldflags "-X main.defaultNetwork=testnet"
+          wails build -tags webkit2_41
           cp build/bin/${GUI_NAME} ../../staging/${GUI_NAME}
 
       - name: Build QT wallet (macOS)
@@ -143,7 +143,7 @@ jobs:
         shell: bash
         run: |
           cd cmd/qt
-          wails build -platform darwin/${{ matrix.goarch }} -ldflags "-X main.defaultNetwork=testnet"
+          wails build -platform darwin/${{ matrix.goarch }}
           cp -r build/bin/${GUI_NAME}.app ../../staging/${GUI_NAME}.app
 
       - name: Build QT wallet (Windows)
@@ -151,7 +151,7 @@ jobs:
         shell: bash
         run: |
           cd cmd/qt
-          wails build -webview2 embed -ldflags "-X main.defaultNetwork=testnet"
+          wails build -webview2 embed
           cp build/bin/${GUI_NAME}.exe ../../staging/${GUI_NAME}.exe
 
       - name: Package (tar.gz for Unix)
@@ -251,11 +251,11 @@ jobs:
           # Extract
           tar xzf ${COIN_NAME_LOWER}-linux-amd64.tar.gz
 
-          # Run the GUI wallet
+          # Run the GUI wallet (auto-detects mainnet/testnet)
           ./${COIN_NAME_LOWER}-qt
 
-          # Or run the daemon
-          ./${COIN_NAME_LOWER}d -network testnet -mine
+          # Or run the daemon (specify network explicitly)
+          ./${COIN_NAME_LOWER}d -network mainnet -mine
 
           # Check status (in another terminal)
           ./${COIN_NAME_LOWER}-cli getblockchaininfo
