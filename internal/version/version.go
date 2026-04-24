@@ -22,7 +22,7 @@ const (
 	Minor = 12
 
 	// Patch is the patch version component (bug fixes).
-	Patch = 1
+	Patch = 2
 
 	// ProtocolVersion is the peer-to-peer wire protocol version.
 	// Increment when the wire format changes in a backward-incompatible way.

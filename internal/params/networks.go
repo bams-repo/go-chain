@@ -118,10 +118,8 @@ var Mainnet = &ChainParams{
 	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
 
 	SeedNodes: []string{
-		"45.32.196.26:19333",    
-		"149.28.248.117:19333", 
-		"78.141.227.33:19333",  
-		"45.63.16.42:19333",    
+		"95.179.203.47:19333",  // seednode_london
+		"207.246.117.14:19333", // seednode_miami
 	},
 
 	MiningStartTime: 1777338000, // 2026-04-27 18:00:00 PDT — mainnet mining begins
