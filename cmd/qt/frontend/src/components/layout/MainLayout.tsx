@@ -5,6 +5,7 @@ import type { CoinInfo } from "@/lib/types";
 import { Navbar } from "./Navbar";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { GetMainnetLaunchInfo } from "../../../wailsjs/go/main/App";
+import { EventsOn } from "../../../wailsjs/runtime/runtime";
 
 function NetworkPill({ network }: { network: CoinInfo["network"] }) {
   const label = network === "mainnet" ? "Mainnet" : network === "testnet" ? "Testnet" : "Regtest";
@@ -38,17 +39,79 @@ function NetworkPill({ network }: { network: CoinInfo["network"] }) {
   );
 }
 
+function MainnetRestartModal({ coinName }: { coinName: string }) {
+  return (
+    <div
+      className="fixed inset-0 z-[9999] flex items-center justify-center"
+      style={{ background: "rgba(0, 0, 0, 0.75)", backdropFilter: "blur(4px)" }}
+    >
+      <div
+        className="mx-4 max-w-md rounded-xl border p-6 shadow-2xl"
+        style={{
+          background: "var(--color-btc-card)",
+          borderColor: "var(--color-btc-gold)",
+        }}
+      >
+        <div className="mb-4 flex items-center gap-3">
+          <div
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
+            style={{ background: "rgba(247, 147, 26, 0.15)" }}
+          >
+            <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="var(--color-btc-gold)" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="8" x2="12" y2="12" />
+              <line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+          </div>
+          <h2
+            className="text-lg font-bold tracking-tight"
+            style={{ color: "var(--color-btc-gold)" }}
+          >
+            Mainnet Is Live!
+          </h2>
+        </div>
+        <p className="mb-3 text-sm leading-relaxed" style={{ color: "var(--color-btc-text)" }}>
+          The {coinName} mainnet has activated while this wallet was running on testnet.
+        </p>
+        <p className="mb-5 text-sm leading-relaxed" style={{ color: "var(--color-btc-text-muted)" }}>
+          Please close and restart your wallet to switch to mainnet. Your testnet data will remain safe.
+        </p>
+        <div
+          className="rounded-lg border px-4 py-3 text-center text-xs font-medium"
+          style={{
+            borderColor: "var(--color-btc-border)",
+            color: "var(--color-btc-text-muted)",
+            background: "var(--color-btc-deep)",
+          }}
+        >
+          Close this wallet and reopen it to join mainnet
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MainnetCountdown() {
   const [launchEpoch, setLaunchEpoch] = useState(0);
   const [countdown, setCountdown] = useState({ days: 0, hours: 0, minutes: 0, seconds: 0 });
   const [launched, setLaunched] = useState(false);
+  const [showRestart, setShowRestart] = useState(false);
+  const [startedOnTestnet, setStartedOnTestnet] = useState(false);
+  const coinInfo = useCoinInfo();
 
   useEffect(() => {
     GetMainnetLaunchInfo()
       .then((info) => {
         if (info.miningStartTime) setLaunchEpoch(info.miningStartTime as number);
+        if (info.network && info.network !== "mainnet") setStartedOnTestnet(true);
       })
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    return EventsOn("mainnet:activated", () => {
+      setShowRestart(true);
+    });
   }, []);
 
   useEffect(() => {
@@ -59,6 +122,7 @@ function MainnetCountdown() {
       if (diff <= 0) {
         setLaunched(true);
         setCountdown({ days: 0, hours: 0, minutes: 0, seconds: 0 });
+        if (startedOnTestnet) setShowRestart(true);
         return;
       }
       setLaunched(false);
@@ -72,21 +136,24 @@ function MainnetCountdown() {
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
-  }, [launchEpoch]);
+  }, [launchEpoch, startedOnTestnet]);
 
   if (!launchEpoch) return null;
 
   if (launched) {
     return (
-      <div className="flex items-center gap-1.5">
-        <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="var(--color-btc-green)" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
-          <path d="M22 11.08V12a10 10 0 11-5.93-9.14" />
-          <polyline points="22 4 12 14.01 9 11.01" />
-        </svg>
-        <span className="text-[11px] font-semibold" style={{ color: "var(--color-btc-green)" }}>
-          Mainnet Live
-        </span>
-      </div>
+      <>
+        {showRestart && <MainnetRestartModal coinName={coinInfo.name} />}
+        <div className="flex items-center gap-1.5">
+          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="var(--color-btc-green)" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M22 11.08V12a10 10 0 11-5.93-9.14" />
+            <polyline points="22 4 12 14.01 9 11.01" />
+          </svg>
+          <span className="text-[11px] font-semibold" style={{ color: "var(--color-btc-green)" }}>
+            Mainnet Live
+          </span>
+        </div>
+      </>
     );
   }
 

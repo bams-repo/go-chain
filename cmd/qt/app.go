@@ -127,6 +127,7 @@ func (a *App) startup(ctx context.Context) {
 	a.loadAddressBook()
 
 	go a.probeLoop(ctx)
+	go a.watchMainnetActivation(ctx, cfg.Network)
 
 	nickPath := ircNickPath(n.Config())
 	savedNick := loadIRCNick(nickPath)
@@ -1166,6 +1167,31 @@ func (a *App) runProbe(ctx context.Context) {
 			errMsg = err.Error()
 		}
 		logging.L.Info("P2P port probe: not reachable", "addr", probeAddr, "error", errMsg)
+	}
+}
+
+// watchMainnetActivation sleeps until MiningStartTime arrives and then
+// emits a Wails event so the frontend can prompt the user to restart.
+// Only runs when the wallet started on a non-mainnet network and the
+// activation timestamp is still in the future.
+func (a *App) watchMainnetActivation(ctx context.Context, startedNetwork string) {
+	if startedNetwork == "mainnet" {
+		return
+	}
+	launchTime := params.Mainnet.MiningStartTime
+	if launchTime <= 0 {
+		return
+	}
+	remaining := time.Until(time.Unix(launchTime, 0))
+	if remaining <= 0 {
+		return
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		wailsRuntime.EventsEmit(ctx, "mainnet:activated")
+	case <-ctx.Done():
 	}
 }
 
