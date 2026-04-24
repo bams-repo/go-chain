@@ -362,6 +362,11 @@ func (s *Server) SetDataDir(dir string) {
 	s.dataDir = dir
 }
 
+// FeePerByte returns the current fee rate (satoshis per byte).
+func (s *Server) FeePerByte() uint64 {
+	return s.feePerByte.Load()
+}
+
 // SetBroadcastBlock registers the callback for relaying pool-submitted blocks
 // to the P2P network. This is critical for stratum pool operation — without it,
 // blocks accepted via submitblock would never reach other nodes.

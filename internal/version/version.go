@@ -19,10 +19,10 @@ const (
 	Major = 0
 
 	// Minor is the minor version component (new features, backward-compatible).
-	Minor = 11
+	Minor = 12
 
 	// Patch is the patch version component (bug fixes).
-	Patch = 5
+	Patch = 0
 
 	// ProtocolVersion is the peer-to-peer wire protocol version.
 	// Increment when the wire format changes in a backward-incompatible way.

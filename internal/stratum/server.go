@@ -564,14 +564,14 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 		return
 	}
 
-	ntime, err := decodeUint32Hex(ntimeHex)
+	ntime, err := decodeUint32BE(ntimeHex)
 	if err != nil {
 		s.sendJSON(w, stratumResponse{ID: req.ID, Result: false, Error: []interface{}{20, "invalid ntime", nil}})
 		w.sharesInvalid.Add(1)
 		return
 	}
 
-	nonce, err := decodeUint32Hex(nonceHex)
+	nonce, err := decodeUint32LE(nonceHex)
 	if err != nil {
 		s.sendJSON(w, stratumResponse{ID: req.ID, Result: false, Error: []interface{}{20, "invalid nonce", nil}})
 		w.sharesInvalid.Add(1)
@@ -1205,7 +1205,7 @@ func stratumPrevhashHex(h types.Hash) string {
 	return hex.EncodeToString(out[:])
 }
 
-func decodeUint32Hex(s string) (uint32, error) {
+func decodeUint32BE(s string) (uint32, error) {
 	s = strings.TrimPrefix(s, "0x")
 	if len(s) != 8 {
 		return 0, fmt.Errorf("expected 8 hex chars, got %d", len(s))
@@ -1215,6 +1215,18 @@ func decodeUint32Hex(s string) (uint32, error) {
 		return 0, err
 	}
 	return binary.BigEndian.Uint32(b), nil
+}
+
+func decodeUint32LE(s string) (uint32, error) {
+	s = strings.TrimPrefix(s, "0x")
+	if len(s) != 8 {
+		return 0, fmt.Errorf("expected 8 hex chars, got %d", len(s))
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(b), nil
 }
 
 // targetToDifficulty converts a 256-bit LE target hash to a stratum difficulty value.

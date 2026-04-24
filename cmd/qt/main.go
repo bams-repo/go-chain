@@ -10,8 +10,11 @@ import (
 	"embed"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/bams-repo/fairchain/internal/coinparams"
+	"github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/version"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/menu"
@@ -23,11 +26,8 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-// defaultNetwork is set at build time via -ldflags:
-//
-//	-X main.defaultNetwork=testnet
-//
-// Falls back to "testnet" when unset (e.g. during `wails dev`).
+// defaultNetwork is unused but kept for backward-compatible ldflags builds.
+// Network selection is fully runtime — see networkForBuild().
 var defaultNetwork string
 
 //go:embed all:frontend/dist
@@ -83,10 +83,16 @@ func buildAppMenu(app *App) *menu.Menu {
 }
 
 func networkForBuild() string {
-	if defaultNetwork == "" {
-		return "testnet"
+	// Explicit env var always wins — never ignore a testnet/regtest override.
+	if env := strings.TrimSpace(os.Getenv("FAIRCHAIN_NETWORK")); env != "" {
+		return strings.ToLower(env)
 	}
-	return defaultNetwork
+
+	// Runtime auto-detect: mainnet activates once MiningStartTime has passed.
+	if params.Mainnet.MiningStartTime > 0 && time.Now().Unix() >= params.Mainnet.MiningStartTime {
+		return "mainnet"
+	}
+	return "testnet"
 }
 
 func windowTitle() string {

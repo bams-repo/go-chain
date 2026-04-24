@@ -9,6 +9,12 @@ export function ConnectIRC():Promise<void>;
 
 export function ExecuteRPC(arg1:string,arg2:string):Promise<Record<string, any>>;
 
+export function GetAddressBook():Promise<Record<string, string>>;
+
+export function GetAddressLabel(arg1:string):Promise<string>;
+
+export function GetAddressTransactionCounts():Promise<Record<string, number>>;
+
 export function GetBalance():Promise<Record<string, any>>;
 
 export function GetBlockchainInfo():Promise<Record<string, any>>;
@@ -28,6 +34,8 @@ export function GetMiningConfig():Promise<Record<string, any>>;
 export function GetMiningStatus():Promise<Record<string, any>>;
 
 export function GetNetworkTotals():Promise<Record<string, any>>;
+
+export function GetNewAddress():Promise<string>;
 
 export function GetNodeConfig():Promise<Record<string, any>>;
 
@@ -51,6 +59,8 @@ export function IsServiceInstalled():Promise<boolean>;
 
 export function ListRPCMethods():Promise<Array<string>>;
 
+export function ListReceiveAddresses():Promise<Array<string>>;
+
 export function ListTransactions():Promise<Array<Record<string, any>>>;
 
 export function OpenDataDir():Promise<void>;
@@ -60,6 +70,10 @@ export function RescanBlockchain():Promise<string>;
 export function ResolveGeo(arg1:Array<string>):Promise<Array<Record<string, any>>>;
 
 export function SendIRCMessage(arg1:string):Promise<void>;
+
+export function SendToAddress(arg1:string,arg2:number):Promise<Record<string, any>>;
+
+export function SetAddressLabel(arg1:string,arg2:string):Promise<void>;
 
 export function SetMining(arg1:boolean):Promise<void>;
 
@@ -74,3 +88,5 @@ export function TestPort():Promise<Record<string, any>>;
 export function ToggleMining():Promise<Record<string, any>>;
 
 export function UninstallService():Promise<string>;
+
+export function ValidateAddress(arg1:string):Promise<Record<string, any>>;

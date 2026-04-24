@@ -18,6 +18,18 @@ export function ExecuteRPC(arg1, arg2) {
   return window['go']['main']['App']['ExecuteRPC'](arg1, arg2);
 }
 
+export function GetAddressBook() {
+  return window['go']['main']['App']['GetAddressBook']();
+}
+
+export function GetAddressLabel(arg1) {
+  return window['go']['main']['App']['GetAddressLabel'](arg1);
+}
+
+export function GetAddressTransactionCounts() {
+  return window['go']['main']['App']['GetAddressTransactionCounts']();
+}
+
 export function GetBalance() {
   return window['go']['main']['App']['GetBalance']();
 }
@@ -56,6 +68,10 @@ export function GetMiningStatus() {
 
 export function GetNetworkTotals() {
   return window['go']['main']['App']['GetNetworkTotals']();
+}
+
+export function GetNewAddress() {
+  return window['go']['main']['App']['GetNewAddress']();
 }
 
 export function GetNodeConfig() {
@@ -102,6 +118,10 @@ export function ListRPCMethods() {
   return window['go']['main']['App']['ListRPCMethods']();
 }
 
+export function ListReceiveAddresses() {
+  return window['go']['main']['App']['ListReceiveAddresses']();
+}
+
 export function ListTransactions() {
   return window['go']['main']['App']['ListTransactions']();
 }
@@ -120,6 +140,14 @@ export function ResolveGeo(arg1) {
 
 export function SendIRCMessage(arg1) {
   return window['go']['main']['App']['SendIRCMessage'](arg1);
+}
+
+export function SendToAddress(arg1, arg2) {
+  return window['go']['main']['App']['SendToAddress'](arg1, arg2);
+}
+
+export function SetAddressLabel(arg1, arg2) {
+  return window['go']['main']['App']['SetAddressLabel'](arg1, arg2);
 }
 
 export function SetMining(arg1) {
@@ -148,4 +176,8 @@ export function ToggleMining() {
 
 export function UninstallService() {
   return window['go']['main']['App']['UninstallService']();
+}
+
+export function ValidateAddress(arg1) {
+  return window['go']['main']['App']['ValidateAddress'](arg1);
 }

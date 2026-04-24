@@ -346,6 +346,11 @@ func TestJSONRPCSubmitBlockMissingParams(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error for missing params")
 	}
+	// Pool software (miningcore, ckpool) probes submitblock with no args;
+	// -1 (RPC_MISC_ERROR) signals "method exists" vs -32601 "not found".
+	if resp.Error.Code != rpcErrMisc {
+		t.Fatalf("error code: got %d, want %d (rpcErrMisc)", resp.Error.Code, rpcErrMisc)
+	}
 }
 
 func TestJSONRPCIDPreserved(t *testing.T) {

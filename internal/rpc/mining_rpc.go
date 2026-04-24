@@ -426,9 +426,12 @@ func (s *Server) NotifyBlockChange() {
 
 // rpcSubmitBlock accepts a hex-encoded serialized block (BIP 22 format).
 // Returns null on success, a BIP 22 rejection reason string on failure.
+// Missing-params returns rpcErrMisc (-1) matching Bitcoin Core convention;
+// pool software (miningcore, ckpool, etc.) probes this method with no args
+// and uses -1 to confirm the RPC exists.
 func (s *Server) rpcSubmitBlock(params []json.RawMessage) (interface{}, *jsonRPCError) {
 	if len(params) < 1 {
-		return nil, newRPCError(rpcErrInvalidParams, "missing hex block data")
+		return nil, newRPCError(rpcErrMisc, "missing hex block data")
 	}
 
 	var hexData string

@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useCoinInfo } from "@/hooks/useCoinInfo";
 import {
   GetBalance,
@@ -13,6 +14,7 @@ import {
   UninstallService,
   IsServiceInstalled,
   TestPort,
+  GetAddressLabel,
 } from "../../../wailsjs/go/main/App";
 import { BrowserOpenURL } from "../../../wailsjs/runtime/runtime";
 
@@ -329,9 +331,12 @@ function PortForwardingDialog({
 
 export function Overview() {
   const coinInfo = useCoinInfo();
+  const navigate = useNavigate();
   const [confirmed, setConfirmed] = useState(0);
   const [unconfirmed, setUnconfirmed] = useState(0);
   const [address, setAddress] = useState("");
+  const [addressLabel, setAddressLabel] = useState("");
+  const [addressCopied, setAddressCopied] = useState(false);
   const [height, setHeight] = useState(0);
   const [bestHash, setBestHash] = useState("");
   const [peers, setPeers] = useState(0);
@@ -340,6 +345,14 @@ export function Overview() {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [protocolOutdated, setProtocolOutdated] = useState(false);
   const [networkVersion, setNetworkVersion] = useState("");
+
+  const copyAddress = useCallback(() => {
+    if (!address) return;
+    navigator.clipboard.writeText(address).then(() => {
+      setAddressCopied(true);
+      setTimeout(() => setAddressCopied(false), 2000);
+    });
+  }, [address]);
   const [releasesURL, setReleasesURL] = useState("");
 
   const [nodeConfig, setNodeConfig] = useState<Record<string, any>>({});
@@ -379,7 +392,10 @@ export function Overview() {
       if (!address) {
         GetWalletAddress()
           .then((a) => {
-            if (a) setAddress(a);
+            if (a) {
+              setAddress(a);
+              GetAddressLabel(a).then((lbl) => { if (lbl) setAddressLabel(lbl); }).catch(() => {});
+            }
           })
           .catch(() => {});
       }
@@ -573,22 +589,61 @@ export function Overview() {
           border: "1px solid var(--color-btc-border)",
         }}
       >
-        <h3
-          className="mb-2 text-xs font-medium uppercase tracking-wider"
-          style={{ color: "var(--color-btc-text-dim)" }}
-        >
-          Default Address
-        </h3>
-        <code
-          className="block break-all rounded-lg px-3 py-2 text-sm font-mono"
-          style={{
-            background: "var(--color-btc-deep)",
-            color: "var(--color-btc-gold-light)",
-            border: "1px solid var(--color-btc-border)",
-          }}
-        >
-          {address || "Loading..."}
-        </code>
+        <div className="mb-2 flex items-center justify-between">
+          <h3
+            className="text-xs font-medium uppercase tracking-wider"
+            style={{ color: "var(--color-btc-text-dim)" }}
+          >
+            Default Address
+          </h3>
+          <button
+            onClick={() => navigate("/receive")}
+            className="rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide transition-colors"
+            style={{
+              background: "rgba(247, 147, 26, 0.12)",
+              color: "var(--color-btc-gold)",
+              border: "1px solid rgba(247, 147, 26, 0.25)",
+            }}
+          >
+            Manage Addresses
+          </button>
+        </div>
+        {addressLabel && (
+          <p className="mb-1.5 text-[11px] font-semibold" style={{ color: "var(--color-btc-gold-light)" }}>{addressLabel}</p>
+        )}
+        <div className="flex items-center gap-2">
+          <code
+            className="min-w-0 flex-1 break-all rounded-lg px-3 py-2 text-sm font-mono"
+            style={{
+              background: "var(--color-btc-deep)",
+              color: "var(--color-btc-gold-light)",
+              border: "1px solid var(--color-btc-border)",
+            }}
+          >
+            {address || "Loading..."}
+          </code>
+          {address && (
+            <button
+              onClick={copyAddress}
+              className="shrink-0 rounded-lg p-2 transition-colors"
+              style={{
+                background: addressCopied ? "rgba(63, 185, 80, 0.15)" : "rgba(247, 147, 26, 0.12)",
+                color: addressCopied ? "var(--color-btc-green)" : "var(--color-btc-gold)",
+                border: `1px solid ${addressCopied ? "rgba(63, 185, 80, 0.3)" : "rgba(247, 147, 26, 0.25)"}`,
+              }}
+              title={addressCopied ? "Copied!" : "Copy address"}
+            >
+              {addressCopied ? (
+                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+              ) : (
+                <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
+              )}
+            </button>
+          )}
+        </div>
+        {addressCopied && (
+          <p className="mt-1.5 text-[11px] font-medium" style={{ color: "var(--color-btc-green)" }}>Address copied to clipboard</p>
+        )}
       </div>
 
       {/* Chain Status */}

@@ -22,6 +22,7 @@ import (
 
 	"github.com/bams-repo/fairchain/internal/coinparams"
 	"github.com/bams-repo/fairchain/internal/config"
+	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/logging"
 	"github.com/bams-repo/fairchain/internal/miner"
 	"github.com/bams-repo/fairchain/internal/node"
@@ -29,6 +30,7 @@ import (
 	"github.com/bams-repo/fairchain/internal/types"
 	"github.com/bams-repo/fairchain/internal/utxo"
 	"github.com/bams-repo/fairchain/internal/version"
+	"github.com/bams-repo/fairchain/internal/wallet"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -48,10 +50,17 @@ type App struct {
 	probePort   string
 	probeError  string
 	probeReady  bool // true once the first probe has completed
+
+	// Address book: user-assigned labels for any address (own or external).
+	addrBookMu   sync.RWMutex
+	addrBook     map[string]string // address → label
+	addrBookPath string
 }
 
 func NewApp() *App {
-	return &App{}
+	return &App{
+		addrBook: make(map[string]string),
+	}
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -91,6 +100,14 @@ func (a *App) startup(ctx context.Context) {
 	n, err := node.New(cfg, opts)
 	if err != nil {
 		logging.L.Error("failed to initialize node", "error", err)
+		if strings.Contains(err.Error(), "acquire lock file") || strings.Contains(err.Error(), "another") {
+			wailsRuntime.MessageDialog(ctx, wailsRuntime.MessageDialogOptions{
+				Type:    wailsRuntime.ErrorDialog,
+				Title:   coinparams.Name + " Wallet",
+				Message: "Cannot start: another " + coinparams.Name + " Wallet instance is already running.\n\nPlease close the other instance before starting a new one.\n\nIf you are certain no other " + coinparams.Name + " Wallet is running, the lock file may be stale from a previous crash. Delete the file at:\n" + cfg.LockFilePath(),
+			})
+			wailsRuntime.Quit(ctx)
+		}
 		return
 	}
 
@@ -106,6 +123,8 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	a.node = n
+	a.addrBookPath = filepath.Join(cfg.NetworkDataDir(), "addressbook.json")
+	a.loadAddressBook()
 
 	go a.probeLoop(ctx)
 
@@ -114,7 +133,7 @@ func (a *App) startup(ctx context.Context) {
 
 	a.irc = newIRCClient(ircConfig{
 		ServerAddr: "irc.libera.chat:6697",
-		Channel:    "#test112221",
+		Channel:    "#fairchain",
 		NickPrefix: coinparams.NameLower,
 		SavedNick:  savedNick,
 		OnNickChange: func(nick string) {
@@ -284,6 +303,104 @@ func (a *App) GetWalletAddress() (string, error) {
 		return "", fmt.Errorf("node not initialized")
 	}
 	return a.node.Wallet().GetDefaultAddress(), nil
+}
+
+// GetNewAddress derives a fresh external (receiving) address.
+func (a *App) GetNewAddress() (string, error) {
+	if a.node == nil {
+		return "", fmt.Errorf("node not initialized")
+	}
+	return a.node.Wallet().GetNewAddress()
+}
+
+// ListReceiveAddresses returns all external (receiving) addresses in the wallet.
+func (a *App) ListReceiveAddresses() ([]string, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	return a.node.Wallet().ExternalAddresses(), nil
+}
+
+// ── Address Book ─────────────────────────────────────────────────────
+
+func (a *App) loadAddressBook() {
+	data, err := os.ReadFile(a.addrBookPath)
+	if err != nil {
+		return
+	}
+	a.addrBookMu.Lock()
+	defer a.addrBookMu.Unlock()
+	_ = json.Unmarshal(data, &a.addrBook)
+}
+
+func (a *App) saveAddressBook() error {
+	a.addrBookMu.RLock()
+	data, err := json.MarshalIndent(a.addrBook, "", "  ")
+	a.addrBookMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(a.addrBookPath, data, 0600)
+}
+
+// SetAddressLabel stores a user-assigned label for an address.
+// Pass an empty label to remove it.
+func (a *App) SetAddressLabel(address, label string) error {
+	address = strings.TrimSpace(address)
+	label = strings.TrimSpace(label)
+	if address == "" {
+		return fmt.Errorf("address is required")
+	}
+	a.addrBookMu.Lock()
+	if label == "" {
+		delete(a.addrBook, address)
+	} else {
+		a.addrBook[address] = label
+	}
+	a.addrBookMu.Unlock()
+	return a.saveAddressBook()
+}
+
+// GetAddressLabel returns the label for a single address, or empty string.
+func (a *App) GetAddressLabel(address string) string {
+	a.addrBookMu.RLock()
+	defer a.addrBookMu.RUnlock()
+	return a.addrBook[address]
+}
+
+// GetAddressBook returns the full address book as {address: label}.
+func (a *App) GetAddressBook() map[string]string {
+	a.addrBookMu.RLock()
+	defer a.addrBookMu.RUnlock()
+	cp := make(map[string]string, len(a.addrBook))
+	for k, v := range a.addrBook {
+		cp[k] = v
+	}
+	return cp
+}
+
+// GetAddressTransactionCounts returns a map of address → UTXO count for all
+// addresses that appear in the wallet's UTXO set (own addresses only).
+func (a *App) GetAddressTransactionCounts() (map[string]int, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	w := a.node.Wallet()
+	bc := a.node.Chain()
+	_, tipHeight := bc.Tip()
+
+	iter := func(fn func(txHash [32]byte, index uint32, value uint64, pkScript []byte, height uint32, isCoinbase bool)) {
+		bc.UtxoSet().ForEach(func(txHash types.Hash, index uint32, entry *utxo.UtxoEntry) {
+			fn(txHash, index, entry.Value, entry.PkScript, entry.Height, entry.IsCoinbase)
+		})
+	}
+
+	utxos := w.FindUnspent(iter, tipHeight)
+	counts := make(map[string]int, len(utxos))
+	for _, u := range utxos {
+		counts[u.Address]++
+	}
+	return counts, nil
 }
 
 // GetSyncProgress returns a value between 0.0 and 1.0 indicating sync progress.
@@ -1217,6 +1334,90 @@ func resolvePublicIP(client *http.Client) string {
 		}
 	}
 	return ""
+}
+
+// SendToAddress sends coins from the wallet to the given address.
+// Amount is in display units (e.g. 1.5 FAIR). Returns the txid on success.
+func (a *App) SendToAddress(address string, amountFloat float64) (map[string]interface{}, error) {
+	if a.node == nil {
+		return nil, fmt.Errorf("node not initialized")
+	}
+	w := a.node.Wallet()
+	if err := w.RequireUnlocked(); err != nil {
+		return nil, fmt.Errorf("wallet is locked: %w", err)
+	}
+
+	amount := uint64(amountFloat * float64(coinparams.CoinsPerBaseUnit))
+	if amount == 0 {
+		return nil, fmt.Errorf("amount must be greater than zero")
+	}
+
+	bc := a.node.Chain()
+	_, tipHeight := bc.Tip()
+	iter := func(fn func(txHash [32]byte, index uint32, value uint64, pkScript []byte, height uint32, isCoinbase bool)) {
+		bc.UtxoSet().ForEach(func(txHash types.Hash, index uint32, entry *utxo.UtxoEntry) {
+			fn(txHash, index, entry.Value, entry.PkScript, entry.Height, entry.IsCoinbase)
+		})
+	}
+	utxos := w.FindUnspent(iter, tipHeight)
+
+	rpcSrv := a.node.RPCServer()
+	feePerByte := uint64(1)
+	if rpcSrv != nil {
+		feePerByte = rpcSrv.FeePerByte()
+	}
+
+	tx, err := w.BuildTransaction(
+		wallet.SendRequest{ToAddress: address, Amount: amount},
+		feePerByte,
+		utxos,
+		a.node.Params().CoinbaseMaturity,
+		tipHeight,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	mp := a.node.Mempool()
+	txHash, err := mp.AddTx(tx)
+	if err != nil {
+		return nil, fmt.Errorf("mempool rejection: %w", err)
+	}
+
+	a.node.P2PMgr().BroadcastTx(txHash)
+
+	return map[string]interface{}{
+		"txid": txHash.ReverseString(),
+	}, nil
+}
+
+// ValidateAddress checks whether the given address is valid for this network
+// and whether it belongs to this wallet.
+func (a *App) ValidateAddress(address string) map[string]interface{} {
+	if a.node == nil {
+		return map[string]interface{}{
+			"isvalid": false,
+			"address": address,
+			"error":   "node not initialized",
+		}
+	}
+	w := a.node.Wallet()
+	_, _, err := crypto.AddressToPubKeyHash(address)
+	if err != nil {
+		return map[string]interface{}{
+			"isvalid": false,
+			"address": address,
+		}
+	}
+	isMine := false
+	if dk := w.GetKeyForAddress(address); dk != nil {
+		isMine = true
+	}
+	return map[string]interface{}{
+		"isvalid": true,
+		"address": address,
+		"ismine":  isMine,
+	}
 }
 
 // GetMainnetLaunchInfo returns the mainnet mining start epoch and the current

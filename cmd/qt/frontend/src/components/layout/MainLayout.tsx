@@ -134,6 +134,12 @@ function viewMeta(pathname: string): { title: string; subtitle: string } {
   if (p === "/mining" || p.startsWith("/mining/")) {
     return { title: "Mining", subtitle: "Internal miner & stratum server" };
   }
+  if (p === "/receive" || p.startsWith("/receive/")) {
+    return { title: "Receive", subtitle: "Generate & manage receiving addresses" };
+  }
+  if (p === "/send" || p.startsWith("/send/")) {
+    return { title: "Send", subtitle: "Send coins to another address" };
+  }
   return { title: "Wallet", subtitle: "Fairchain" };
 }
 
