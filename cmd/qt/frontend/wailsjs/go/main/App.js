@@ -10,20 +10,16 @@ export function CoinInfo() {
   return window['go']['main']['App']['CoinInfo']();
 }
 
-export function CreateWallet() {
-  return window['go']['main']['App']['CreateWallet']();
-}
-
 export function ConnectIRC() {
   return window['go']['main']['App']['ConnectIRC']();
 }
 
-export function ExecuteRPC(arg1, arg2) {
-  return window['go']['main']['App']['ExecuteRPC'](arg1, arg2);
+export function CreateWallet() {
+  return window['go']['main']['App']['CreateWallet']();
 }
 
-export function ImportWallet(arg1) {
-  return window['go']['main']['App']['ImportWallet'](arg1);
+export function ExecuteRPC(arg1, arg2) {
+  return window['go']['main']['App']['ExecuteRPC'](arg1, arg2);
 }
 
 export function GetAddressBook() {
@@ -112,6 +108,10 @@ export function GetUpdateStatus() {
 
 export function GetWalletAddress() {
   return window['go']['main']['App']['GetWalletAddress']();
+}
+
+export function ImportWallet(arg1) {
+  return window['go']['main']['App']['ImportWallet'](arg1);
 }
 
 export function InstallService() {

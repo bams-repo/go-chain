@@ -126,6 +126,7 @@ var Mainnet = &ChainParams{
 	SeedNodes: []string{
 		"95.179.203.47:19333",
 		"207.246.117.14:19333",
+		"[2001:19f0:5400:3322:5400:06ff:fe1d:ce90]:19333",
 	},
 
 	MiningStartTime: 1777338000, // 2026-04-27 18:00:00 PDT — mainnet mining begins

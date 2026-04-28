@@ -5,13 +5,11 @@ export function ChangeIRCNick(arg1:string):Promise<void>;
 
 export function CoinInfo():Promise<Record<string, any>>;
 
-export function CreateWallet():Promise<Record<string, any>>;
-
 export function ConnectIRC():Promise<void>;
 
-export function ExecuteRPC(arg1:string,arg2:string):Promise<Record<string, any>>;
+export function CreateWallet():Promise<Record<string, any>>;
 
-export function ImportWallet(arg1:string):Promise<Record<string, any>>;
+export function ExecuteRPC(arg1:string,arg2:string):Promise<Record<string, any>>;
 
 export function GetAddressBook():Promise<Record<string, string>>;
 
@@ -56,6 +54,8 @@ export function GetSyncStatus():Promise<Record<string, any>>;
 export function GetUpdateStatus():Promise<Record<string, any>>;
 
 export function GetWalletAddress():Promise<string>;
+
+export function ImportWallet(arg1:string):Promise<Record<string, any>>;
 
 export function InstallService():Promise<string>;
 

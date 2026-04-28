@@ -1670,6 +1670,14 @@ func (m *Manager) handlePeer(ctx context.Context, peer *Peer) {
 		peer.SendMessage(protocol.CmdSendHeaders, nil)
 	}
 
+	// Bitcoin Core parity: if the peer advertises a higher chain than ours,
+	// immediately request blocks so we catch up even when the sync state
+	// machine considers us "synced" (small gaps below its thresholds).
+	_, ourHeight := m.chain.Tip()
+	if peer.Version().StartHeight > ourHeight {
+		m.requestBlocks(peer)
+	}
+
 	// During IBD, avoid getaddr/addr chatter which can trigger strict peer
 	// message rate limits. Peer discovery isn't needed to complete sync.
 	if !m.IsSyncing() {
@@ -4712,14 +4720,17 @@ func (m *Manager) handleSyncedTick() {
 		return
 	}
 
-	if tipStale {
+	if tipStale || bestHeight > ourHeight {
 		if logging.DebugMode {
-			logging.L.Debug("[dbg] handleSyncedTick: tip stale, requesting blocks from all peers",
+			logging.L.Debug("[dbg] handleSyncedTick: behind peers or tip stale, requesting blocks",
 				"our_height", ourHeight,
-				"best_peer_height", bestHeight)
+				"best_peer_height", bestHeight,
+				"tip_stale", tipStale)
 		}
-		logging.L.Debug("chain tip appears stale, requesting blocks from all peers",
-			"component", "p2p", "height", ourHeight)
+		if tipStale {
+			logging.L.Debug("chain tip appears stale, requesting blocks from all peers",
+				"component", "p2p", "height", ourHeight)
+		}
 		m.mu.RLock()
 		allPeers := make([]*Peer, 0, len(m.peers))
 		for _, p := range m.peers {
