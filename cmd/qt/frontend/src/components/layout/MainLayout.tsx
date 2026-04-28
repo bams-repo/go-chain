@@ -187,7 +187,7 @@ function MainnetCountdown() {
 function viewMeta(pathname: string): { title: string; subtitle: string } {
   const p = pathname.replace(/\/$/, "") || "/";
   if (p === "" || p === "/") {
-    return { title: "Overview", subtitle: "Balances, default address, and chain status" };
+    return { title: "Overview", subtitle: "Balances, address, chain status, and estimated network hashrate" };
   }
   if (p === "/social" || p.startsWith("/social/")) {
     return { title: "Social", subtitle: "Wallet IRC — community channel" };
@@ -200,6 +200,9 @@ function viewMeta(pathname: string): { title: string; subtitle: string } {
   }
   if (p === "/mining" || p.startsWith("/mining/")) {
     return { title: "Mining", subtitle: "Internal miner & stratum server" };
+  }
+  if (p === "/node-network" || p.startsWith("/node-network/")) {
+    return { title: "Node & network", subtitle: "P2P settings, reachability, and data directory" };
   }
   if (p === "/receive" || p.startsWith("/receive/")) {
     return { title: "Receive", subtitle: "Generate & manage receiving addresses" };

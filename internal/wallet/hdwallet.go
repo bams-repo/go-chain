@@ -51,6 +51,19 @@ type WalletData struct {
 	ScryptN        int    `json:"scrypt_n,omitempty"`
 	ScryptR        int    `json:"scrypt_r,omitempty"`
 	ScryptP        int    `json:"scrypt_p,omitempty"`
+
+	// Watch-only (public) HD state for encrypted wallets while locked. Lets us
+	// list addresses and see balances without the seed in memory.
+	WatchExternalXPub   string   `json:"watch_external,omitempty"`
+	WatchChangeXPub     string   `json:"watch_change,omitempty"`
+	ImportedWatchPubHex []string `json:"imported_watch_pub,omitempty"`
+}
+
+// walletEncPlain is the JSON payload encrypted on disk (replaces legacy "mnemonic\nseed" text).
+type walletEncPlain struct {
+	Mnemonic string   `json:"mn"`
+	SeedHex  string   `json:"sd"`
+	Imported []string `json:"im,omitempty"` // 32-byte secp256k1 private keys as hex
 }
 
 // DerivedKey holds a single derived key and its metadata.
@@ -168,17 +181,12 @@ func (w *HDWallet) loadFromJSON(data []byte) error {
 	if wd.Encrypted {
 		w.encrypted = true
 		w.locked = true
-		// For encrypted wallets, we can still derive public keys from the
-		// stored seed if the wallet was previously unlocked and saved.
-		// But on fresh load of an encrypted wallet, we need the mnemonic/seed
-		// which are in the encrypted blob. We must load them to derive keys.
-		// Attempt to load from the unencrypted fields if present (backward compat).
+		// Legacy: plaintext seed in JSON (insecure; do not write on new encrypts).
 		if wd.Seed != "" && wd.Mnemonic != "" {
 			return w.loadSeedAndDerive(wd.Mnemonic, wd.Seed)
 		}
-		// Encrypted wallet with no plaintext seed: keys cannot be derived until unlock.
-		// We still mark the wallet as loaded so address queries work after unlock.
-		return nil
+		// Encrypted with no plaintext seed: load watch-only addresses from xpubs if present.
+		return w.loadWatchOnlyFromWalletData(&wd)
 	}
 
 	return w.loadSeedAndDerive(wd.Mnemonic, wd.Seed)
@@ -209,6 +217,174 @@ func (w *HDWallet) loadSeedAndDerive(mnemonic, seedHex string) error {
 	}
 
 	return nil
+}
+
+// loadWatchOnlyFromWalletData rebuilds pubkey-only derived keys for an encrypted
+// wallet loaded from disk while still locked (no seed in memory).
+func (w *HDWallet) loadWatchOnlyFromWalletData(wd *WalletData) error {
+	if wd.WatchExternalXPub == "" || wd.WatchChangeXPub == "" {
+		// Legacy encrypted file without xpub metadata; unlock required for addresses.
+		return nil
+	}
+	extK, err := hdkeychain.NewKeyFromString(wd.WatchExternalXPub)
+	if err != nil {
+		return fmt.Errorf("parse watch external xpub: %w", err)
+	}
+	chgK, err := hdkeychain.NewKeyFromString(wd.WatchChangeXPub)
+	if err != nil {
+		return fmt.Errorf("parse watch change xpub: %w", err)
+	}
+	w.externalKey = extK
+	w.changeKey = chgK
+	w.accountKey = nil
+
+	w.externalKeys = nil
+	w.changeKeys = nil
+	w.keysByHash = make(map[[crypto.PubKeyHashSize]byte]*DerivedKey)
+	w.keysByAddress = make(map[string]*DerivedKey)
+
+	for i := uint32(0); i < w.nextExternalIdx; i++ {
+		if _, err := w.deriveExternal(i); err != nil {
+			return fmt.Errorf("watch external %d: %w", i, err)
+		}
+	}
+	for i := uint32(0); i < w.nextChangeIdx; i++ {
+		if _, err := w.deriveChange(i); err != nil {
+			return fmt.Errorf("watch change %d: %w", i, err)
+		}
+	}
+	for _, pubHex := range wd.ImportedWatchPubHex {
+		if err := w.registerImportedWatchOnly(pubHex); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *HDWallet) registerImportedWatchOnly(pubHex string) error {
+	pubBytes, err := hex.DecodeString(pubHex)
+	if err != nil {
+		return fmt.Errorf("decode imported watch pubkey: %w", err)
+	}
+	pubKey, err := secp256k1.ParsePubKey(pubBytes)
+	if err != nil {
+		return fmt.Errorf("parse imported watch pubkey: %w", err)
+	}
+	compressed := pubKey.SerializeCompressed()
+	pubKeyHash := crypto.PubKeyHash(compressed)
+	dk := &DerivedKey{
+		PrivKey:    nil,
+		PubKey:     compressed,
+		PubKeyHash: pubKeyHash,
+		Path:       "imported",
+		IsChange:   false,
+		Index:      0,
+	}
+	w.externalKeys = append(w.externalKeys, dk)
+	w.keysByHash[pubKeyHash] = dk
+	w.keysByAddress[crypto.PubKeyHashToAddress(pubKeyHash, w.addrVersion)] = dk
+	return nil
+}
+
+func parseEncPlain(plaintext []byte) (mnemonic, seedHex string, imported []string, err error) {
+	var p walletEncPlain
+	if json.Unmarshal(plaintext, &p) == nil && p.Mnemonic != "" && p.SeedHex != "" {
+		return p.Mnemonic, p.SeedHex, p.Imported, nil
+	}
+	parts := splitOnNewline(string(plaintext))
+	if len(parts) < 2 {
+		return "", "", nil, fmt.Errorf("invalid wallet plaintext")
+	}
+	return parts[0], parts[1], nil, nil
+}
+
+func (w *HDWallet) buildEncPlainPayload() ([]byte, error) {
+	var imp []string
+	for _, dk := range w.externalKeys {
+		if dk.Path == "imported" && dk.PrivKey != nil {
+			imp = append(imp, hex.EncodeToString(dk.PrivKey.Serialize()))
+		}
+	}
+	for _, dk := range w.changeKeys {
+		if dk.Path == "imported" && dk.PrivKey != nil {
+			imp = append(imp, hex.EncodeToString(dk.PrivKey.Serialize()))
+		}
+	}
+	p := walletEncPlain{
+		Mnemonic: w.mnemonic,
+		SeedHex:  hex.EncodeToString(w.seed),
+		Imported: imp,
+	}
+	return json.Marshal(p)
+}
+
+func (w *HDWallet) restoreImportedPrivKeys(privHexes []string) error {
+	for _, h := range privHexes {
+		if h == "" {
+			continue
+		}
+		raw, err := hex.DecodeString(h)
+		if err != nil {
+			return fmt.Errorf("imported key hex: %w", err)
+		}
+		privKey, err := crypto.PrivKeyFromBytes(raw)
+		if err != nil {
+			return err
+		}
+		pubKey := privKey.PubKey().SerializeCompressed()
+		pubKeyHash := crypto.PubKeyHash(pubKey)
+		if _, exists := w.keysByHash[pubKeyHash]; exists {
+			continue
+		}
+		addr := crypto.PubKeyHashToAddress(pubKeyHash, w.addrVersion)
+		dk := &DerivedKey{
+			PrivKey:    privKey,
+			PubKey:     pubKey,
+			PubKeyHash: pubKeyHash,
+			Path:       "imported",
+			IsChange:   false,
+			Index:      0,
+		}
+		w.externalKeys = append(w.externalKeys, dk)
+		w.keysByHash[pubKeyHash] = dk
+		w.keysByAddress[addr] = dk
+	}
+	return nil
+}
+
+// wipeLockedSecrets clears seed, mnemonic, AES key material, extended private
+// keys, and per-address private keys. Public key data remains for watch-only use.
+func (w *HDWallet) wipeLockedSecrets() {
+	for i := range w.encKey {
+		w.encKey[i] = 0
+	}
+	w.encKey = nil
+
+	for i := range w.seed {
+		w.seed[i] = 0
+	}
+	w.seed = nil
+	w.mnemonic = ""
+
+	if w.accountKey != nil {
+		w.accountKey.Zero()
+		w.accountKey = nil
+	}
+	if w.externalKey != nil {
+		w.externalKey.Zero()
+		w.externalKey = nil
+	}
+	if w.changeKey != nil {
+		w.changeKey.Zero()
+		w.changeKey = nil
+	}
+
+	for _, dk := range w.externalKeys {
+		dk.PrivKey = nil
+	}
+	for _, dk := range w.changeKeys {
+		dk.PrivKey = nil
+	}
 }
 
 func (w *HDWallet) deriveAccountKeys() error {
@@ -272,20 +448,31 @@ func (w *HDWallet) deriveChange(index uint32) (*DerivedKey, error) {
 }
 
 func (w *HDWallet) registerKey(extKey *hdkeychain.ExtendedKey, isChange bool, index uint32) (*DerivedKey, error) {
-	ecPrivKey, err := extKey.ECPrivKey()
-	if err != nil {
-		return nil, fmt.Errorf("extract EC private key: %w", err)
-	}
-
-	privKey := secp256k1.PrivKeyFromBytes(ecPrivKey.Serialize())
-	pubKey := privKey.PubKey().SerializeCompressed()
-	pubKeyHash := crypto.PubKeyHash(pubKey)
-
 	chainIdx := 0
 	if isChange {
 		chainIdx = 1
 	}
 	path := fmt.Sprintf("m/44'/0'/0'/%d/%d", chainIdx, index)
+
+	var privKey *secp256k1.PrivateKey
+	var pubKey []byte
+
+	if extKey.IsPrivate() {
+		ecPrivKey, err := extKey.ECPrivKey()
+		if err != nil {
+			return nil, fmt.Errorf("extract EC private key: %w", err)
+		}
+		privKey = secp256k1.PrivKeyFromBytes(ecPrivKey.Serialize())
+		pubKey = privKey.PubKey().SerializeCompressed()
+	} else {
+		ecPub, err := extKey.ECPubKey()
+		if err != nil {
+			return nil, fmt.Errorf("extract EC public key: %w", err)
+		}
+		pubKey = ecPub.SerializeCompressed()
+	}
+
+	pubKeyHash := crypto.PubKeyHash(pubKey)
 
 	dk := &DerivedKey{
 		PrivKey:    privKey,
@@ -314,6 +501,10 @@ func (w *HDWallet) DeriveNextExternal() (*DerivedKey, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.encrypted && w.locked {
+		return nil, fmt.Errorf("wallet is locked")
+	}
+
 	dk, err := w.deriveExternal(w.nextExternalIdx)
 	if err != nil {
 		return nil, err
@@ -329,6 +520,10 @@ func (w *HDWallet) DeriveNextExternal() (*DerivedKey, error) {
 func (w *HDWallet) DeriveNextChange() (*DerivedKey, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.encrypted && w.locked {
+		return nil, fmt.Errorf("wallet is locked")
+	}
 
 	dk, err := w.deriveChange(w.nextChangeIdx)
 	if err != nil {
@@ -512,6 +707,16 @@ func (w *HDWallet) ImportPrivKey(privKeyStr string) (string, error) {
 	w.externalKeys = append(w.externalKeys, dk)
 	w.keysByHash[pubKeyHash] = dk
 	w.keysByAddress[addr] = dk
+
+	if w.encrypted && !w.locked {
+		if err := w.reencryptUnlockedPayload(); err != nil {
+			return "", err
+		}
+	} else if !w.encrypted {
+		if err := w.save(); err != nil {
+			return "", err
+		}
+	}
 
 	return addr, nil
 }
@@ -788,14 +993,7 @@ func (w *HDWallet) IsLocked() bool {
 	}
 	if !w.unlockUntil.IsZero() && time.Now().After(w.unlockUntil) {
 		w.locked = true
-		for i := range w.encKey {
-			w.encKey[i] = 0
-		}
-		w.encKey = nil
-		for i := range w.seed {
-			w.seed[i] = 0
-		}
-		w.mnemonic = ""
+		w.wipeLockedSecrets()
 		w.unlockUntil = time.Time{}
 		return true
 	}
@@ -816,6 +1014,11 @@ func (w *HDWallet) EncryptWallet(passphrase string) error {
 		return fmt.Errorf("passphrase must not be empty")
 	}
 
+	plaintext, err := w.buildEncPlainPayload()
+	if err != nil {
+		return fmt.Errorf("build wallet payload: %w", err)
+	}
+
 	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return fmt.Errorf("generate salt: %w", err)
@@ -826,50 +1029,50 @@ func (w *HDWallet) EncryptWallet(passphrase string) error {
 		return fmt.Errorf("derive key: %w", err)
 	}
 
-	plaintext := w.mnemonic + "\n" + hex.EncodeToString(w.seed)
-	ciphertext, iv, err := aesEncrypt(aesKey, []byte(plaintext))
+	ciphertext, iv, err := aesEncrypt(aesKey, plaintext)
+	for i := range aesKey {
+		aesKey[i] = 0
+	}
 	if err != nil {
 		return fmt.Errorf("encrypt: %w", err)
 	}
+
+	extPub, err := w.externalKey.Neuter()
+	if err != nil {
+		return fmt.Errorf("neuter external chain: %w", err)
+	}
+	chgPub, err := w.changeKey.Neuter()
+	if err != nil {
+		return fmt.Errorf("neuter change chain: %w", err)
+	}
+
+	impWatch := w.collectImportedWatchPubHex()
 
 	w.encrypted = true
 	w.locked = true
 	w.encKey = nil
 
-	return w.saveEncrypted(ciphertext, salt, iv)
+	if err := w.saveEncrypted(ciphertext, salt, iv, extPub.String(), chgPub.String(), impWatch); err != nil {
+		return err
+	}
+
+	w.wipeLockedSecrets()
+	return nil
 }
 
-// WalletPassphrase unlocks the wallet for the given duration.
-// Matches Bitcoin Core's walletpassphrase RPC.
-func (w *HDWallet) WalletPassphrase(passphrase string, timeoutSecs int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if !w.encrypted {
-		return fmt.Errorf("wallet is not encrypted")
-	}
-
-	// Read the encrypted wallet data to verify the passphrase.
-	data, err := os.ReadFile(w.walletPath())
-	if err != nil {
-		return fmt.Errorf("read wallet: %w", err)
-	}
-	var wd WalletData
-	if err := json.Unmarshal(data, &wd); err != nil {
-		return fmt.Errorf("parse wallet: %w", err)
-	}
-
+// decryptPayloadFromWalletData decrypts the encrypted payload in wd using passphrase.
+func decryptPayloadFromWalletData(wd *WalletData, passphrase string) ([]byte, error) {
 	salt, err := hex.DecodeString(wd.Salt)
 	if err != nil {
-		return fmt.Errorf("decode salt: %w", err)
+		return nil, fmt.Errorf("decode salt: %w", err)
 	}
 	iv, err := hex.DecodeString(wd.IV)
 	if err != nil {
-		return fmt.Errorf("decode iv: %w", err)
+		return nil, fmt.Errorf("decode iv: %w", err)
 	}
 	ciphertext, err := hex.DecodeString(wd.EncryptedData)
 	if err != nil {
-		return fmt.Errorf("decode ciphertext: %w", err)
+		return nil, fmt.Errorf("decode ciphertext: %w", err)
 	}
 
 	n, r, p := wd.ScryptN, wd.ScryptR, wd.ScryptP
@@ -885,28 +1088,175 @@ func (w *HDWallet) WalletPassphrase(passphrase string, timeoutSecs int64) error 
 
 	aesKey, err := scrypt.Key([]byte(passphrase), salt, n, r, p, keyLen)
 	if err != nil {
+		return nil, fmt.Errorf("derive key: %w", err)
+	}
+	plaintext, err := aesDecrypt(aesKey, iv, ciphertext)
+	for i := range aesKey {
+		aesKey[i] = 0
+	}
+	if err != nil {
+		return nil, fmt.Errorf("incorrect passphrase")
+	}
+	return plaintext, nil
+}
+
+// ChangeWalletPassphrase replaces the wallet encryption passphrase (Bitcoin Core
+// walletpassphrasechange). The old passphrase must be correct; if the wallet is
+// unlocked, in-memory state (e.g. recent imports) is merged into the new blob.
+func (w *HDWallet) ChangeWalletPassphrase(oldPassphrase, newPassphrase string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.encrypted {
+		return fmt.Errorf("wallet is not encrypted")
+	}
+	if newPassphrase == "" {
+		return fmt.Errorf("new passphrase must not be empty")
+	}
+
+	data, err := os.ReadFile(w.walletPath())
+	if err != nil {
+		return fmt.Errorf("read wallet: %w", err)
+	}
+	var wd WalletData
+	if err := json.Unmarshal(data, &wd); err != nil {
+		return fmt.Errorf("parse wallet: %w", err)
+	}
+
+	plainDisk, err := decryptPayloadFromWalletData(&wd, oldPassphrase)
+	if err != nil {
+		return err
+	}
+	mnDisk, _, _, perr := parseEncPlain(plainDisk)
+	if perr != nil || !bip39.IsMnemonicValid(mnDisk) {
+		return fmt.Errorf("incorrect passphrase")
+	}
+
+	var plaintext []byte
+	if !w.locked && w.seed != nil {
+		plaintext, err = w.buildEncPlainPayload()
+		if err != nil {
+			return fmt.Errorf("build payload: %w", err)
+		}
+		mnMem, _, _, _ := parseEncPlain(plaintext)
+		if mnMem != mnDisk {
+			return fmt.Errorf("wallet out of sync with disk; restart or lock and unlock first")
+		}
+	} else {
+		plaintext = plainDisk
+	}
+
+	salt := make([]byte, saltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return fmt.Errorf("generate salt: %w", err)
+	}
+	aesKeyNew, err := scrypt.Key([]byte(newPassphrase), salt, scryptN, scryptR, scryptP, keyLen)
+	if err != nil {
+		return fmt.Errorf("derive key: %w", err)
+	}
+	ciphertext, iv, err := aesEncrypt(aesKeyNew, plaintext)
+	if err != nil {
+		for i := range aesKeyNew {
+			aesKeyNew[i] = 0
+		}
+		return fmt.Errorf("encrypt: %w", err)
+	}
+
+	wd.EncryptedData = hex.EncodeToString(ciphertext)
+	wd.Salt = hex.EncodeToString(salt)
+	wd.IV = hex.EncodeToString(iv)
+	wd.ScryptN = scryptN
+	wd.ScryptR = scryptR
+	wd.ScryptP = scryptP
+
+	out, err := json.MarshalIndent(wd, "", "  ")
+	if err != nil {
+		for i := range aesKeyNew {
+			aesKeyNew[i] = 0
+		}
+		return fmt.Errorf("marshal wallet: %w", err)
+	}
+	if err := os.WriteFile(w.walletPath(), out, 0600); err != nil {
+		for i := range aesKeyNew {
+			aesKeyNew[i] = 0
+		}
+		return fmt.Errorf("write wallet: %w", err)
+	}
+
+	sessionUnlocked := !w.locked && w.encKey != nil
+	if sessionUnlocked {
+		for i := range w.encKey {
+			w.encKey[i] = 0
+		}
+		w.encKey = aesKeyNew
+	} else {
+		for i := range aesKeyNew {
+			aesKeyNew[i] = 0
+		}
+	}
+	return nil
+}
+
+// WalletPassphrase unlocks the wallet for the given duration.
+// Matches Bitcoin Core's walletpassphrase RPC.
+func (w *HDWallet) WalletPassphrase(passphrase string, timeoutSecs int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.encrypted {
+		return fmt.Errorf("wallet is not encrypted")
+	}
+
+	data, err := os.ReadFile(w.walletPath())
+	if err != nil {
+		return fmt.Errorf("read wallet: %w", err)
+	}
+	var wd WalletData
+	if err := json.Unmarshal(data, &wd); err != nil {
+		return fmt.Errorf("parse wallet: %w", err)
+	}
+
+	plaintext, err := decryptPayloadFromWalletData(&wd, passphrase)
+	if err != nil {
+		return err
+	}
+
+	mnemonic, seedHex, importedPrivs, perr := parseEncPlain(plaintext)
+	if perr != nil || !bip39.IsMnemonicValid(mnemonic) {
+		return fmt.Errorf("incorrect passphrase")
+	}
+
+	salt, err := hex.DecodeString(wd.Salt)
+	if err != nil {
+		return fmt.Errorf("decode salt: %w", err)
+	}
+	n, r, p := wd.ScryptN, wd.ScryptR, wd.ScryptP
+	if n == 0 {
+		n = scryptN
+	}
+	if r == 0 {
+		r = scryptR
+	}
+	if p == 0 {
+		p = scryptP
+	}
+	aesKey, err := scrypt.Key([]byte(passphrase), salt, n, r, p, keyLen)
+	if err != nil {
 		return fmt.Errorf("derive key: %w", err)
 	}
 
-	plaintext, err := aesDecrypt(aesKey, iv, ciphertext)
-	if err != nil {
-		return fmt.Errorf("incorrect passphrase")
-	}
-
-	// Verify the decrypted data looks valid (mnemonic\nseed_hex).
-	parts := splitOnNewline(string(plaintext))
-	if len(parts) < 2 {
-		return fmt.Errorf("incorrect passphrase")
-	}
-	if !bip39.IsMnemonicValid(parts[0]) {
-		return fmt.Errorf("incorrect passphrase")
-	}
-
-	// If keys haven't been derived yet (fresh load of encrypted wallet),
-	// derive them now from the decrypted seed.
 	if w.seed == nil || len(w.seed) == 0 {
-		if err := w.loadSeedAndDerive(parts[0], parts[1]); err != nil {
+		if err := w.loadSeedAndDerive(mnemonic, seedHex); err != nil {
+			for i := range aesKey {
+				aesKey[i] = 0
+			}
 			return fmt.Errorf("derive keys: %w", err)
+		}
+		if err := w.restoreImportedPrivKeys(importedPrivs); err != nil {
+			for i := range aesKey {
+				aesKey[i] = 0
+			}
+			return err
 		}
 	}
 
@@ -932,22 +1282,7 @@ func (w *HDWallet) WalletLock() error {
 	}
 
 	w.locked = true
-
-	// Zero the AES encryption key.
-	for i := range w.encKey {
-		w.encKey[i] = 0
-	}
-	w.encKey = nil
-
-	// Zero the seed.
-	for i := range w.seed {
-		w.seed[i] = 0
-	}
-
-	// Zero the mnemonic string (best-effort; Go strings are immutable but we
-	// can overwrite the backing slice if we control it).
-	w.mnemonic = ""
-
+	w.wipeLockedSecrets()
 	w.unlockUntil = time.Time{}
 	return nil
 }
@@ -964,17 +1299,69 @@ func (w *HDWallet) RequireUnlocked() error {
 	return nil
 }
 
-func (w *HDWallet) saveEncrypted(ciphertext, salt, iv []byte) error {
+func (w *HDWallet) collectImportedWatchPubHex() []string {
+	var out []string
+	for _, dk := range w.externalKeys {
+		if dk.Path == "imported" {
+			out = append(out, hex.EncodeToString(dk.PubKey))
+		}
+	}
+	for _, dk := range w.changeKeys {
+		if dk.Path == "imported" {
+			out = append(out, hex.EncodeToString(dk.PubKey))
+		}
+	}
+	return out
+}
+
+// reencryptUnlockedPayload rewrites the encrypted blob using the in-memory AES
+// key from walletpassphrase (required after importprivkey while unlocked).
+func (w *HDWallet) reencryptUnlockedPayload() error {
+	if w.encKey == nil || len(w.encKey) == 0 {
+		return fmt.Errorf("wallet session key missing; run walletpassphrase again")
+	}
+	plain, err := w.buildEncPlainPayload()
+	if err != nil {
+		return err
+	}
+	ciphertext, iv, err := aesEncrypt(w.encKey, plain)
+	if err != nil {
+		return err
+	}
+	existing, err := os.ReadFile(w.walletPath())
+	if err != nil {
+		return fmt.Errorf("read wallet: %w", err)
+	}
+	var wd WalletData
+	if err := json.Unmarshal(existing, &wd); err != nil {
+		return fmt.Errorf("parse wallet: %w", err)
+	}
+	wd.EncryptedData = hex.EncodeToString(ciphertext)
+	wd.IV = hex.EncodeToString(iv)
+	wd.NextExternalIdx = w.nextExternalIdx
+	wd.NextChangeIdx = w.nextChangeIdx
+	wd.ImportedWatchPubHex = w.collectImportedWatchPubHex()
+	data, err := json.MarshalIndent(wd, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal wallet: %w", err)
+	}
+	return os.WriteFile(w.walletPath(), data, 0600)
+}
+
+func (w *HDWallet) saveEncrypted(ciphertext, salt, iv []byte, watchExtXPub, watchChXPub string, importedWatchPub []string) error {
 	wd := WalletData{
-		NextExternalIdx: w.nextExternalIdx,
-		NextChangeIdx:   w.nextChangeIdx,
-		Encrypted:       true,
-		EncryptedData:   hex.EncodeToString(ciphertext),
-		Salt:            hex.EncodeToString(salt),
-		IV:              hex.EncodeToString(iv),
-		ScryptN:         scryptN,
-		ScryptR:         scryptR,
-		ScryptP:         scryptP,
+		NextExternalIdx:     w.nextExternalIdx,
+		NextChangeIdx:       w.nextChangeIdx,
+		Encrypted:           true,
+		EncryptedData:       hex.EncodeToString(ciphertext),
+		Salt:                hex.EncodeToString(salt),
+		IV:                  hex.EncodeToString(iv),
+		ScryptN:             scryptN,
+		ScryptR:             scryptR,
+		ScryptP:             scryptP,
+		WatchExternalXPub:   watchExtXPub,
+		WatchChangeXPub:     watchChXPub,
+		ImportedWatchPubHex: importedWatchPub,
 	}
 	data, err := json.MarshalIndent(wd, "", "  ")
 	if err != nil {

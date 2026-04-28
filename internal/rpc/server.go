@@ -234,6 +234,7 @@ func New(addr string, c *chain.Chain, e consensus.Engine, mp *mempool.Mempool, p
 	mux.HandleFunc("/encryptwallet", s.handleEncryptWallet)
 	mux.HandleFunc("/walletpassphrase", s.handleWalletPassphrase)
 	mux.HandleFunc("/walletlock", s.handleWalletLock)
+	mux.HandleFunc("/walletpassphrasechange", s.handleWalletPassphraseChange)
 
 	// Chain-specific
 	mux.HandleFunc("/getchainstatus", s.handleGetChainStatus)

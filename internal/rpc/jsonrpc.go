@@ -14,7 +14,10 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/bams-repo/fairchain/internal/coinparams"
@@ -107,8 +110,12 @@ func (s *Server) buildMethodMap() map[string]rpcHandler {
 		"gettransaction":   s.rpcGetTransaction,
 		"listtransactions": s.rpcListTransactions,
 		"listsinceblock":   s.rpcListSinceBlock,
-		"walletpassphrase": s.rpcWalletPassphrase,
-		"walletlock":       s.rpcWalletLock,
+		"walletpassphrase":       s.rpcWalletPassphrase,
+		"walletlock":             s.rpcWalletLock,
+		"walletpassphrasechange": s.rpcWalletPassphraseChange,
+		"encryptwallet":          s.rpcEncryptWallet,
+		"dumpwallet":             s.rpcDumpWallet,
+		"backupwallet":           s.rpcBackupWallet,
 		"getrawchangeaddress": s.rpcGetRawChangeAddress,
 		"decoderawtransaction": s.rpcDecodeRawTransaction,
 
@@ -581,6 +588,8 @@ func (s *Server) rpcGetWalletInfo(_ []json.RawMessage) (interface{}, *jsonRPCErr
 		"hdseedid":             s.wallet.GetDefaultAddress(),
 		"private_keys_enabled": true,
 	}
+	resp["encrypted"] = s.wallet.IsEncrypted()
+	resp["locked"] = s.wallet.IsLocked()
 	if s.wallet.IsEncrypted() {
 		if s.wallet.IsLocked() {
 			resp["unlocked_until"] = 0
@@ -1341,6 +1350,94 @@ func (s *Server) rpcWalletLock(_ []json.RawMessage) (interface{}, *jsonRPCError)
 		return nil, newRPCError(rpcErrMisc, err.Error())
 	}
 	return nil, nil
+}
+
+// rpcWalletPassphraseChange changes the wallet encryption passphrase.
+func (s *Server) rpcWalletPassphraseChange(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+	if len(params) < 2 {
+		return nil, newRPCError(rpcErrInvalidParams, "walletpassphrasechange requires old and new passphrase")
+	}
+	var oldPass, newPass string
+	if err := json.Unmarshal(params[0], &oldPass); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid old passphrase: "+err.Error())
+	}
+	if err := json.Unmarshal(params[1], &newPass); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid new passphrase: "+err.Error())
+	}
+	if err := s.wallet.ChangeWalletPassphrase(oldPass, newPass); err != nil {
+		return nil, newRPCError(rpcErrMisc, err.Error())
+	}
+	return nil, nil
+}
+
+// rpcEncryptWallet encrypts an unencrypted wallet.
+func (s *Server) rpcEncryptWallet(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+	if len(params) < 1 {
+		return nil, newRPCError(rpcErrInvalidParams, "encryptwallet requires a passphrase")
+	}
+	var passphrase string
+	if err := json.Unmarshal(params[0], &passphrase); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid passphrase: "+err.Error())
+	}
+	if err := s.wallet.EncryptWallet(passphrase); err != nil {
+		return nil, newRPCError(rpcErrMisc, err.Error())
+	}
+	return "wallet encrypted; wallet is now locked", nil
+}
+
+// rpcDumpWallet returns mnemonic and addresses (wallet must be unlocked if encrypted).
+func (s *Server) rpcDumpWallet(_ []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+	if err := s.wallet.RequireUnlocked(); err != nil {
+		return nil, newRPCError(rpcErrMisc, err.Error())
+	}
+	return map[string]interface{}{
+		"mnemonic":    s.wallet.Mnemonic(),
+		"addresses":   s.wallet.AllAddresses(),
+		"keypoolsize": s.wallet.KeyCount(),
+	}, nil
+}
+
+// rpcBackupWallet copies the wallet file to datadir/backups/<filename>.
+func (s *Server) rpcBackupWallet(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if s.wallet == nil {
+		return nil, newRPCError(rpcErrWalletNotFound, "wallet not loaded")
+	}
+	if len(params) < 1 {
+		return nil, newRPCError(rpcErrInvalidParams, "backupwallet requires destination filename")
+	}
+	var dest string
+	if err := json.Unmarshal(params[0], &dest); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid destination: "+err.Error())
+	}
+	if dest == "" {
+		return nil, newRPCError(rpcErrInvalidParams, "empty destination")
+	}
+	// Mirror HTTP handler: only base filename under datadir/backups.
+	filename := filepath.Base(filepath.Clean(dest))
+	if filename == "." || filename == string(filepath.Separator) {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid backup filename")
+	}
+	if strings.Contains(filename, "..") {
+		return nil, newRPCError(rpcErrInvalidParams, "path traversal not allowed")
+	}
+	backupDir := filepath.Join(s.dataDir, "backups")
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		return nil, newRPCError(rpcErrInternal, "create backup dir: "+err.Error())
+	}
+	fullPath := filepath.Join(backupDir, filename)
+	if err := s.wallet.BackupWallet(fullPath); err != nil {
+		return nil, newRPCError(rpcErrInternal, err.Error())
+	}
+	return map[string]interface{}{"filename": filename}, nil
 }
 
 // rpcListTransactions returns recent wallet transactions via JSON-RPC.

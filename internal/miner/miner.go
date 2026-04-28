@@ -9,7 +9,9 @@ package miner
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -128,6 +130,13 @@ func (m *Miner) SetPowerLimit(pct int) {
 	m.powerLimit.Store(int32(pct))
 }
 
+// skipMiningStartGate returns true when FAIRCHAIN_SKIP_MINING_START is set,
+// ignoring params.MiningStartTime. Intended for local / isolated testing only.
+func skipMiningStartGate() bool {
+	v := strings.TrimSpace(os.Getenv("FAIRCHAIN_SKIP_MINING_START"))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
 // MaxWorkers returns the number of logical CPUs available.
 func MaxWorkers() int {
 	n := runtime.NumCPU()
@@ -140,6 +149,10 @@ func MaxWorkers() int {
 // Run starts the mining loop. It blocks until ctx is cancelled.
 func (m *Miner) Run(ctx context.Context) {
 	logging.L.Info("starting mining loop", "component", "miner", "workers", m.workers)
+	if skipMiningStartGate() {
+		logging.L.Warn("FAIRCHAIN_SKIP_MINING_START is set: ignoring chain MiningStartTime (local testing only)",
+			"component", "miner")
+	}
 
 	m.ewmaMu.Lock()
 	m.ewmaRate = 0
@@ -173,7 +186,7 @@ func (m *Miner) Run(ctx context.Context) {
 		default:
 		}
 
-		if m.params.MiningStartTime > 0 {
+		if m.params.MiningStartTime > 0 && !skipMiningStartGate() {
 			now := time.Now().Unix()
 			if now < m.params.MiningStartTime {
 				wait := time.Duration(m.params.MiningStartTime-now) * time.Second
@@ -506,6 +519,21 @@ func (m *Miner) buildCoinbaseWithExtra(height uint32, subsidy uint64, extraNonce
 	}
 	msg = append(msg, []byte(coinparams.CoinbaseTag)...)
 
+	outputs := []types.TxOutput{
+		{
+			Value:    subsidy,
+			PkScript: m.rewardScript,
+		},
+	}
+
+	// Premine: at the designated height, append the required premine output.
+	if m.params.PremineHeight > 0 && height == m.params.PremineHeight && m.params.PremineAmount > 0 {
+		outputs = append(outputs, types.TxOutput{
+			Value:    m.params.PremineAmount,
+			PkScript: m.params.PremineScript,
+		})
+	}
+
 	return types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
@@ -515,12 +543,7 @@ func (m *Miner) buildCoinbaseWithExtra(height uint32, subsidy uint64, extraNonce
 				Sequence:         0xFFFFFFFF,
 			},
 		},
-		Outputs: []types.TxOutput{
-			{
-				Value:    subsidy,
-				PkScript: m.rewardScript,
-			},
-		},
+		Outputs: outputs,
 		LockTime: 0,
 	}
 }

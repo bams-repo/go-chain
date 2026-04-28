@@ -7,6 +7,7 @@
 package crypto
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/bams-repo/fairchain/internal/types"
@@ -149,6 +150,18 @@ func TestCalcWork(t *testing.T) {
 	w2 := CalcWork(0x1d00ffff) // Hard
 	if w1.Cmp(w2) >= 0 {
 		t.Fatal("easier target should produce less work")
+	}
+}
+
+func TestMainnetGenesis100xHarderBits(t *testing.T) {
+	// Mainnet launch (2026-04): genesis mined at InitialBits / 100 (integer target / 100).
+	const oldBits = uint32(0x1f147ade)
+	const wantBits = uint32(0x1e346dbd)
+	tgt := CompactToBig(oldBits)
+	nt := new(big.Int).Div(tgt, big.NewInt(100))
+	got := BigToCompact(nt)
+	if got != wantBits {
+		t.Fatalf("100x harder bits: got 0x%08x want 0x%08x", got, wantBits)
 	}
 }
 

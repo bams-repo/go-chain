@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -570,6 +571,11 @@ func (m *Manager) ShouldMine() bool {
 		m.mu.RUnlock()
 
 		if peerCount == 0 {
+			// Local / isolated testing: allow mining with zero peers when set.
+			v := strings.TrimSpace(os.Getenv("FAIRCHAIN_ALLOW_MINING_NO_PEERS"))
+			if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+				return true
+			}
 			return false
 		}
 		return bestPeerHeight <= ourHeight
@@ -1914,8 +1920,8 @@ func (m *Manager) readAndProcessVersion(peer *Peer) error {
 		return fmt.Errorf("self-connection detected")
 	}
 
-	if theirVersion.Version < MinPeerProtoVersion {
-		return fmt.Errorf("peer protocol version %d below minimum %d", theirVersion.Version, MinPeerProtoVersion)
+	if theirVersion.Version < protocol.MinProtocolVersion {
+		return fmt.Errorf("peer protocol version %d below minimum %d", theirVersion.Version, protocol.MinProtocolVersion)
 	}
 	if theirVersion.StartHeight > MaxPeerStartHeight {
 		return fmt.Errorf("peer start height %d exceeds sanity limit %d", theirVersion.StartHeight, MaxPeerStartHeight)
@@ -3900,15 +3906,33 @@ func (m *Manager) handleHeaderSyncTick() {
 	}
 
 	// Transition to block sync when we have caught up with headers.
-	// Three conditions can trigger this:
-	// 1. We have headers >= the best v2+ peer height (normal case)
-	// 2. We have headers >= our sync peer's claimed height
-	// 3. The sync peer sent a partial batch, meaning it has no more headers
-	// Conditions 2 and 3 protect against rogue peers that claim inflated heights.
+	// Primary condition: headers >= best v2+ peer height (normal case).
+	// Secondary conditions (sync peer matched / partial batch) only apply
+	// when the global best height is NOT far ahead — otherwise a short or
+	// stalled sync peer would prematurely end headers while the real
+	// network tip is thousands of blocks higher.
 	condGeBest := currentHeight >= bestHeight
-	condGeSyncPeer := currentHeight >= syncPeerHeight
-	condCaughtUp := m.headerSyncCaughtUp && currentHeight > 0
+	globalBest := m.BestPeerHeight()
+	const headerDoneMargin = uint32(10)
+	closeToNetwork := globalBest == 0 || currentHeight+headerDoneMargin >= globalBest
+	condGeSyncPeer := currentHeight >= syncPeerHeight && closeToNetwork
+	condCaughtUp := m.headerSyncCaughtUp && currentHeight > 0 && closeToNetwork
 	headersDone := condGeBest || condGeSyncPeer || condCaughtUp
+
+	// If a sync peer is exhausted but the network is far ahead, rotate
+	// to a taller peer rather than ending the header phase.
+	if !headersDone && (m.headerSyncCaughtUp || currentHeight >= syncPeerHeight) && !closeToNetwork {
+		logging.L.Warn("header sync peer exhausted but network is far ahead — rotating",
+			"component", "p2p",
+			"header_height", currentHeight,
+			"sync_peer_height", syncPeerHeight,
+			"global_best", globalBest,
+			"sync_peer", syncPeer.Addr())
+		m.headerSyncFailedPeers[syncPeer.Addr()] = time.Now().Add(headerSyncFailedCooldown)
+		m.headerSyncPeerAddr = ""
+		m.headerSyncCaughtUp = false
+		return
+	}
 
 	if headersDone {
 		logging.SyncAuditDebug("header phase complete — transitioning to block sync",
@@ -4580,29 +4604,29 @@ func (m *Manager) handleSyncedTick() {
 	_, ourHeight := m.chain.Tip()
 	now := time.Now()
 
-	m.mu.RLock()
-	var bestHeight uint32
+	// Use raw BestPeerHeight (no cooldown filtering) for gap detection.
+	// Cooldown filtering makes sense for *selecting* a sync peer, but for
+	// *detecting* whether we're behind the network we must consider ALL
+	// peers — otherwise cooled-down tall peers hide the real network tip
+	// and we never re-enter sync.
+	bestHeight := m.BestPeerHeight()
 	var peerHeightDiag []string
-	for _, p := range m.peers {
-		v := p.Version()
-		if v == nil || v.Version < 2 {
-			continue
-		}
-		ph := p.BestHeight()
-		if cooldown, ok := m.headerSyncFailedPeers[p.Addr()]; ok && now.Before(cooldown) {
-			if logging.DebugMode {
-				peerHeightDiag = append(peerHeightDiag, fmt.Sprintf("%s:h=%d(failed)", p.Addr(), ph))
+	if logging.DebugMode {
+		m.mu.RLock()
+		for _, p := range m.peers {
+			v := p.Version()
+			if v == nil || v.Version < 2 {
+				continue
 			}
-			continue
+			ph := p.BestHeight()
+			if cooldown, ok := m.headerSyncFailedPeers[p.Addr()]; ok && now.Before(cooldown) {
+				peerHeightDiag = append(peerHeightDiag, fmt.Sprintf("%s:h=%d(failed)", p.Addr(), ph))
+			} else {
+				peerHeightDiag = append(peerHeightDiag, fmt.Sprintf("%s:h=%d", p.Addr(), ph))
+			}
 		}
-		if ph > bestHeight {
-			bestHeight = ph
-		}
-		if logging.DebugMode {
-			peerHeightDiag = append(peerHeightDiag, fmt.Sprintf("%s:h=%d", p.Addr(), ph))
-		}
+		m.mu.RUnlock()
 	}
-	m.mu.RUnlock()
 
 	tipStale := m.chain.IsTipStale()
 

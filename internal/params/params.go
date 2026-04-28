@@ -75,6 +75,13 @@ type ChainParams struct {
 	// permitted. The miner sleeps until this time. 0 means no restriction.
 	MiningStartTime int64
 
+	// Premine: a one-time extra coinbase output injected at PremineHeight.
+	// The miner and consensus rules both enforce this output when height matches.
+	// PremineAmount is ON TOP of the regular subsidy; MaxMoneyValue must include it.
+	PremineHeight uint32 // Block height for the premine (0 = disabled).
+	PremineAmount uint64 // Extra value added to the coinbase at PremineHeight.
+	PremineScript []byte // P2PKH (or other) locking script for the premine output.
+
 	// Future consensus upgrade activation heights (placeholders).
 	// Map from feature name to activation block height.
 	ActivationHeights map[string]uint32

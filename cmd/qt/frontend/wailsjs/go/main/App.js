@@ -10,12 +10,20 @@ export function CoinInfo() {
   return window['go']['main']['App']['CoinInfo']();
 }
 
+export function CreateWallet() {
+  return window['go']['main']['App']['CreateWallet']();
+}
+
 export function ConnectIRC() {
   return window['go']['main']['App']['ConnectIRC']();
 }
 
 export function ExecuteRPC(arg1, arg2) {
   return window['go']['main']['App']['ExecuteRPC'](arg1, arg2);
+}
+
+export function ImportWallet(arg1) {
+  return window['go']['main']['App']['ImportWallet'](arg1);
 }
 
 export function GetAddressBook() {
@@ -180,4 +188,8 @@ export function UninstallService() {
 
 export function ValidateAddress(arg1) {
   return window['go']['main']['App']['ValidateAddress'](arg1);
+}
+
+export function WalletExists() {
+  return window['go']['main']['App']['WalletExists']();
 }

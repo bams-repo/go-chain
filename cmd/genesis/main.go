@@ -30,6 +30,7 @@ func main() {
 	message := flag.String("message", coinparams.NameLower+" genesis", "Coinbase message for genesis block")
 	timestamp := flag.Int64("timestamp", 0, "Unix timestamp (0 = now)")
 	threads := flag.Int("threads", runtime.NumCPU(), "Number of mining threads")
+	bitsOverride := flag.Uint("bits", 0, "Override compact difficulty bits (0 = use network InitialBits)")
 	flag.Parse()
 
 	p := fcparams.NetworkByName(*network)
@@ -43,11 +44,15 @@ func main() {
 		ts = uint32(*timestamp)
 	}
 
+	bits := p.InitialBits
+	if *bitsOverride != 0 {
+		bits = uint32(*bitsOverride)
+	}
 	cfg := fcparams.GenesisConfig{
 		NetworkName:     p.Name,
 		CoinbaseMessage: []byte(*message),
 		Timestamp:       ts,
-		Bits:            p.InitialBits,
+		Bits:            bits,
 		Version:         1,
 		Reward:          p.InitialSubsidy,
 		RewardScript:    []byte{0x00},

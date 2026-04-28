@@ -33,7 +33,7 @@ type Page =
   | "send"
   | "receive"
   | "transactions"
-  | "network"
+  | "node-network"
   | "mining"
   | "console"
   | "node-map";
@@ -57,7 +57,7 @@ const primaryNav: NavItem[] = [
 ];
 
 const upcomingNav: NavItem[] = [
-  { id: "network", label: "Network", enabled: false, to: "/network", icon: Globe2 },
+  { id: "node-network", label: "Node & network", enabled: true, to: "/node-network", icon: Globe2 },
   { id: "console", label: "Console", enabled: false, to: "/console", icon: Terminal },
 ];
 
@@ -240,21 +240,47 @@ export function Navbar() {
           </SidebarGroupLabel>
           <SidebarGroupContent className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:items-center">
             <SidebarMenu className="gap-0.5 group-data-[collapsible=icon]:items-center">
-              {upcomingNav.map((item) => (
-                <SidebarMenuItem
-                  key={item.id}
-                  className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:justify-center"
-                >
-                  <SidebarMenuButton
-                    disabled
-                    tooltip={`${item.label} — coming soon`}
-                    className={navButtonClass(false, false)}
+              {upcomingNav.map((item) => {
+                const active = navActive(pathname, item.to);
+                if (item.enabled) {
+                  return (
+                    <SidebarMenuItem
+                      key={item.id}
+                      className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:justify-center"
+                    >
+                      <SidebarMenuButton
+                        asChild
+                        isActive={active}
+                        tooltip={item.label}
+                        className={navButtonClass(active, true)}
+                      >
+                        <NavLink
+                          to={item.to}
+                          className="flex min-w-0 w-full items-center gap-2 group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:w-8 group-data-[collapsible=icon]:min-w-8 group-data-[collapsible=icon]:max-w-8 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:gap-0"
+                        >
+                          <NavIcon Icon={item.icon} active={active} enabled={true} />
+                          <span className="group-data-[collapsible=icon]:hidden">{item.label}</span>
+                        </NavLink>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                }
+                return (
+                  <SidebarMenuItem
+                    key={item.id}
+                    className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:justify-center"
                   >
-                    <NavIcon Icon={item.icon} active={false} enabled={false} />
-                    <span className="group-data-[collapsible=icon]:hidden">{item.label}</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
+                    <SidebarMenuButton
+                      disabled
+                      tooltip={`${item.label} — coming soon`}
+                      className={navButtonClass(false, false)}
+                    >
+                      <NavIcon Icon={item.icon} active={false} enabled={false} />
+                      <span className="group-data-[collapsible=icon]:hidden">{item.label}</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

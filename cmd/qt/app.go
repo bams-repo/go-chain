@@ -43,6 +43,10 @@ type App struct {
 	trayEnd     func()
 	startupTime time.Time
 
+	// Stored during startup so we can defer node creation until after wallet setup.
+	cfg  *config.Config
+	opts node.Options
+
 	// Cached P2P port probe result, refreshed periodically in the background.
 	probeMu     sync.RWMutex
 	probeOpen   bool
@@ -96,22 +100,47 @@ func (a *App) startup(ctx context.Context) {
 	opts := node.Options{
 		NoRPCAuth: true,
 	}
+	if v := strings.TrimSpace(os.Getenv("FAIRCHAIN_NOSEEDNODE")); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+		opts.NoSeedNodes = true
+		logging.L.Info("hardcoded seed nodes suppressed (FAIRCHAIN_NOSEEDNODE)", "component", "wallet")
+	}
 
-	n, err := node.New(cfg, opts)
+	a.cfg = cfg
+	a.opts = opts
+
+	// Ensure data dirs exist so WalletExists() can check the wallet path.
+	if err := cfg.EnsureDataDir(); err != nil {
+		logging.L.Error("failed to create data directories", "error", err)
+	}
+
+	// If a wallet already exists, start the node immediately.
+	// Otherwise the frontend will show the setup wizard and call
+	// CreateWallet / ImportWallet, which start the node on completion.
+	walletFile := filepath.Join(cfg.WalletDir(), "wallet.json")
+	if info, err := os.Stat(walletFile); err == nil && info.Size() > 0 {
+		a.startNode()
+	}
+}
+
+// startNode initialises and starts the full node. Called either from startup()
+// (wallet already exists) or from CreateWallet/ImportWallet after the user
+// completes the first-run wizard.
+func (a *App) startNode() {
+	n, err := node.New(a.cfg, a.opts)
 	if err != nil {
 		logging.L.Error("failed to initialize node", "error", err)
 		if strings.Contains(err.Error(), "acquire lock file") || strings.Contains(err.Error(), "another") {
-			wailsRuntime.MessageDialog(ctx, wailsRuntime.MessageDialogOptions{
+			wailsRuntime.MessageDialog(a.ctx, wailsRuntime.MessageDialogOptions{
 				Type:    wailsRuntime.ErrorDialog,
 				Title:   coinparams.Name + " Wallet",
-				Message: "Cannot start: another " + coinparams.Name + " Wallet instance is already running.\n\nPlease close the other instance before starting a new one.\n\nIf you are certain no other " + coinparams.Name + " Wallet is running, the lock file may be stale from a previous crash. Delete the file at:\n" + cfg.LockFilePath(),
+				Message: "Cannot start: another " + coinparams.Name + " Wallet instance is already running.\n\nPlease close the other instance before starting a new one.\n\nIf you are certain no other " + coinparams.Name + " Wallet is running, the lock file may be stale from a previous crash. Delete the file at:\n" + a.cfg.LockFilePath(),
 			})
-			wailsRuntime.Quit(ctx)
+			wailsRuntime.Quit(a.ctx)
 		}
 		return
 	}
 
-	if err := n.Start(ctx); err != nil {
+	if err := n.Start(a.ctx); err != nil {
 		logging.L.Error("failed to start node", "error", err)
 		n.Stop()
 		return
@@ -119,15 +148,15 @@ func (a *App) startup(ctx context.Context) {
 
 	if v := strings.TrimSpace(os.Getenv("FAIRCHAIN_MINING")); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
 		n.SetMining(true)
-		logging.L.Info("mining enabled via FAIRCHAIN_MINING", "network", cfg.Network)
+		logging.L.Info("mining enabled via FAIRCHAIN_MINING", "network", a.cfg.Network)
 	}
 
 	a.node = n
-	a.addrBookPath = filepath.Join(cfg.NetworkDataDir(), "addressbook.json")
+	a.addrBookPath = filepath.Join(a.cfg.NetworkDataDir(), "addressbook.json")
 	a.loadAddressBook()
 
-	go a.probeLoop(ctx)
-	go a.watchMainnetActivation(ctx, cfg.Network)
+	go a.probeLoop(a.ctx)
+	go a.watchMainnetActivation(a.ctx, a.cfg.Network)
 
 	nickPath := ircNickPath(n.Config())
 	savedNick := loadIRCNick(nickPath)
@@ -143,7 +172,7 @@ func (a *App) startup(ctx context.Context) {
 	})
 
 	go func() {
-		connectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		connectCtx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
 		defer cancel()
 		if err := a.irc.Connect(connectCtx); err != nil {
 			logging.L.Warn("wallet social chat failed to connect at startup", "error", err)
@@ -158,6 +187,74 @@ func (a *App) startup(ctx context.Context) {
 	})
 	a.trayEnd = trayEnd
 	trayStart()
+}
+
+// WalletExists returns true if a wallet.json file already exists on disk.
+// The frontend calls this before showing the main UI or the setup wizard.
+func (a *App) WalletExists() bool {
+	if a.cfg == nil {
+		return false
+	}
+	walletFile := filepath.Join(a.cfg.WalletDir(), "wallet.json")
+	info, err := os.Stat(walletFile)
+	return err == nil && info.Size() > 0
+}
+
+// CreateWallet generates a new HD wallet with a fresh 24-word mnemonic and
+// starts the node. Returns the mnemonic so the UI can display it for backup.
+func (a *App) CreateWallet() (map[string]interface{}, error) {
+	if a.node != nil {
+		return nil, fmt.Errorf("node already running")
+	}
+	if a.cfg == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+	netParams := params.NetworkByName(a.cfg.Network)
+	if netParams == nil {
+		return nil, fmt.Errorf("unknown network: %s", a.cfg.Network)
+	}
+
+	w, err := wallet.NewHDWallet(a.cfg.WalletDir(), netParams.AddressPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("create wallet: %w", err)
+	}
+
+	a.startNode()
+
+	return map[string]interface{}{
+		"mnemonic": w.Mnemonic(),
+		"address":  w.GetDefaultAddress(),
+	}, nil
+}
+
+// ImportWallet restores a wallet from a BIP-39 mnemonic phrase and starts
+// the node. Returns the derived default address.
+func (a *App) ImportWallet(mnemonic string) (map[string]interface{}, error) {
+	if a.node != nil {
+		return nil, fmt.Errorf("node already running")
+	}
+	if a.cfg == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+	mnemonic = strings.TrimSpace(mnemonic)
+	if mnemonic == "" {
+		return nil, fmt.Errorf("mnemonic is required")
+	}
+	netParams := params.NetworkByName(a.cfg.Network)
+	if netParams == nil {
+		return nil, fmt.Errorf("unknown network: %s", a.cfg.Network)
+	}
+
+	w, err := wallet.NewHDWalletFromMnemonic(a.cfg.WalletDir(), netParams.AddressPrefix, mnemonic)
+	if err != nil {
+		return nil, fmt.Errorf("import wallet: %w", err)
+	}
+
+	a.startNode()
+
+	return map[string]interface{}{
+		"address": w.GetDefaultAddress(),
+	}, nil
 }
 
 func (a *App) shutdown(ctx context.Context) {

@@ -5,7 +5,7 @@
 #   ./configure              # detect environment, write config.mk
 #   ./configure --with-qt    # enable GUI wallet
 #   make build               # build according to config
-.PHONY: all build build-core deps qt qt-dev daemon cli genesis adversary \
+.PHONY: all build build-core deps qt qt-dev daemon cli genesis adversary pow-bench \
         test test-short bench lint fmt tidy clean \
         run-regtest run-regtest2 run-testnet run-testnet0 \
         testnet-status chaos modularity mine-genesis mine-genesis-testnet status
@@ -77,6 +77,9 @@ adversary:
 	$(GO) build -o $(BINDIR)/$(ADVERSARY_NAME) ./cmd/adversary
 	$(GO) build -o $(BINDIR)/$(ADVERSARY_NAME)2 ./cmd/adversary2
 	$(GO) build -o $(BINDIR)/$(ADVERSARY_NAME)3 ./cmd/adversary3
+
+pow-bench:
+	$(GO) build -o $(BINDIR)/pow-bench ./cmd/pow-bench
 
 # --- Vendored dependencies (fetched on demand) ---
 deps:

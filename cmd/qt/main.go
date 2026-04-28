@@ -47,12 +47,10 @@ func buildAppMenu(app *App) *menu.Menu {
 		wailsRuntime.Quit(app.ctx)
 	})
 
-	miningMenu := appMenu.AddSubmenu("Mining")
-	miningMenu.AddText("Start Mining", keys.CmdOrCtrl("m"), func(_ *menu.CallbackData) {
-		wailsRuntime.EventsEmit(app.ctx, "menu:toggle-mining")
-	})
-
 	walletMenu := appMenu.AddSubmenu("Wallet")
+	walletMenu.AddText("Wallet security...", nil, func(_ *menu.CallbackData) {
+		wailsRuntime.EventsEmit(app.ctx, "menu:wallet-security")
+	})
 	walletMenu.AddText("Encrypt Wallet...", nil, func(_ *menu.CallbackData) {
 		wailsRuntime.EventsEmit(app.ctx, "menu:encrypt-wallet")
 	})

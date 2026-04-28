@@ -19,14 +19,18 @@ const (
 	Major = 0
 
 	// Minor is the minor version component (new features, backward-compatible).
-	Minor = 12
+	Minor = 13
 
 	// Patch is the patch version component (bug fixes).
-	Patch = 2
+	Patch = 0
 
 	// ProtocolVersion is the peer-to-peer wire protocol version.
 	// Increment when the wire format changes in a backward-incompatible way.
-	ProtocolVersion uint32 = 11
+	ProtocolVersion uint32 = 12
+
+	// MinProtocolVersion is the minimum wire protocol version accepted from peers.
+	// Keep in lockstep with ProtocolVersion for releases that break the old wire.
+	MinProtocolVersion uint32 = 12
 
 	// ClientName identifies this implementation.
 	ClientName = coinparams.NameLower

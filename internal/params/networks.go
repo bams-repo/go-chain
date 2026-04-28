@@ -13,9 +13,15 @@ import (
 )
 
 const (
-	// MaxMoneyValue is the maximum number of base units that can ever exist.
-	// No single transaction output may exceed this value.
-	MaxMoneyValue = 2_099_999_997_690_000
+	// MinedSupply is the total coins producible through mining alone (before premine).
+	MinedSupply = 2_099_999_997_690_000
+
+	// MainnetPremineAmount is 20% of the mined supply, added on top at block 1.
+	MainnetPremineAmount = MinedSupply / 5 // 419_999_999_538_000
+
+	// MaxMoneyValue is the absolute maximum base units that can ever exist,
+	// including the mainnet premine. Consensus and mempool checks use this.
+	MaxMoneyValue = MinedSupply + MainnetPremineAmount
 
 	// MaxTxSize is the maximum serialized size of a single transaction in bytes.
 	// Bitcoin Core uses MAX_STANDARD_TX_WEIGHT / 4 ≈ 100,000 bytes for standard
@@ -24,7 +30,7 @@ const (
 	MaxTxSize = 100_000
 
 	// 20% premine on top of mined supply for testnet.
-	TestnetPremineAmount = MaxMoneyValue / 5
+	TestnetPremineAmount = MinedSupply / 5
 )
 
 var (
@@ -45,14 +51,10 @@ var Mainnet = &ChainParams{
 	DefaultPort:  19333,
 	AddressPrefix: 0x00,
 
-	// Pre-mined genesis block (sha256mem: 64 MiB sequential fill + dual SHA256 mix).
-	// Coinbase: "fairchain genesis"
+	// Pre-mined genesis (sha256mem). Coinbase: "fairchain genesis"
 	// Timestamp: 1774175035 (2026-03-22T10:23:55Z)
-	// Display hash: ed66675f3d5ca4cb16b1623252fbdfe49dbde4c021277ae0b026d09823a4cf56
-	// Pre-mined genesis block (sha256mem, LE hash convention).
-	// Coinbase: "fairchain genesis"
-	// Timestamp: 1774175035 (2026-03-22T10:23:55Z)
-	// Display hash: 1fcb291c4ffa3c9877b325d42f06e187edfae37417e1d2058b626233429aeea6
+	// Initial difficulty: compact 0x1e346dbd (100× harder than 0x1f147ade).
+	// Display hash: 25e5c6c08aedc446584045db998974b6b7b816ac69c73255c2e8496949989576
 	GenesisBlock: types.Block{
 		Header: types.BlockHeader{
 			Version:   1,
@@ -64,8 +66,8 @@ var Mainnet = &ChainParams{
 				0x63, 0x9b, 0xea, 0x6d, 0x0a, 0x1e, 0xea, 0xc6,
 			},
 			Timestamp: 1774175035,
-			Bits:      0x1f147ade,
-			Nonce:     1101,
+			Bits:      0x1e346dbd,
+			Nonce:     2147488231,
 		},
 		Transactions: []types.Transaction{{
 			Version: 1,
@@ -82,10 +84,10 @@ var Mainnet = &ChainParams{
 		}},
 	},
 	GenesisHash: types.Hash{
-		0xa6, 0xee, 0x9a, 0x42, 0x33, 0x62, 0x62, 0x8b,
-		0x05, 0xd2, 0xe1, 0x17, 0x74, 0xe3, 0xfa, 0xed,
-		0x87, 0xe1, 0x06, 0x2f, 0xd4, 0x25, 0xb3, 0x77,
-		0x98, 0x3c, 0xfa, 0x4f, 0x1c, 0x29, 0xcb, 0x1f,
+		0x76, 0x95, 0x98, 0x49, 0x69, 0x49, 0xe8, 0xc2,
+		0x55, 0x32, 0xc7, 0x69, 0xac, 0x16, 0xb8, 0xb7,
+		0xb6, 0x74, 0x89, 0x99, 0xdb, 0x45, 0x40, 0x58,
+		0x46, 0xc4, 0xed, 0x8a, 0xc0, 0xc6, 0xe5, 0x25,
 	},
 
 	TargetBlockSpacing:  10 * time.Minute,
@@ -94,8 +96,8 @@ var Mainnet = &ChainParams{
 	MaxTimeFutureDrift:  2 * time.Hour,
 	MinTimestampRule:    "median-11",
 
-	// 100x harder than trivial — LWMA adjusts quickly to real hash rate.
-	InitialBits:      0x1f147ade,
+	// Genesis difficulty (100× harder than prior 0x1f147ade). LWMA retargets from here.
+	InitialBits:      0x1e346dbd,
 	MinBits:          0x207fffff,
 	NoRetarget:       false,
 
@@ -117,12 +119,27 @@ var Mainnet = &ChainParams{
 	MinRelayTxFeeRate: 1, // 1 sat/byte minimum, matching Bitcoin Core's default
 	MempoolExpiry:     336 * time.Hour, // 2 weeks, matching Bitcoin Core DEFAULT_MEMPOOL_EXPIRE
 
+	// Bootstrap peers (must be fairchaind listening on mainnet DefaultPort 19333).
+	// As of 2026-04 the public seed VPS hosts accept P2P on testnet port 19334 only;
+	// 19333/tcp is not open there, so mainnet nodes will not connect until those
+	// hosts run a mainnet listener on 19333 (or you add -seedpeer / config seeds).
 	SeedNodes: []string{
-		"95.179.203.47:19333",  // seednode_london
-		"207.246.117.14:19333", // seednode_miami
+		"95.179.203.47:19333",
+		"207.246.117.14:19333",
 	},
 
 	MiningStartTime: 1777338000, // 2026-04-27 18:00:00 PDT — mainnet mining begins
+
+	// Block-1 premine: 20% of mined supply paid to a project-controlled address.
+	PremineHeight: 1,
+	PremineAmount: MainnetPremineAmount,
+	PremineScript: []byte{
+		0x76, 0xa9, 0x14,
+		0xc7, 0xff, 0xfe, 0xed, 0x7b, 0x2b, 0x51, 0x77,
+		0x94, 0x93, 0x73, 0x99, 0x84, 0xa4, 0x51, 0xf6,
+		0x16, 0xd9, 0x9c, 0x64,
+		0x88, 0xac,
+	},
 
 	ActivationHeights: map[string]uint32{
 		"locktime": 1,
@@ -214,9 +231,10 @@ var Testnet = &ChainParams{
 	MinRelayTxFeeRate: 1,
 	MempoolExpiry:     336 * time.Hour,
 
+	// Public testnet seeds (P2P 19334 — matches deployed fairchain-testnet.service).
 	SeedNodes: []string{
-		"95.179.203.47:19334",  // seednode_london
-		"207.246.117.14:19334", // seednode_miami
+		"95.179.203.47:19334",
+		"207.246.117.14:19334",
 	},
 
 	ActivationHeights: map[string]uint32{

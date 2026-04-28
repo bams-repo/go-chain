@@ -46,6 +46,7 @@ type WalletInterface interface {
 	EncryptWallet(passphrase string) error
 	WalletPassphrase(passphrase string, timeoutSecs int64) error
 	WalletLock() error
+	ChangeWalletPassphrase(oldPassphrase, newPassphrase string) error
 	RequireUnlocked() error
 
 	FindUnspent(
@@ -302,6 +303,8 @@ func (s *Server) handleGetWalletInfo(w http.ResponseWriter, r *http.Request) {
 		"hdseedid":             s.wallet.GetDefaultAddress(),
 		"private_keys_enabled": true,
 		"unlocked_until":       0,
+		"encrypted":            s.wallet.IsEncrypted(),
+		"locked":               s.wallet.IsLocked(),
 	}
 	if s.wallet.IsEncrypted() {
 		if s.wallet.IsLocked() {
@@ -813,6 +816,23 @@ func (s *Server) handleWalletLock(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.wallet.WalletLock(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, true)
+}
+
+func (s *Server) handleWalletPassphraseChange(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) || !s.requireWallet(w) {
+		return
+	}
+	oldPass := r.PostFormValue("oldpassphrase")
+	newPass := r.PostFormValue("newpassphrase")
+	if oldPass == "" || newPass == "" {
+		writeError(w, http.StatusBadRequest, "missing oldpassphrase or newpassphrase")
+		return
+	}
+	if err := s.wallet.ChangeWalletPassphrase(oldPass, newPass); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
 	writeJSON(w, true)

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useCoinInfo } from "@/hooks/useCoinInfo";
+import { walletRpc } from "@/lib/walletRpc";
 import {
   GetBalance,
   SendToAddress,
@@ -8,6 +9,8 @@ import {
 } from "../../../wailsjs/go/main/App";
 
 type Step = "form" | "confirm" | "success" | "error";
+
+type WalletInfoRpc = { encrypted?: boolean; locked?: boolean };
 
 function BookIcon({ size = 14 }: { size?: number }) {
   return (
@@ -117,6 +120,7 @@ export function Send() {
 
   const [addressBook, setAddressBook] = useState<Record<string, string>>({});
   const [showBook, setShowBook] = useState(false);
+  const [lockState, setLockState] = useState<{ encrypted: boolean; locked: boolean } | null>(null);
 
   const addressRef = useRef<HTMLInputElement>(null);
   const validateTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -124,6 +128,17 @@ export function Send() {
   useEffect(() => {
     GetBalance().then((b) => setConfirmed(b.confirmed as number)).catch(() => {});
   }, [step]);
+
+  useEffect(() => {
+    const refreshLock = () => {
+      walletRpc<WalletInfoRpc>("getwalletinfo", [])
+        .then((w) => setLockState({ encrypted: !!w.encrypted, locked: !!w.locked }))
+        .catch(() => setLockState(null));
+    };
+    refreshLock();
+    const id = setInterval(refreshLock, 4000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     GetAddressBook().then((book) => { if (book) setAddressBook(book); }).catch(() => {});
@@ -178,9 +193,17 @@ export function Send() {
     return ok;
   };
 
-  const handleReview = () => { if (canProceed()) setStep("confirm"); };
+  const handleReview = () => {
+    if (walletLocked) return;
+    if (canProceed()) setStep("confirm");
+  };
 
   const handleConfirmSend = async () => {
+    if (walletLocked) {
+      setSendError("Wallet is locked. Unlock in Wallet → Wallet security, then try again.");
+      setStep("error");
+      return;
+    }
     setSending(true);
     setSendError("");
     try {
@@ -234,9 +257,33 @@ export function Send() {
     .map(([addr, lbl]) => ({ address: addr, label: lbl }))
     .sort((a, b) => a.label.localeCompare(b.label));
 
+  const walletLocked = !!(lockState?.encrypted && lockState.locked);
+  const lockBanner = lockState && lockState.encrypted && lockState.locked;
+
   if (step === "form") {
     return (
       <div className="flex h-full flex-col gap-3">
+        {lockBanner && (
+          <div
+            className="rounded-xl px-4 py-3.5"
+            style={{
+              background: "rgba(247, 147, 26, 0.12)",
+              border: "1px solid rgba(247, 147, 26, 0.45)",
+              color: "var(--color-btc-gold-light)",
+            }}
+            role="status"
+          >
+            <p className="text-[12px] font-bold leading-snug" style={{ color: "var(--color-btc-gold)" }}>
+              Wallet is locked
+            </p>
+            <p className="mt-1.5 text-[11px] leading-relaxed" style={{ color: "var(--color-btc-text-muted)" }}>
+              Your wallet is encrypted and locked. You cannot create outgoing transactions until you unlock it. Use
+              the menu: <span style={{ color: "var(--color-btc-gold-light)" }}>Wallet → Wallet security</span>, then
+              unlock with your passphrase. Your balance and incoming payments still update while locked.
+            </p>
+          </div>
+        )}
+
         {/* Balance */}
         <div
           className="btc-noise btc-glow-active relative overflow-hidden rounded-xl p-5"
@@ -357,8 +404,12 @@ export function Send() {
           <button
             type="button"
             onClick={handleReview}
-            disabled={!address.trim() || !amount || !!addressError}
-            style={{ ...btnPrimary, opacity: !address.trim() || !amount || !!addressError ? 0.5 : 1, cursor: !address.trim() || !amount || !!addressError ? "not-allowed" : "pointer" }}
+            disabled={!address.trim() || !amount || !!addressError || walletLocked}
+            style={{
+              ...btnPrimary,
+              opacity: !address.trim() || !amount || !!addressError || walletLocked ? 0.5 : 1,
+              cursor: !address.trim() || !amount || !!addressError || walletLocked ? "not-allowed" : "pointer",
+            }}
           >
             Review Transaction
           </button>
@@ -370,6 +421,20 @@ export function Send() {
   if (step === "confirm") {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-4 px-4">
+        {lockBanner && (
+          <div
+            className="w-full max-w-md rounded-xl px-4 py-3"
+            style={{
+              background: "rgba(247, 147, 26, 0.12)",
+              border: "1px solid rgba(247, 147, 26, 0.45)",
+            }}
+            role="status"
+          >
+            <p className="text-center text-[11px] font-bold" style={{ color: "var(--color-btc-gold)" }}>
+              Wallet is locked — unlock in Wallet → Wallet security before sending
+            </p>
+          </div>
+        )}
         <div className="btc-glow w-full max-w-md rounded-xl p-6" style={{ background: "var(--color-btc-card)", border: "1px solid var(--color-btc-border)" }}>
           <h2 className="mb-4 text-center text-sm font-semibold uppercase tracking-wider" style={{ color: "var(--color-btc-gold)" }}>Confirm Transaction</h2>
           <div className="flex flex-col gap-3">
@@ -405,7 +470,12 @@ export function Send() {
           </div>
           <div className="mt-5 flex gap-3">
             <button type="button" onClick={() => setStep("form")} disabled={sending} style={{ ...btnSecondary, flex: 1 }}>Back</button>
-            <button type="button" onClick={handleConfirmSend} disabled={sending} style={{ ...btnPrimary, flex: 1, opacity: sending ? 0.6 : 1 }}>
+            <button
+              type="button"
+              onClick={handleConfirmSend}
+              disabled={sending || walletLocked}
+              style={{ ...btnPrimary, flex: 1, opacity: sending || walletLocked ? 0.5 : 1, cursor: sending || walletLocked ? "not-allowed" : "pointer" }}
+            >
               {sending ? "Sending..." : "Send Now"}
             </button>
           </div>

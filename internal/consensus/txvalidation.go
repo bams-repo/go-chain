@@ -7,6 +7,7 @@
 package consensus
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
@@ -320,6 +321,16 @@ func ValidateTransactionInputs(block *types.Block, utxoSet *utxo.Set, height uin
 	if maxCoinbase < subsidy {
 		return 0, fmt.Errorf("subsidy + fees overflow (subsidy=%d, fees=%d)", subsidy, totalFees)
 	}
+
+	// Premine: at the designated height the coinbase MUST include an extra
+	// output paying exactly PremineAmount to PremineScript.
+	if p.PremineHeight > 0 && height == p.PremineHeight && p.PremineAmount > 0 {
+		maxCoinbase += p.PremineAmount
+		if err := validatePremineOutput(block.Transactions[0], p); err != nil {
+			return 0, err
+		}
+	}
+
 	var coinbaseValue uint64
 	for outIdx, out := range block.Transactions[0].Outputs {
 		if coinbaseValue+out.Value < coinbaseValue {
@@ -498,4 +509,16 @@ func CalcTxFee(tx *types.Transaction, utxoSet *utxo.Set) (uint64, error) {
 		return 0, fmt.Errorf("input value %d < output value %d", totalIn, totalOut)
 	}
 	return totalIn - totalOut, nil
+}
+
+// validatePremineOutput ensures the coinbase contains an output that pays
+// exactly PremineAmount to PremineScript. Called only at PremineHeight.
+func validatePremineOutput(cb types.Transaction, p *params.ChainParams) error {
+	for _, out := range cb.Outputs {
+		if out.Value == p.PremineAmount && bytes.Equal(out.PkScript, p.PremineScript) {
+			return nil
+		}
+	}
+	return fmt.Errorf("coinbase at premine height %d missing required premine output "+
+		"(amount=%d)", p.PremineHeight, p.PremineAmount)
 }

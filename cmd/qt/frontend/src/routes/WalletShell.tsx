@@ -3,11 +3,20 @@ import MainLayout from "@/components/layout/MainLayout";
 import { StatusBar } from "@/components/StatusBar";
 import { SyncOverlay } from "@/components/SyncOverlay";
 import { DebugWindow } from "@/components/DebugWindow";
+import { SecurityWindow } from "@/components/SecurityWindow";
 import { useWalletChrome } from "@/hooks/useWalletChrome";
 
 export default function WalletShell() {
-  const { showSyncOverlay, onHideSyncOverlay, showDebug, onCloseDebug, handleSyncOverlay } =
-    useWalletChrome();
+  const {
+    showSyncOverlay,
+    onHideSyncOverlay,
+    showDebug,
+    onCloseDebug,
+    handleSyncOverlay,
+    showSecurity,
+    onSecurityOpenChange,
+    securityHighlight,
+  } = useWalletChrome();
 
   return (
     <TooltipProvider>
@@ -18,6 +27,7 @@ export default function WalletShell() {
         <StatusBar handleSyncOverlay={handleSyncOverlay} />
         {showSyncOverlay && <SyncOverlay onHide={onHideSyncOverlay} />}
         {showDebug && <DebugWindow onClose={onCloseDebug} />}
+        <SecurityWindow open={showSecurity} onOpenChange={onSecurityOpenChange} highlight={securityHighlight} />
       </div>
     </TooltipProvider>
   );

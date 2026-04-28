@@ -164,6 +164,9 @@ func (s *Server) rpcGetBlockTemplate(params []json.RawMessage) (interface{}, *js
 	mempoolTmpl := s.mempool.BlockTemplate()
 
 	coinbaseValue := subsidy + mempoolTmpl.TotalFees
+	if s.params.PremineHeight > 0 && newHeight == s.params.PremineHeight {
+		coinbaseValue += s.params.PremineAmount
+	}
 
 	nextBits := s.engine.CalcNextBits(tipHeader, tipHeight, s.chain.GetAncestor, s.params)
 
@@ -297,6 +300,20 @@ func (s *Server) buildDefaultCoinbase(height uint32, value uint64) types.Transac
 		rewardScript = []byte{0x00}
 	}
 
+	outputs := []types.TxOutput{
+		{
+			Value:    value,
+			PkScript: rewardScript,
+		},
+	}
+
+	if s.params.PremineHeight > 0 && height == s.params.PremineHeight && s.params.PremineAmount > 0 {
+		outputs = append(outputs, types.TxOutput{
+			Value:    s.params.PremineAmount,
+			PkScript: s.params.PremineScript,
+		})
+	}
+
 	return types.Transaction{
 		Version: 1,
 		Inputs: []types.TxInput{
@@ -306,12 +323,7 @@ func (s *Server) buildDefaultCoinbase(height uint32, value uint64) types.Transac
 				Sequence:         0xFFFFFFFF,
 			},
 		},
-		Outputs: []types.TxOutput{
-			{
-				Value:    value,
-				PkScript: rewardScript,
-			},
-		},
+		Outputs:  outputs,
 		LockTime: 0,
 	}
 }

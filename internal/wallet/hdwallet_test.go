@@ -378,6 +378,29 @@ func TestHDWalletEncryptAndUnlock(t *testing.T) {
 	}
 }
 
+func TestHDWalletChangePassphrase(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewHDWallet(dir, 0x00)
+	if err != nil {
+		t.Fatalf("NewHDWallet: %v", err)
+	}
+	if err := w.EncryptWallet("first-secret"); err != nil {
+		t.Fatalf("EncryptWallet: %v", err)
+	}
+	if err := w.WalletPassphrase("first-secret", 300); err != nil {
+		t.Fatalf("WalletPassphrase: %v", err)
+	}
+	if err := w.ChangeWalletPassphrase("first-secret", "second-secret"); err != nil {
+		t.Fatalf("ChangeWalletPassphrase: %v", err)
+	}
+	if err := w.WalletPassphrase("second-secret", 300); err != nil {
+		t.Fatalf("WalletPassphrase with new secret: %v", err)
+	}
+	if err := w.WalletPassphrase("first-secret", 300); err == nil {
+		t.Fatal("old passphrase should not work after change")
+	}
+}
+
 func TestHDWalletEncryptAlreadyEncrypted(t *testing.T) {
 	dir := t.TempDir()
 	w, err := NewHDWallet(dir, 0x00)
@@ -418,6 +441,18 @@ func TestHDWalletEncryptedPersistence(t *testing.T) {
 	}
 	if !w2.IsLocked() {
 		t.Fatal("reloaded wallet should be locked")
+	}
+
+	// Watch-only metadata: default address visible before unlock (Bitcoin-like).
+	if w2.GetDefaultAddress() != addr {
+		t.Fatalf("locked reload should preserve default address: got %q, want %q", w2.GetDefaultAddress(), addr)
+	}
+	if w2.KeyCount() != w1.KeyCount() {
+		t.Fatalf("locked reload key count: got %d, want %d", w2.KeyCount(), w1.KeyCount())
+	}
+
+	if _, err := w2.GetNewAddress(); err == nil {
+		t.Fatal("GetNewAddress should fail while wallet is locked")
 	}
 
 	// Unlock and verify address matches.

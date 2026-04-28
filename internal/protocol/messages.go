@@ -20,6 +20,9 @@ import (
 // second import for the constant.
 var ProtocolVersion = version.ProtocolVersion
 
+// MinProtocolVersion is the minimum wire protocol version peers must speak.
+var MinProtocolVersion = version.MinProtocolVersion
+
 // Maximum payload size to prevent memory exhaustion (4 MB).
 const MaxPayloadSize = 4 * 1024 * 1024
 
