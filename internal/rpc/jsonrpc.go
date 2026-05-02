@@ -88,8 +88,9 @@ func (s *Server) buildMethodMap() map[string]rpcHandler {
 		"getconnectioncount": s.rpcGetConnectionCount,
 
 		// Mempool
-		"getmempoolinfo": s.rpcGetMempoolInfo,
-		"getrawmempool":  s.rpcGetRawMempool,
+		"getmempoolinfo":    s.rpcGetMempoolInfo,
+		"getrawmempool":     s.rpcGetRawMempool,
+		"removetransaction": s.rpcRemoveTransaction,
 
 		// UTXO
 		"gettxout":        s.rpcGetTxOut,
@@ -422,6 +423,32 @@ func (s *Server) rpcGetRawMempool(params []json.RawMessage) (interface{}, *jsonR
 		}
 	}
 	return result, nil
+}
+
+// rpcRemoveTransaction implements `removetransaction <txid>` — an operator
+// escape valve for evicting a specific mempool entry. The automatic post-reorg
+// sweep should normally make this unnecessary, but it remains useful (a) for
+// surgical removal of a misbehaving tx, (b) as a debugging aid when tracing
+// mempool state, and (c) as a fallback if a future bug ever lets an invalid
+// tx slip past the sweep. Idempotent — `{removed:false}` for an unknown txid
+// is not an error.
+func (s *Server) rpcRemoveTransaction(params []json.RawMessage) (interface{}, *jsonRPCError) {
+	if len(params) != 1 {
+		return nil, newRPCError(rpcErrInvalidParams, "removetransaction requires 1 argument: txid")
+	}
+	var txidHex string
+	if err := json.Unmarshal(params[0], &txidHex); err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "txid must be a hex string")
+	}
+	txHash, err := types.HashFromReverseHex(txidHex)
+	if err != nil {
+		return nil, newRPCError(rpcErrInvalidParams, "invalid txid hex: "+err.Error())
+	}
+	if !s.mempool.HasTx(txHash) {
+		return map[string]interface{}{"removed": false, "txid": txidHex}, nil
+	}
+	s.mempool.RemoveTx(txHash)
+	return map[string]interface{}{"removed": true, "txid": txidHex}, nil
 }
 
 func (s *Server) rpcGetTxOut(params []json.RawMessage) (interface{}, *jsonRPCError) {

@@ -164,6 +164,23 @@ func New(cfg *config.Config, opts Options) (*Node, error) {
 		log.Info("loaded mempool from disk", "transactions", loaded)
 	}
 
+	// Wire reorg → mempool sweep. After a chain reorg disconnects blocks, any
+	// mempool tx whose inputs traced to those blocks becomes referentially
+	// invalid; without sweeping, the next getblocktemplate will include those
+	// txs and every block built from it will be rejected at submitblock with
+	// "validate tx inputs ... references missing UTXO". The sweep evicts them
+	// before that can happen.
+	bc.SetReorgCompleteHandler(func(forkHeight, oldTipHeight, newTipHeight uint32) {
+		evicted := mp.SweepInvalid()
+		if evicted > 0 {
+			log.Info("mempool sweep after reorg evicted invalid txs",
+				"evicted", evicted,
+				"fork_height", forkHeight,
+				"old_tip", oldTipHeight,
+				"new_tip", newTipHeight)
+		}
+	})
+
 	// Initialize HD wallet.
 	hdWallet, err := wallet.NewHDWallet(cfg.WalletDir(), p.AddressPrefix)
 	if err != nil {

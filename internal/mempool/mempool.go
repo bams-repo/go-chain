@@ -232,6 +232,54 @@ func (m *Mempool) RemoveTxs(hashes []types.Hash) {
 	}
 }
 
+// SweepInvalid evicts mempool transactions whose inputs no longer resolve
+// against the live UTXO set or via another transaction still in the mempool.
+// Intended to be called after a chain reorganization disconnects blocks: any
+// transaction that depended on outputs of disconnected blocks is no longer
+// connectable and must be removed before the next getblocktemplate is built,
+// otherwise every block built from that template will be rejected at
+// submitblock with "validate tx inputs ... references missing UTXO".
+//
+// AddTx already validates inputs at insertion time, so the only stale entries
+// are transactions that became invalid AFTER insertion — exactly the reorg
+// case. The sweep iterates to a fixed point so that evicting an
+// orphan-dependent parent also removes its now-orphaned CPFP children.
+//
+// Returns the total number of transactions evicted.
+func (m *Mempool) SweepInvalid() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	totalEvicted := 0
+	for {
+		var evict []types.Hash
+		for txHash, entry := range m.txs {
+			for _, in := range entry.Tx.Inputs {
+				// Input is satisfied by the live UTXO set.
+				if m.utxoSet.Has(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index) {
+					continue
+				}
+				// Input is satisfied by an unconfirmed mempool parent (CPFP).
+				parent, ok := m.txs[in.PreviousOutPoint.Hash]
+				if ok && int(in.PreviousOutPoint.Index) < len(parent.Tx.Outputs) {
+					continue
+				}
+				// Neither — input vanished. Evict.
+				evict = append(evict, txHash)
+				break
+			}
+		}
+		if len(evict) == 0 {
+			break
+		}
+		for _, h := range evict {
+			m.removeTxUnsafe(h)
+		}
+		totalEvicted += len(evict)
+	}
+	return totalEvicted
+}
+
 func (m *Mempool) removeTxUnsafe(hash types.Hash) {
 	entry, ok := m.txs[hash]
 	if !ok {
