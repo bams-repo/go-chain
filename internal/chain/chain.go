@@ -95,6 +95,14 @@ type Chain struct {
 
 	reorgHistory []reorgRecord
 
+	// onReorgComplete is fired after every successful chain reorganization,
+	// once the new tip is committed. Used by the node to trigger a mempool
+	// sweep that evicts transactions whose inputs were created in
+	// disconnected blocks. Optional — nil is allowed. Always invoked from a
+	// fresh goroutine so the listener may take its own locks without
+	// deadlocking against c.mu (which is held throughout reorg()).
+	onReorgComplete func(forkHeight, oldTipHeight, newTipHeight uint32)
+
 	ibdMode            bool
 	ibdBlocksSinceSync uint32
 }
@@ -114,6 +122,17 @@ func New(p *params.ChainParams, engine consensus.Engine, s store.BlockStore, ts 
 		orphans:      make(map[types.Hash]*orphanBlock),
 		utxoSet:      utxo.NewSet(),
 	}
+}
+
+// SetReorgCompleteHandler registers a callback fired after every successful
+// chain reorganization. The callback receives (forkHeight, oldTipHeight,
+// newTipHeight) and is dispatched from a fresh goroutine so it may acquire
+// other locks (e.g. mempool) without deadlocking against the chain lock.
+// Pass nil to clear an existing handler.
+func (c *Chain) SetReorgCompleteHandler(fn func(forkHeight, oldTipHeight, newTipHeight uint32)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onReorgComplete = fn
 }
 
 // SetIBDMode enables or disables IBD (Initial Block Download) mode.
@@ -1251,6 +1270,15 @@ func (c *Chain) reorg(newTipHash types.Hash, newTipHeight uint32, newWork *big.I
 		depth:     reorgDepth,
 		timestamp: time.Now(),
 	})
+
+	// Notify any registered listener that the reorg has completed. We are
+	// still holding c.mu here (the caller acquired it in processBlock), so
+	// dispatch on a fresh goroutine — the listener typically sweeps the
+	// mempool, which has its own lock. Running synchronously would risk
+	// deadlock if the listener (or any code it calls) ever needs c.mu.
+	if cb := c.onReorgComplete; cb != nil {
+		go cb(forkParentHeight, oldTipHeight, newTipHeight)
+	}
 
 	return nil
 }

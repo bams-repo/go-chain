@@ -484,6 +484,147 @@ func TestCPFP_RejectChildSpendingNonexistentParentOutput(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// SweepInvalid tests — post-reorg eviction of txs with vanished inputs
+// ---------------------------------------------------------------------------
+
+// TestSweepInvalid_EvictsTxWithVanishedInput simulates the reorg case: a tx
+// that was valid at AddTx time becomes invalid when its input UTXO is
+// removed (i.e. the block that created the input was disconnected).
+func TestSweepInvalid_EvictsTxWithVanishedInput(t *testing.T) {
+	privKey, pkScript, utxoSet, fundingHash := setupKeyAndUTXO(t)
+
+	p := testParams()
+	mp := New(p, utxoSet, func() uint32 { return 200 })
+
+	tx := fundedTx(privKey, fundingHash, 0, pkScript, 10_0000_0000, 9_9999_0000)
+	txHash, err := mp.AddTx(tx)
+	if err != nil {
+		t.Fatalf("AddTx failed: %v", err)
+	}
+	if mp.Count() != 1 {
+		t.Fatalf("expected 1 tx pre-sweep, got %d", mp.Count())
+	}
+
+	// Simulate a reorg disconnecting the block that created the funding UTXO:
+	// remove the output from the live UTXO set. The tx in the mempool is now
+	// referentially invalid.
+	utxoSet.Remove(fundingHash, 0)
+
+	evicted := mp.SweepInvalid()
+	if evicted != 1 {
+		t.Fatalf("expected 1 evicted, got %d", evicted)
+	}
+	if mp.HasTx(txHash) {
+		t.Fatal("tx should have been evicted from mempool")
+	}
+	if mp.Count() != 0 {
+		t.Fatalf("expected empty mempool, got %d txs", mp.Count())
+	}
+}
+
+// TestSweepInvalid_PreservesValidCPFPChain ensures the sweep does not
+// over-evict: a parent + child still in mempool remain after sweep when the
+// parent's input is still in the UTXO set.
+func TestSweepInvalid_PreservesValidCPFPChain(t *testing.T) {
+	privKey, pkScript, utxoSet, fundingHash := setupKeyAndUTXO(t)
+
+	p := testParams()
+	mp := New(p, utxoSet, func() uint32 { return 200 })
+
+	parentTx := fundedTx(privKey, fundingHash, 0, pkScript, 10_0000_0000, 9_9999_0000)
+	parentHash, err := mp.AddTx(parentTx)
+	if err != nil {
+		t.Fatalf("parent AddTx failed: %v", err)
+	}
+	childTx := fundedTx(privKey, parentHash, 0, pkScript, 9_9999_0000, 9_9998_0000)
+	childHash, err := mp.AddTx(childTx)
+	if err != nil {
+		t.Fatalf("child AddTx (CPFP) failed: %v", err)
+	}
+
+	// Sweep with no UTXO changes: nothing should be evicted.
+	evicted := mp.SweepInvalid()
+	if evicted != 0 {
+		t.Fatalf("expected 0 evicted, got %d", evicted)
+	}
+	if !mp.HasTx(parentHash) || !mp.HasTx(childHash) {
+		t.Fatal("CPFP parent and child should both remain after a no-op sweep")
+	}
+	if mp.Count() != 2 {
+		t.Fatalf("expected 2 txs, got %d", mp.Count())
+	}
+}
+
+// TestSweepInvalid_CascadeEvictsOrphanedChildren verifies the fixed-point
+// iteration: when a parent is evicted, its CPFP children are no longer
+// connectable and must be evicted in a subsequent pass.
+func TestSweepInvalid_CascadeEvictsOrphanedChildren(t *testing.T) {
+	privKey, pkScript, utxoSet, fundingHash := setupKeyAndUTXO(t)
+
+	p := testParams()
+	mp := New(p, utxoSet, func() uint32 { return 200 })
+
+	// Parent (depth 0) spends the funding UTXO.
+	parentTx := fundedTx(privKey, fundingHash, 0, pkScript, 10_0000_0000, 9_9999_0000)
+	parentHash, err := mp.AddTx(parentTx)
+	if err != nil {
+		t.Fatalf("parent AddTx failed: %v", err)
+	}
+	// Child (depth 1) spends parent's output.
+	childTx := fundedTx(privKey, parentHash, 0, pkScript, 9_9999_0000, 9_9998_0000)
+	childHash, err := mp.AddTx(childTx)
+	if err != nil {
+		t.Fatalf("child AddTx failed: %v", err)
+	}
+	// Grandchild (depth 2) spends child's output.
+	grandchildTx := fundedTx(privKey, childHash, 0, pkScript, 9_9998_0000, 9_9997_0000)
+	grandchildHash, err := mp.AddTx(grandchildTx)
+	if err != nil {
+		t.Fatalf("grandchild AddTx failed: %v", err)
+	}
+	if mp.Count() != 3 {
+		t.Fatalf("expected 3 txs in chain, got %d", mp.Count())
+	}
+
+	// Reorg: the funding UTXO disappears from the live set.
+	utxoSet.Remove(fundingHash, 0)
+
+	evicted := mp.SweepInvalid()
+	if evicted != 3 {
+		t.Fatalf("expected cascade eviction of all 3 chain entries, got %d", evicted)
+	}
+	if mp.HasTx(parentHash) || mp.HasTx(childHash) || mp.HasTx(grandchildHash) {
+		t.Fatal("none of parent / child / grandchild should remain after cascade sweep")
+	}
+	if mp.Count() != 0 {
+		t.Fatalf("expected empty mempool, got %d txs", mp.Count())
+	}
+}
+
+// TestSweepInvalid_NoOpOnHealthyMempool is a paranoia check: the sweep is
+// idempotent and a no-op when nothing has changed.
+func TestSweepInvalid_NoOpOnHealthyMempool(t *testing.T) {
+	privKey, pkScript, utxoSet, fundingHash := setupKeyAndUTXO(t)
+
+	p := testParams()
+	mp := New(p, utxoSet, func() uint32 { return 200 })
+
+	tx := fundedTx(privKey, fundingHash, 0, pkScript, 10_0000_0000, 9_9999_0000)
+	if _, err := mp.AddTx(tx); err != nil {
+		t.Fatalf("AddTx failed: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if evicted := mp.SweepInvalid(); evicted != 0 {
+			t.Fatalf("iteration %d: expected 0 evicted, got %d", i, evicted)
+		}
+		if mp.Count() != 1 {
+			t.Fatalf("iteration %d: mempool changed unexpectedly", i)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Persistence roundtrip tests
 // ---------------------------------------------------------------------------
 
