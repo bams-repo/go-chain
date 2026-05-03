@@ -140,6 +140,10 @@ function MainnetCountdown() {
 
   if (!launchEpoch) return null;
 
+  if (launched && coinInfo.network !== "mainnet") {
+    return null;
+  }
+
   if (launched) {
     return (
       <>
@@ -197,6 +201,15 @@ function viewMeta(pathname: string): { title: string; subtitle: string } {
   }
   if (p === "/transactions" || p.startsWith("/transactions/")) {
     return { title: "Transactions", subtitle: "Wallet transaction history & maturity" };
+  }
+  if (p === "/explorer" || p.startsWith("/explorer/")) {
+    if (p.startsWith("/explorer/block/")) {
+      return { title: "Block", subtitle: "Header, links, and transactions for this block" };
+    }
+    if (p.startsWith("/explorer/tx/")) {
+      return { title: "Transaction", subtitle: "Inputs, outputs, confirmations, and raw hex" };
+    }
+    return { title: "Block explorer", subtitle: "Search the chain, browse recent blocks and the mempool" };
   }
   if (p === "/mining" || p.startsWith("/mining/")) {
     return { title: "Mining", subtitle: "Internal miner & stratum server" };

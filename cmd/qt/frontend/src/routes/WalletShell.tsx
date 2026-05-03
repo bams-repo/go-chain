@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import MainLayout from "@/components/layout/MainLayout";
 import { StatusBar } from "@/components/StatusBar";
@@ -5,8 +7,16 @@ import { SyncOverlay } from "@/components/SyncOverlay";
 import { DebugWindow } from "@/components/DebugWindow";
 import { SecurityWindow } from "@/components/SecurityWindow";
 import { useWalletChrome } from "@/hooks/useWalletChrome";
+import { EventsOn } from "../../wailsjs/runtime/runtime";
 
 export default function WalletShell() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    return EventsOn("menu:block-explorer", () => {
+      navigate("/explorer");
+    });
+  }, [navigate]);
+
   const {
     showSyncOverlay,
     onHideSyncOverlay,

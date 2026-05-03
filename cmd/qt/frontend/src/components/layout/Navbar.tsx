@@ -2,6 +2,7 @@ import type { LucideIcon } from "lucide-react";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
+  Blocks,
   Globe2,
   LayoutDashboard,
   MessagesSquare,
@@ -33,6 +34,7 @@ type Page =
   | "send"
   | "receive"
   | "transactions"
+  | "explorer"
   | "node-network"
   | "mining"
   | "console"
@@ -51,6 +53,7 @@ const primaryNav: NavItem[] = [
   { id: "send", label: "Send", enabled: true, to: "/send", icon: ArrowUpFromLine },
   { id: "receive", label: "Receive", enabled: true, to: "/receive", icon: ArrowDownToLine },
   { id: "transactions", label: "Transactions", enabled: true, to: "/transactions", icon: ScrollText },
+  { id: "explorer", label: "Explorer", enabled: true, to: "/explorer", icon: Blocks },
   { id: "mining", label: "Mining", enabled: true, to: "/mining", icon: Pickaxe },
   { id: "social", label: "Social", enabled: true, to: "/social", icon: MessagesSquare },
   { id: "node-map", label: "Node Map", enabled: true, to: "/node-map", icon: Map },

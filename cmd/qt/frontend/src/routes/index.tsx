@@ -10,6 +10,9 @@ import { NodeNetwork } from "@/pages/node-network";
 import { NodeMap } from "@/pages/node-map";
 import { Mining } from "@/pages/mining";
 import { Transactions } from "@/pages/transactions";
+import { ExplorerHome } from "@/pages/explorer/Home";
+import { ExplorerBlockPage } from "@/pages/explorer/BlockPage";
+import { ExplorerTxPage } from "@/pages/explorer/TxPage";
 
 export default function AppRoutes() {
   return (
@@ -24,6 +27,9 @@ export default function AppRoutes() {
           <Route path="/node-map" element={<NodeMap />} />
           <Route path="/node-network" element={<NodeNetwork />} />
           <Route path="/mining" element={<Mining />} />
+          <Route path="/explorer" element={<ExplorerHome />} />
+          <Route path="/explorer/block/:id" element={<ExplorerBlockPage />} />
+          <Route path="/explorer/tx/:txid" element={<ExplorerTxPage />} />
           <Route path="*" element={<Coming />} />
         </Route>
       </Route>

@@ -65,6 +65,11 @@ func buildAppMenu(app *App) *menu.Menu {
 		wailsRuntime.EventsEmit(app.ctx, "menu:verify-message")
 	})
 
+	viewMenu := appMenu.AddSubmenu("View")
+	viewMenu.AddText("Block Explorer", nil, func(_ *menu.CallbackData) {
+		wailsRuntime.EventsEmit(app.ctx, "menu:block-explorer")
+	})
+
 	helpMenu := appMenu.AddSubmenu("Help")
 	helpMenu.AddText("About "+coinparams.Name+" Wallet", nil, func(_ *menu.CallbackData) {
 		_, _ = wailsRuntime.MessageDialog(app.ctx, wailsRuntime.MessageDialogOptions{
@@ -85,12 +90,38 @@ func networkForBuild() string {
 	if env := strings.TrimSpace(os.Getenv("FAIRCHAIN_NETWORK")); env != "" {
 		return strings.ToLower(env)
 	}
+	if cliNetwork := networkFromArgs(os.Args[1:]); cliNetwork != "" {
+		return cliNetwork
+	}
 
 	// Runtime auto-detect: mainnet activates once MiningStartTime has passed.
 	if params.Mainnet.MiningStartTime > 0 && time.Now().Unix() >= params.Mainnet.MiningStartTime {
 		return "mainnet"
 	}
 	return "testnet"
+}
+
+func networkFromArgs(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "-testnet" || arg == "--testnet":
+			return "testnet"
+		case arg == "-regtest" || arg == "--regtest":
+			return "regtest"
+		case arg == "-mainnet" || arg == "--mainnet":
+			return "mainnet"
+		case arg == "-network" || arg == "--network":
+			if i+1 < len(args) {
+				return strings.ToLower(strings.TrimSpace(args[i+1]))
+			}
+		case strings.HasPrefix(arg, "-network="):
+			return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "-network=")))
+		case strings.HasPrefix(arg, "--network="):
+			return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "--network=")))
+		}
+	}
+	return ""
 }
 
 func windowTitle() string {

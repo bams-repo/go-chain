@@ -22,6 +22,30 @@ export function ExecuteRPC(arg1, arg2) {
   return window['go']['main']['App']['ExecuteRPC'](arg1, arg2);
 }
 
+export function ExplorerChainOverview() {
+  return window['go']['main']['App']['ExplorerChainOverview']();
+}
+
+export function ExplorerGetBlock(arg1) {
+  return window['go']['main']['App']['ExplorerGetBlock'](arg1);
+}
+
+export function ExplorerGetTransaction(arg1) {
+  return window['go']['main']['App']['ExplorerGetTransaction'](arg1);
+}
+
+export function ExplorerMempoolSlice(arg1) {
+  return window['go']['main']['App']['ExplorerMempoolSlice'](arg1);
+}
+
+export function ExplorerRecentBlocks(arg1) {
+  return window['go']['main']['App']['ExplorerRecentBlocks'](arg1);
+}
+
+export function ExplorerSearch(arg1) {
+  return window['go']['main']['App']['ExplorerSearch'](arg1);
+}
+
 export function GetAddressBook() {
   return window['go']['main']['App']['GetAddressBook']();
 }
