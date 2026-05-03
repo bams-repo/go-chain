@@ -1,7 +1,8 @@
 /*
  * sha256mem GPU Miner — submits blocks to a Fairchain daemon
  * ============================================================
- * Uses sha256mem_v4_gpu.cl (same algorithm as Go sha256mem) to mine blocks
+ * Uses sha256mem_v4_gpu.cl (linear 64 MiB) or sha256mem_v4_tmto_gpu.cl (--tmto,
+ * consensus-equivalent time–memory tradeoff) to mine blocks
  * via the REST /submitblock endpoint.
  *
  * Build:
@@ -11,6 +12,7 @@
  *   ./gpu_miner                                    # defaults: localhost:19335
  *   ./gpu_miner --rpc http://127.0.0.1:19335       # explicit RPC
  *   ./gpu_miner --workers 60                        # override worker count
+ *   ./gpu_miner --tmto                            # TMTO kernel (~512 KiB/worker, SRBMiner-class occupancy)
  *   ./gpu_miner --honest                            # use wall-clock timestamps
  *
  * Copyright (c) 2024-2026 The Fairchain Contributors
@@ -25,6 +27,7 @@
 #include <math.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <openssl/sha.h>
 #include <curl/curl.h>
 
@@ -390,21 +393,24 @@ int main(int argc, char **argv)
     int num_workers = 0;
     int hashes_per_batch = 4;
     int honest_timestamps = 0;
+    int use_tmto = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rpc") == 0 && i+1 < argc) rpc_base = argv[++i];
         else if (strcmp(argv[i], "--workers") == 0 && i+1 < argc) num_workers = atoi(argv[++i]);
         else if (strcmp(argv[i], "--hpi") == 0 && i+1 < argc) hashes_per_batch = atoi(argv[++i]);
         else if (strcmp(argv[i], "--honest") == 0) honest_timestamps = 1;
-        else { fprintf(stderr, "Usage: %s [--rpc URL] [--workers N] [--hpi N] [--honest]\n", argv[0]); return 1; }
+        else if (strcmp(argv[i], "--tmto") == 0) use_tmto = 1;
+        else { fprintf(stderr, "Usage: %s [--rpc URL] [--workers N] [--hpi N] [--honest] [--tmto]\n", argv[0]); return 1; }
     }
 
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    /* 2097152 slots × 32 bytes = 64 MiB per worker (matches internal/algorithms/sha256mem) */
-    const size_t MEM_PER_WORKER = 2097152UL * 32;
+    /* Linear: 64 MiB; TMTO: 16k checkpoints × 32 B = 512 KiB (same PoW) */
+    const size_t MEM_PER_WORKER = use_tmto ? ((2097152UL / 128UL) * 32UL) : (2097152UL * 32);
+    const char *kernel_path = use_tmto ? "sha256mem_v4_tmto_gpu.cl" : "sha256mem_v4_gpu.cl";
 
     /* ── OpenCL setup ─────────────────────────────────────────── */
     cl_platform_id platform;
@@ -416,17 +422,62 @@ int main(int argc, char **argv)
 
     char dev_name[256];
     size_t dev_gmem;
+    cl_uint vendor_id = 0;
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(dev_name), dev_name, NULL);
     clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(dev_gmem), &dev_gmem, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_VENDOR_ID, sizeof(vendor_id), &vendor_id, NULL);
+
+    /* Try loading autotune cache */
+    if (num_workers <= 0 && use_tmto) {
+        char pattern[512];
+        snprintf(pattern, sizeof(pattern), "Autotune/sha256mem_%04x_", vendor_id);
+        /* Scan Autotune/ directory for matching file */
+        char cache_path[512] = {0};
+        struct stat st;
+        if (stat("Autotune", &st) == 0) {
+            /* Simple: try reading files matching the vendor prefix */
+            char cmd[1024];
+            snprintf(cmd, sizeof(cmd), "ls Autotune/sha256mem_%04x_* 2>/dev/null | head -1", vendor_id);
+            FILE *p = popen(cmd, "r");
+            if (p) {
+                if (fgets(cache_path, sizeof(cache_path), p)) {
+                    cache_path[strcspn(cache_path, "\n")] = '\0';
+                }
+                pclose(p);
+            }
+        }
+        if (cache_path[0]) {
+            FILE *fc = fopen(cache_path, "r");
+            if (fc) {
+                int cached = 0;
+                if (fscanf(fc, "%d", &cached) == 1 && cached > 0) {
+                    num_workers = cached;
+                    printf("Loaded autotune: %d workers from %s\n", num_workers, cache_path);
+                }
+                fclose(fc);
+            }
+        }
+    }
 
     if (num_workers <= 0) {
-        num_workers = (int)((dev_gmem * 0.80) / MEM_PER_WORKER);
-        if (num_workers < 1) num_workers = 1;
+        if (use_tmto) {
+            /* For TMTO, default to a well-tested fraction */
+            int w = (int)((dev_gmem * 0.64) / MEM_PER_WORKER);
+            w = (w / 32) * 32;
+            if (w < 256) w = 256;
+            num_workers = w;
+            printf("Auto workers: %d (run bench_gpu_tmto for optimal autotune)\n", num_workers);
+        } else {
+            int w = (int)((dev_gmem * 0.55) / MEM_PER_WORKER);
+            w = (w / 256) * 256;
+            if (w < 256) w = 256;
+            num_workers = w;
+        }
     }
 
     size_t total_vram = (size_t)num_workers * MEM_PER_WORKER;
 
-    printf("sha256mem GPU Miner — Fairchain\n");
+    printf("sha256mem GPU Miner — Fairchain %s\n", use_tmto ? "(TMTO)" : "(linear 64 MiB)");
     printf("  GPU:       %s\n", dev_name);
     printf("  VRAM:      %lu / %lu MiB\n",
            (unsigned long)(total_vram/(1024*1024)),
@@ -442,7 +493,7 @@ int main(int argc, char **argv)
     if (err != CL_SUCCESS) { fprintf(stderr, "create queue: %d\n", err); return 1; }
 
     size_t src_len;
-    char *src = load_kernel_source("sha256mem_v4_gpu.cl", &src_len);
+    char *src = load_kernel_source(kernel_path, &src_len);
     cl_program prog = clCreateProgramWithSource(ctx, 1, (const char **)&src, &src_len, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "create program: %d\n", err); return 1; }
 

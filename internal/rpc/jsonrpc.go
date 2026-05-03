@@ -97,28 +97,28 @@ func (s *Server) buildMethodMap() map[string]rpcHandler {
 		"gettxoutsetinfo": s.rpcGetTxOutSetInfo,
 
 		// Wallet
-		"validateaddress":  s.rpcValidateAddress,
-		"getaddressinfo":   s.rpcGetAddressInfo,
-		"getnewaddress":    s.rpcGetNewAddress,
-		"getbalance":       s.rpcGetBalance,
-		"getwalletinfo":    s.rpcGetWalletInfo,
-		"listunspent":      s.rpcListUnspent,
-		"dumpprivkey":      s.rpcDumpPrivKey,
-		"importprivkey":    s.rpcImportPrivKey,
-		"settxfee":         s.rpcSetTxFee,
-		"sendtoaddress":    s.rpcSendToAddress,
-		"sendmany":         s.rpcSendMany,
-		"gettransaction":   s.rpcGetTransaction,
-		"listtransactions": s.rpcListTransactions,
-		"listsinceblock":   s.rpcListSinceBlock,
+		"validateaddress":        s.rpcValidateAddress,
+		"getaddressinfo":         s.rpcGetAddressInfo,
+		"getnewaddress":          s.rpcGetNewAddress,
+		"getbalance":             s.rpcGetBalance,
+		"getwalletinfo":          s.rpcGetWalletInfo,
+		"listunspent":            s.rpcListUnspent,
+		"dumpprivkey":            s.rpcDumpPrivKey,
+		"importprivkey":          s.rpcImportPrivKey,
+		"settxfee":               s.rpcSetTxFee,
+		"sendtoaddress":          s.rpcSendToAddress,
+		"sendmany":               s.rpcSendMany,
+		"gettransaction":         s.rpcGetTransaction,
+		"listtransactions":       s.rpcListTransactions,
+		"listsinceblock":         s.rpcListSinceBlock,
 		"walletpassphrase":       s.rpcWalletPassphrase,
 		"walletlock":             s.rpcWalletLock,
 		"walletpassphrasechange": s.rpcWalletPassphraseChange,
 		"encryptwallet":          s.rpcEncryptWallet,
 		"dumpwallet":             s.rpcDumpWallet,
 		"backupwallet":           s.rpcBackupWallet,
-		"getrawchangeaddress": s.rpcGetRawChangeAddress,
-		"decoderawtransaction": s.rpcDecodeRawTransaction,
+		"getrawchangeaddress":    s.rpcGetRawChangeAddress,
+		"decoderawtransaction":   s.rpcDecodeRawTransaction,
 
 		// Control
 		"getinfo": s.rpcGetInfo,
@@ -389,12 +389,12 @@ func (s *Server) rpcGetConnectionCount(_ []json.RawMessage) (interface{}, *jsonR
 
 func (s *Server) rpcGetMempoolInfo(_ []json.RawMessage) (interface{}, *jsonRPCError) {
 	return map[string]interface{}{
-		"loaded":           true,
-		"size":             s.mempool.Count(),
-		"bytes":            s.mempool.TotalSize(),
-		"maxmempool":       300 * 1024 * 1024,
-		"mempoolminfee":    s.params.MinRelayTxFeeRate,
-		"mempoolexpiry":    int64(s.params.MempoolExpiry.Hours()),
+		"loaded":        true,
+		"size":          s.mempool.Count(),
+		"bytes":         s.mempool.TotalSize(),
+		"maxmempool":    300 * 1024 * 1024,
+		"mempoolminfee": s.params.MinRelayTxFeeRate,
+		"mempoolexpiry": int64(s.params.MempoolExpiry.Hours()),
 	}, nil
 }
 
@@ -924,6 +924,7 @@ func (s *Server) rpcSendToAddress(params []json.RawMessage) (interface{}, *jsonR
 		utxos,
 		s.params.CoinbaseMaturity,
 		tipHeight,
+		s.params.MinRelayTxFee,
 	)
 	if err != nil {
 		return nil, newRPCError(rpcErrMisc, err.Error())

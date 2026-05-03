@@ -25,6 +25,10 @@ function formatDuration(secs: number): string {
   return `${h}h ${m}m`;
 }
 
+function formatDifficulty(diff: number): string {
+  return diff.toFixed(5);
+}
+
 const cardStyle: React.CSSProperties = {
   background: "var(--color-btc-card)",
   border: "1px solid var(--color-btc-border)",
@@ -293,7 +297,7 @@ export function Mining() {
                           {w.hashrate > 0 ? formatHashrate(w.hashrate) : "—"}
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono" style={{ color: "var(--color-btc-text)" }}>
-                          {typeof w.difficulty === "number" ? w.difficulty.toFixed(4) : "—"}
+                          {typeof w.difficulty === "number" ? formatDifficulty(w.difficulty) : "—"}
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono" style={{ color: "var(--color-btc-green)" }}>
                           {w.sharesValid ?? 0}

@@ -44,6 +44,17 @@ const (
 
 	// maxDupeTracked is the max number of tracked share hashes per job.
 	maxDupeTracked = 65536
+
+	// vardiffWindow is the minimum observation window before reducing difficulty
+	// for quiet workers. Busy workers can adjust earlier after vardiffMinShares.
+	vardiffWindow    = 30 * time.Second
+	vardiffMinShares = 10
+	vardiffDeadband  = 0.25
+	vardiffMaxUp     = 2.0
+	vardiffMaxDown   = 0.5
+
+	hashrateLWMASamples = 20
+	diffOneHashes       = 4294967296.0
 )
 
 // Config holds stratum server configuration.
@@ -60,10 +71,10 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		ListenAddr:                "0.0.0.0:3333",
-		VardiffMin:                0.001,
+		VardiffMin:                0.0000001,
 		VardiffMax:                0, // network difficulty
-		StartDiff:                 0, // use VardiffMin
-		VardiffTargetSharesPerMin: 20,
+		StartDiff:                 0.0001,
+		VardiffTargetSharesPerMin: 2,
 	}
 }
 
@@ -86,20 +97,22 @@ type worker struct {
 	addr   string
 	authed bool
 
-	mu          sync.Mutex
-	difficulty  float64
-	suggestDiff float64 // miner-suggested difficulty (via mining.suggest_difficulty)
+	mu                   sync.Mutex
+	difficulty           float64
+	suggestDiff          float64 // miner-suggested difficulty (via mining.suggest_difficulty)
 	subscribedExtranonce string
 
-	connectedAt time.Time
-	lastShareAt time.Time
+	connectedAt     time.Time
+	lastShareAt     time.Time
+	shareWork       float64
+	hashrateSamples []float64
 
 	sharesValid   atomic.Int64
 	sharesStale   atomic.Int64
 	sharesInvalid atomic.Int64
 
 	// Vardiff tracking
-	vardiffShareCount int
+	vardiffShareCount  int
 	vardiffWindowStart time.Time
 
 	done chan struct{}
@@ -107,19 +120,19 @@ type worker struct {
 
 // job represents an active mining job sent to workers.
 type job struct {
-	id         string
-	prevBlock  types.Hash
-	coinbase1  []byte // coinbase prefix (before extranonce)
-	coinbase2  []byte // coinbase suffix (after extranonce)
+	id           string
+	prevBlock    types.Hash
+	coinbase1    []byte       // coinbase prefix (before extranonce)
+	coinbase2    []byte       // coinbase suffix (after extranonce)
 	merkleHashes []types.Hash // merkle branch (proper binary tree path)
-	version    uint32
-	bits       uint32
-	timestamp  uint32
-	height     uint32
-	target     types.Hash
-	txs        []types.Transaction
-	cleanJobs  bool
-	createdAt  time.Time
+	version      uint32
+	bits         uint32
+	timestamp    uint32
+	height       uint32
+	target       types.Hash
+	txs          []types.Transaction
+	cleanJobs    bool
+	createdAt    time.Time
 
 	// Duplicate share tracking: set of PoW hash hex strings
 	dupeMu sync.Mutex
@@ -144,36 +157,36 @@ func (j *job) isDuplicateShare(powHash types.Hash) bool {
 
 // Server is an embedded Stratum V1 TCP server.
 type Server struct {
-	cfg      Config
-	chain    *chain.Chain
-	mempool  *mempool.Mempool
-	params   *params.ChainParams
-	hasher   algorithms.Hasher
+	cfg          Config
+	chain        *chain.Chain
+	mempool      *mempool.Mempool
+	params       *params.ChainParams
+	hasher       algorithms.Hasher
 	rewardScript []byte
 
 	onBlock func(*types.Block) // callback when a block is found
 
 	listener net.Listener
 
-	mu       sync.RWMutex
-	workers  map[*worker]struct{}
+	mu      sync.RWMutex
+	workers map[*worker]struct{}
 
-	jobMu    sync.RWMutex
-	jobs     map[string]*job // all active jobs by ID
-	currentJob *job          // most recent job
+	jobMu      sync.RWMutex
+	jobs       map[string]*job // all active jobs by ID
+	currentJob *job            // most recent job
 
 	jobCounter uint64
 
-	extranonceMu sync.Mutex
+	extranonceMu      sync.Mutex
 	extranonceCounter uint32
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	running atomic.Bool
-	sharesValid   atomic.Int64
-	sharesStale   atomic.Int64
-	blocksFound   atomic.Int64
+	running     atomic.Bool
+	sharesValid atomic.Int64
+	sharesStale atomic.Int64
+	blocksFound atomic.Int64
 }
 
 // New creates a new stratum server. onBlock is called when a valid block is mined.
@@ -259,14 +272,11 @@ func (s *Server) Workers() []WorkerInfo {
 	for w := range s.workers {
 		w.mu.Lock()
 		diff := w.difficulty
+		hashrateSamples := append([]float64(nil), w.hashrateSamples...)
 		w.mu.Unlock()
 
 		valid := w.sharesValid.Load()
-		elapsed := time.Since(w.connectedAt).Seconds()
-		var hashrate float64
-		if elapsed > 0 && valid > 0 {
-			hashrate = float64(valid) * diff * 4294967296.0 / elapsed
-		}
+		hashrate := estimateHashrateLWMA(hashrateSamples)
 
 		infos = append(infos, WorkerInfo{
 			Name:          w.name,
@@ -290,12 +300,12 @@ func (s *Server) Stats() map[string]interface{} {
 	s.mu.RUnlock()
 
 	return map[string]interface{}{
-		"running":      s.running.Load(),
-		"listenAddr":   s.cfg.ListenAddr,
-		"workers":      workerCount,
-		"sharesValid":  s.sharesValid.Load(),
-		"sharesStale":  s.sharesStale.Load(),
-		"blocksFound":  s.blocksFound.Load(),
+		"running":     s.running.Load(),
+		"listenAddr":  s.cfg.ListenAddr,
+		"workers":     workerCount,
+		"sharesValid": s.sharesValid.Load(),
+		"sharesStale": s.sharesStale.Load(),
+		"blocksFound": s.blocksFound.Load(),
 	}
 }
 
@@ -326,13 +336,13 @@ func (s *Server) handleWorker(conn net.Conn) {
 	}
 
 	w := &worker{
-		conn:        conn,
-		addr:        conn.RemoteAddr().String(),
-		difficulty:  startDiff,
-		connectedAt: time.Now(),
+		conn:                 conn,
+		addr:                 conn.RemoteAddr().String(),
+		difficulty:           startDiff,
+		connectedAt:          time.Now(),
 		subscribedExtranonce: fmt.Sprintf("%08x", enonce),
-		vardiffWindowStart: time.Now(),
-		done:        make(chan struct{}),
+		vardiffWindowStart:   time.Now(),
+		done:                 make(chan struct{}),
 	}
 
 	s.mu.Lock()
@@ -383,9 +393,9 @@ func (s *Server) handleWorker(conn net.Conn) {
 // --- Stratum V1 protocol types ---
 
 type stratumRequest struct {
-	ID     interface{}       `json:"id"`
-	Method string            `json:"method"`
-	Params json.RawMessage   `json:"params"`
+	ID     interface{}     `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 }
 
 type stratumResponse struct {
@@ -451,25 +461,6 @@ func (s *Server) handleSubscribe(w *worker, req *stratumRequest) {
 		"extranonce2_size", 4,
 	)
 	s.sendJSON(w, stratumResponse{ID: req.ID, Result: result})
-
-	// Clamp initial difficulty to network difficulty
-	s.jobMu.RLock()
-	j := s.currentJob
-	s.jobMu.RUnlock()
-	if j != nil {
-		netDiff := targetToDifficulty(j.target)
-		w.mu.Lock()
-		if netDiff > 0 && w.difficulty > netDiff {
-			w.difficulty = netDiff
-		}
-		w.mu.Unlock()
-	}
-
-	s.sendSetDifficulty(w)
-
-	if j != nil {
-		s.sendJob(w, j)
-	}
 }
 
 func (s *Server) handleAuthorize(w *worker, req *stratumRequest) {
@@ -486,6 +477,24 @@ func (s *Server) handleAuthorize(w *worker, req *stratumRequest) {
 
 	s.sendJSON(w, stratumResponse{ID: req.ID, Result: true})
 	logging.L.Info("stratum worker authorized", "component", "stratum", "worker", params[0], "addr", w.addr)
+
+	// Standard Stratum clients expect the authorize response before async work.
+	// Send the current difficulty and job only after authorization succeeds.
+	s.jobMu.RLock()
+	j := s.currentJob
+	s.jobMu.RUnlock()
+	if j != nil {
+		netDiff := targetToDifficulty(j.target)
+		w.mu.Lock()
+		if netDiff > 0 && w.difficulty > netDiff {
+			w.difficulty = netDiff
+		}
+		w.mu.Unlock()
+	}
+	s.sendSetDifficulty(w)
+	if j != nil {
+		s.sendJob(w, j)
+	}
 }
 
 func (s *Server) handleSuggestDifficulty(w *worker, req *stratumRequest) {
@@ -571,7 +580,7 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 		return
 	}
 
-	nonce, err := decodeUint32LE(nonceHex)
+	nonce, err := decodeUint32BE(nonceHex)
 	if err != nil {
 		s.sendJSON(w, stratumResponse{ID: req.ID, Result: false, Error: []interface{}{20, "invalid nonce", nil}})
 		w.sharesInvalid.Add(1)
@@ -621,19 +630,17 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 
 	coinbaseHash, _ := crypto.HashTransaction(&coinbaseTx)
 	merkleRoot := computeMerkleRootFromBranch(coinbaseHash, j.merkleHashes)
-	merkleRootBE := merkleRoot.Reversed()
 
 	logging.StratumDebug("submit: merkle computed",
 		"coinbase_hash_LE", hex.EncodeToString(coinbaseHash[:]),
 		"merkle_root_LE", hex.EncodeToString(merkleRoot[:]),
-		"merkle_root_BE", hex.EncodeToString(merkleRootBE[:]),
 		"merkle_branch_count", len(j.merkleHashes),
 	)
 
 	header := types.BlockHeader{
 		Version:    j.version,
 		PrevBlock:  j.prevBlock,
-		MerkleRoot: merkleRootBE,
+		MerkleRoot: merkleRoot,
 		Timestamp:  ntime,
 		Bits:       j.bits,
 		Nonce:      nonce,
@@ -651,23 +658,22 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 	}
 
 	// Duplicate share detection
-	rawHash := powHash.Reversed()
-	if j.isDuplicateShare(rawHash) {
+	if j.isDuplicateShare(powHash) {
 		s.sendJSON(w, stratumResponse{ID: req.ID, Result: false, Error: []interface{}{22, "duplicate share", nil}})
 		w.sharesInvalid.Add(1)
 		return
 	}
 
-	// Share validation — compare in cpuminer's raw memory layout
+	// Share validation: standard Stratum difficulty target in internal hash order.
 	w.mu.Lock()
 	shareDiff := w.difficulty
 	w.mu.Unlock()
-	shareTargetRaw := difficultyToTarget(shareDiff)
+	shareTarget := difficultyToTarget(shareDiff)
 
-	netTargetRaw := j.target
+	netTarget := j.target
 
-	hashMeetsShareTarget := validHashRaw(rawHash, shareTargetRaw)
-	hashMeetsNetTarget := validHashRaw(rawHash, netTargetRaw)
+	hashMeetsShareTarget := powHash.LessOrEqual(shareTarget)
+	hashMeetsNetTarget := powHash.LessOrEqual(netTarget)
 
 	if logging.StratumDebugMode {
 		logging.StratumDebug("submit: share validation",
@@ -675,29 +681,29 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 			"header_nonce", fmt.Sprintf("%08x (%d)", header.Nonce, header.Nonce),
 		)
 		hashU32 := fmt.Sprintf("%08x %08x %08x %08x %08x %08x %08x %08x",
-			binary.LittleEndian.Uint32(rawHash[0:4]),
-			binary.LittleEndian.Uint32(rawHash[4:8]),
-			binary.LittleEndian.Uint32(rawHash[8:12]),
-			binary.LittleEndian.Uint32(rawHash[12:16]),
-			binary.LittleEndian.Uint32(rawHash[16:20]),
-			binary.LittleEndian.Uint32(rawHash[20:24]),
-			binary.LittleEndian.Uint32(rawHash[24:28]),
-			binary.LittleEndian.Uint32(rawHash[28:32]))
+			binary.LittleEndian.Uint32(powHash[0:4]),
+			binary.LittleEndian.Uint32(powHash[4:8]),
+			binary.LittleEndian.Uint32(powHash[8:12]),
+			binary.LittleEndian.Uint32(powHash[12:16]),
+			binary.LittleEndian.Uint32(powHash[16:20]),
+			binary.LittleEndian.Uint32(powHash[20:24]),
+			binary.LittleEndian.Uint32(powHash[24:28]),
+			binary.LittleEndian.Uint32(powHash[28:32]))
 		targetU32 := fmt.Sprintf("%08x %08x %08x %08x %08x %08x %08x %08x",
-			binary.LittleEndian.Uint32(shareTargetRaw[0:4]),
-			binary.LittleEndian.Uint32(shareTargetRaw[4:8]),
-			binary.LittleEndian.Uint32(shareTargetRaw[8:12]),
-			binary.LittleEndian.Uint32(shareTargetRaw[12:16]),
-			binary.LittleEndian.Uint32(shareTargetRaw[16:20]),
-			binary.LittleEndian.Uint32(shareTargetRaw[20:24]),
-			binary.LittleEndian.Uint32(shareTargetRaw[24:28]),
-			binary.LittleEndian.Uint32(shareTargetRaw[28:32]))
-		logging.StratumDebug("submit: raw hash u32",
-			"hash_raw_bytes", hex.EncodeToString(rawHash[:]),
+			binary.LittleEndian.Uint32(shareTarget[0:4]),
+			binary.LittleEndian.Uint32(shareTarget[4:8]),
+			binary.LittleEndian.Uint32(shareTarget[8:12]),
+			binary.LittleEndian.Uint32(shareTarget[12:16]),
+			binary.LittleEndian.Uint32(shareTarget[16:20]),
+			binary.LittleEndian.Uint32(shareTarget[20:24]),
+			binary.LittleEndian.Uint32(shareTarget[24:28]),
+			binary.LittleEndian.Uint32(shareTarget[28:32]))
+		logging.StratumDebug("submit: pow hash u32",
+			"hash_bytes", hex.EncodeToString(powHash[:]),
 			"hash_u32", hashU32,
 		)
 		logging.StratumDebug("submit: share target u32",
-			"target_raw_bytes", hex.EncodeToString(shareTargetRaw[:]),
+			"target_bytes", hex.EncodeToString(shareTarget[:]),
 			"target_u32", targetU32,
 			"share_diff", shareDiff,
 		)
@@ -726,7 +732,22 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 		"stale", isStale,
 	)
 	w.sharesValid.Add(1)
-	w.lastShareAt = time.Now()
+	now := time.Now()
+	w.mu.Lock()
+	shareWork := shareDiff * diffOneHashes
+	w.shareWork += shareWork
+	sampleStart := w.lastShareAt
+	if sampleStart.IsZero() {
+		sampleStart = w.connectedAt
+	}
+	if elapsed := now.Sub(sampleStart).Seconds(); elapsed > 0 {
+		w.hashrateSamples = append(w.hashrateSamples, shareWork/elapsed)
+		if len(w.hashrateSamples) > hashrateLWMASamples {
+			w.hashrateSamples = w.hashrateSamples[len(w.hashrateSamples)-hashrateLWMASamples:]
+		}
+	}
+	w.lastShareAt = now
+	w.mu.Unlock()
 	s.sharesValid.Add(1)
 
 	s.adjustVardiff(w)
@@ -907,10 +928,13 @@ func (s *Server) sendJob(w *worker, j *job) {
 }
 
 func (s *Server) sendJobWithClean(w *worker, j *job, clean bool) {
+	s.adjustVardiffIdle(w)
+
 	prevhashHex := stratumPrevhashHex(j.prevBlock)
 	branchHexes := make([]string, 0, len(j.merkleHashes))
 	for _, h := range j.merkleHashes {
-		branchHexes = append(branchHexes, hex.EncodeToString(h[:]))
+		hr := h.Reversed()
+		branchHexes = append(branchHexes, hex.EncodeToString(hr[:]))
 	}
 
 	versionHex := fmt.Sprintf("%08x", j.version)
@@ -970,83 +994,132 @@ func (s *Server) sendSetDifficulty(w *worker) {
 // --- Vardiff ---
 
 func (s *Server) adjustVardiff(w *worker) {
+	s.adjustVardiffMeasured(w, true)
+}
+
+func (s *Server) adjustVardiffIdle(w *worker) {
 	w.mu.Lock()
-	w.vardiffShareCount++
+	count := w.vardiffShareCount
+	elapsed := time.Since(w.vardiffWindowStart)
+	w.mu.Unlock()
+	if count > 0 || elapsed < vardiffWindow {
+		return
+	}
+	s.adjustVardiffMeasured(w, false)
+}
+
+func (s *Server) adjustVardiffMeasured(w *worker, acceptedShare bool) {
+	w.mu.Lock()
+	if acceptedShare {
+		w.vardiffShareCount++
+	}
 	count := w.vardiffShareCount
 	elapsed := time.Since(w.vardiffWindowStart).Seconds()
-	w.mu.Unlock()
 
-	if elapsed < 30 && count < 10 {
+	if elapsed < vardiffWindow.Seconds() && count < vardiffMinShares {
+		w.mu.Unlock()
 		return
 	}
 
 	if elapsed <= 0 {
+		w.mu.Unlock()
 		return
 	}
 
 	sharesPerMin := float64(count) / (elapsed / 60.0)
 	target := s.cfg.VardiffTargetSharesPerMin
 	if target <= 0 {
-		target = 20
+		target = 2
 	}
 
 	ratio := sharesPerMin / target
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	newDiff := w.difficulty
-	if ratio > 1.5 {
-		newDiff = w.difficulty * ratio * 0.8
-	} else if ratio < 0.5 && ratio > 0 {
-		newDiff = w.difficulty * ratio * 1.2
-	} else {
-		w.vardiffShareCount = 0
-		w.vardiffWindowStart = time.Now()
-		return
-	}
-
-	// Clamp to configured min
-	if newDiff < s.cfg.VardiffMin {
-		newDiff = s.cfg.VardiffMin
-	}
-
-	// Honour miner-suggested difficulty as floor
-	if w.suggestDiff > 0 && newDiff < w.suggestDiff {
-		newDiff = w.suggestDiff
-	}
-
-	// Clamp to configured max
-	if s.cfg.VardiffMax > 0 && newDiff > s.cfg.VardiffMax {
-		newDiff = s.cfg.VardiffMax
-	}
-
-	// Always clamp to network difficulty (ckpool behavior)
+	netDiff := 0.0
 	s.jobMu.RLock()
 	cj := s.currentJob
 	s.jobMu.RUnlock()
 	if cj != nil {
-		netDiff := targetToDifficulty(cj.target)
-		if netDiff > 0 && newDiff > netDiff {
-			newDiff = netDiff
-		}
+		netDiff = targetToDifficulty(cj.target)
 	}
 
-	if newDiff != w.difficulty {
-		w.difficulty = newDiff
+	newDiff, changed := calculateVardiff(w.difficulty, ratio, s.cfg.VardiffMin, s.cfg.VardiffMax, w.suggestDiff, netDiff)
+	if !changed {
 		w.vardiffShareCount = 0
 		w.vardiffWindowStart = time.Now()
-
-		diff := w.difficulty
-		go func() {
-			notify := stratumNotify{
-				ID:     nil,
-				Method: "mining.set_difficulty",
-				Params: []interface{}{diff},
-			}
-			s.sendJSON(w, notify)
-		}()
+		w.mu.Unlock()
+		return
 	}
+
+	w.difficulty = newDiff
+	w.vardiffShareCount = 0
+	w.vardiffWindowStart = time.Now()
+	w.mu.Unlock()
+
+	s.sendSetDifficulty(w)
+}
+
+func calculateVardiff(currentDiff, observedRatio, minDiff, maxDiff, suggestedMin, networkMax float64) (float64, bool) {
+	if currentDiff <= 0 {
+		currentDiff = minDiff
+	}
+	if minDiff <= 0 {
+		minDiff = 0.0000001
+	}
+
+	lower := 1.0 - vardiffDeadband
+	upper := 1.0 + vardiffDeadband
+	if observedRatio >= lower && observedRatio <= upper {
+		return currentDiff, false
+	}
+
+	factor := vardiffMaxDown
+	if observedRatio > 0 {
+		factor = observedRatio
+	}
+	if factor > vardiffMaxUp {
+		factor = vardiffMaxUp
+	}
+	if factor < vardiffMaxDown {
+		factor = vardiffMaxDown
+	}
+
+	newDiff := currentDiff * factor
+
+	if newDiff < minDiff {
+		newDiff = minDiff
+	}
+	if suggestedMin > 0 && newDiff < suggestedMin {
+		newDiff = suggestedMin
+	}
+	if maxDiff > 0 && newDiff > maxDiff {
+		newDiff = maxDiff
+	}
+	if networkMax > 0 && newDiff > networkMax {
+		newDiff = networkMax
+	}
+
+	return newDiff, newDiff != currentDiff
+}
+
+func estimateHashrateLWMA(samples []float64) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
+
+	var weightedSum float64
+	var weightSum float64
+	for i, sample := range samples {
+		if sample <= 0 {
+			continue
+		}
+		weight := float64(i + 1)
+		weightedSum += sample * weight
+		weightSum += weight
+	}
+	if weightSum == 0 {
+		return 0
+	}
+	return weightedSum / weightSum
 }
 
 // --- Coinbase construction ---
@@ -1247,40 +1320,28 @@ func targetToDifficulty(target types.Hash) float64 {
 	return f
 }
 
-// difficultyToTarget replicates cpuminer-opt's diff_to_hash exactly.
-// cpuminer (128-bit path) computes:
-//
-//	targ[0] = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF  (low 128 bits, all 1s)
-//	targ[1] = (uint128)((1.0 / diff) * 2^96)      (high 128 bits)
-//
-// The result is stored in memory as two LE uint128s: targ[0] at bytes 0-15,
-// targ[1] at bytes 16-31.
+// difficultyToTarget converts standard Stratum difficulty to an internal-order
+// hash target using Bitcoin's diff1 target: target = diff1 / difficulty.
 func difficultyToTarget(diff float64) types.Hash {
 	if diff <= 0 {
 		diff = 1
 	}
 
-	invDiff := new(big.Float).SetPrec(256).Quo(
-		new(big.Float).SetPrec(256).SetFloat64(1.0),
-		new(big.Float).SetPrec(256).SetFloat64(diff),
-	)
-	exp96 := new(big.Float).SetPrec(256).SetInt(new(big.Int).Lsh(big.NewInt(1), 96))
-	high128f := new(big.Float).SetPrec(256).Mul(invDiff, exp96)
-	high128, _ := high128f.Int(nil)
+	diff1, _ := new(big.Int).SetString("00000000FFFF0000000000000000000000000000000000000000000000000000", 16)
+	targetF := new(big.Float).SetPrec(256).SetInt(diff1)
+	targetF.Quo(targetF, new(big.Float).SetPrec(256).SetFloat64(diff))
+	target, _ := targetF.Int(nil)
 
-	max128 := new(big.Int).Lsh(big.NewInt(1), 128)
-	max128.Sub(max128, big.NewInt(1))
-	if high128.Cmp(max128) > 0 {
-		high128.Set(max128)
+	maxTarget := new(big.Int).Lsh(big.NewInt(1), 256)
+	maxTarget.Sub(maxTarget, big.NewInt(1))
+	if target.Cmp(maxTarget) > 0 {
+		target.Set(maxTarget)
 	}
 
 	var h types.Hash
-	for i := 0; i < 16; i++ {
-		h[i] = 0xFF
-	}
-	high128Bytes := high128.Bytes()
-	for i := 0; i < len(high128Bytes) && i < 16; i++ {
-		h[16+(15-i)] = high128Bytes[i]
+	targetBytes := target.Bytes()
+	for i := 0; i < len(targetBytes) && i < len(h); i++ {
+		h[i] = targetBytes[len(targetBytes)-1-i]
 	}
 	return h
 }

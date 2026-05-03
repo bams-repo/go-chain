@@ -13,6 +13,8 @@ import {
 } from "../../../wailsjs/go/main/App";
 import { BrowserOpenURL } from "../../../wailsjs/runtime/runtime";
 
+let updateBannerDismissed = false;
+
 function formatNetworkHashRate(hps: number): string {
   if (!Number.isFinite(hps) || hps < 0) return "—";
   if (hps >= 1e18) return `${(hps / 1e18).toFixed(2)} EH/s`;
@@ -91,6 +93,7 @@ export function Overview() {
   const [syncProgress, setSyncProgress] = useState(0);
   const [syncState, setSyncState] = useState("INITIAL");
   const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [updateDismissed, setUpdateDismissed] = useState(updateBannerDismissed);
   const [protocolOutdated, setProtocolOutdated] = useState(false);
   const [networkVersion, setNetworkVersion] = useState("");
   const [networkHashPS, setNetworkHashPS] = useState<number | null>(null);
@@ -196,7 +199,7 @@ export function Overview() {
         </div>
       )}
 
-      {updateAvailable && !protocolOutdated && (
+      {updateAvailable && !protocolOutdated && !updateDismissed && (
         <div
           className="flex items-center gap-3 rounded-xl px-5 py-3"
           style={{
@@ -234,6 +237,18 @@ export function Overview() {
               </span>
             )}
           </div>
+          <button
+            type="button"
+            onClick={() => { updateBannerDismissed = true; setUpdateDismissed(true); }}
+            className="flex-shrink-0 rounded-md p-1 transition-opacity hover:opacity-80"
+            style={{ background: "rgba(255,255,255,0.12)" }}
+            aria-label="Dismiss update banner"
+          >
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="#fef2f2" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
       )}
 

@@ -59,6 +59,7 @@ func TestBuildTransactionBasic(t *testing.T) {
 		utxos,
 		100, // coinbase maturity
 		100, // tip height
+		0,   // no minimum relay fee
 	)
 	if err != nil {
 		t.Fatalf("BuildTransaction: %v", err)
@@ -117,6 +118,7 @@ func TestBuildTransactionSignatureVerifies(t *testing.T) {
 		utxos,
 		100,
 		100,
+		0,
 	)
 	if err != nil {
 		t.Fatalf("BuildTransaction: %v", err)
@@ -144,6 +146,7 @@ func TestBuildTransactionMultipleInputs(t *testing.T) {
 		utxos,
 		100,
 		100,
+		0,
 	)
 	if err != nil {
 		t.Fatalf("BuildTransaction: %v", err)
@@ -180,6 +183,7 @@ func TestBuildTransactionInsufficientFunds(t *testing.T) {
 		utxos,
 		100,
 		100,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected insufficient funds error")
@@ -199,6 +203,7 @@ func TestBuildTransactionZeroAmount(t *testing.T) {
 		utxos,
 		100,
 		100,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error for zero amount")
@@ -215,6 +220,7 @@ func TestBuildTransactionInvalidAddress(t *testing.T) {
 		utxos,
 		100,
 		100,
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error for invalid address")
@@ -229,7 +235,7 @@ func TestBuildTransactionDustChange(t *testing.T) {
 	// Fee at 1 sat/byte = 192 sats
 	// If we send (value - 192 - 500) where 500 < DustThreshold, change should be dropped.
 	value := uint64(100_000)
-	fee1out := uint64(192) // estimated fee with 1 output
+	fee1out := uint64(192)              // estimated fee with 1 output
 	sendAmount := value - fee1out - 100 // 100 sats change (below dust threshold of 546)
 	utxos := makeTestUTXOs(w, []uint64{value}, 1)
 
@@ -242,6 +248,7 @@ func TestBuildTransactionDustChange(t *testing.T) {
 		utxos,
 		100,
 		100,
+		0,
 	)
 	if err != nil {
 		t.Fatalf("BuildTransaction: %v", err)
@@ -280,6 +287,7 @@ func TestBuildTransactionCoinbaseMaturity(t *testing.T) {
 		utxos,
 		100, // coinbase maturity
 		100, // tip height
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected error for immature coinbase")
@@ -311,12 +319,44 @@ func TestBuildTransactionMatureCoinbase(t *testing.T) {
 		utxos,
 		100,
 		200,
+		0,
 	)
 	if err != nil {
 		t.Fatalf("BuildTransaction: %v", err)
 	}
 	if len(tx.Inputs) != 1 {
 		t.Fatalf("expected 1 input, got %d", len(tx.Inputs))
+	}
+}
+
+func TestBuildTransactionMinRelayFee(t *testing.T) {
+	w := makeTestWallet(t)
+	utxos := makeTestUTXOs(w, []uint64{100_000_000}, 1)
+
+	dest := makeTestWallet(t)
+	destAddr := dest.GetDefaultAddress()
+
+	// At 1 sat/byte with 1 input + 2 outputs, fee-rate fee = 226 sats.
+	// With minRelayFee=1000, fee must be bumped to 1000.
+	tx, err := w.BuildTransaction(
+		SendRequest{ToAddress: destAddr, Amount: 50_000_000},
+		1,
+		utxos,
+		100,
+		100,
+		1000,
+	)
+	if err != nil {
+		t.Fatalf("BuildTransaction: %v", err)
+	}
+
+	var totalOut uint64
+	for _, out := range tx.Outputs {
+		totalOut += out.Value
+	}
+	fee := utxos[0].Value - totalOut
+	if fee < 1000 {
+		t.Fatalf("fee %d is below minRelayFee 1000", fee)
 	}
 }
 

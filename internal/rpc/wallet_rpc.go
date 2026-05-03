@@ -67,6 +67,7 @@ type WalletInterface interface {
 		utxos []wallet.UnspentOutput,
 		coinbaseMaturity uint32,
 		tipHeight uint32,
+		minRelayFee uint64,
 	) (*types.Transaction, error)
 
 	SignRawTransaction(
@@ -144,7 +145,7 @@ func (s *Server) handleGetBalance(w http.ResponseWriter, r *http.Request) {
 	)
 
 	writeJSON(w, map[string]interface{}{
-		"balance":                                balance,
+		"balance":                               balance,
 		"balance_" + coinparams.DisplayUnitName: float64(balance) / coinparams.CoinsPerBaseUnit,
 	})
 }
@@ -180,14 +181,14 @@ func (s *Server) handleListUnspent(w http.ResponseWriter, r *http.Request) {
 		}
 		txHashType := types.Hash(u.TxHash)
 		results = append(results, map[string]interface{}{
-			"txid":                                  txHashType.ReverseString(),
-			"vout":                                  u.Index,
-			"address":                               u.Address,
-			"scriptPubKey":                          hex.EncodeToString(u.PkScript),
-			"amount":                                u.Value,
+			"txid":                                 txHashType.ReverseString(),
+			"vout":                                 u.Index,
+			"address":                              u.Address,
+			"scriptPubKey":                         hex.EncodeToString(u.PkScript),
+			"amount":                               u.Value,
 			"amount_" + coinparams.DisplayUnitName: float64(u.Value) / coinparams.CoinsPerBaseUnit,
-			"confirmations":                         u.Confirmations,
-			"spendable":                             true,
+			"confirmations":                        u.Confirmations,
+			"spendable":                            true,
 		})
 	}
 
@@ -227,6 +228,7 @@ func (s *Server) handleSendToAddress(w http.ResponseWriter, r *http.Request) {
 		utxos,
 		s.params.CoinbaseMaturity,
 		tipHeight,
+		s.params.MinRelayTxFee,
 	)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -292,19 +294,19 @@ func (s *Server) handleGetWalletInfo(w http.ResponseWriter, r *http.Request) {
 	)
 
 	resp := map[string]interface{}{
-		"walletname":                              "default",
-		"walletversion":                           1,
-		"balance":                                 balance,
-		"balance_" + coinparams.DisplayUnitName:  float64(balance) / coinparams.CoinsPerBaseUnit,
-		"unconfirmed_balance":                     unconfirmed - balance,
-		"txcount":              0,
-		"keypoolsize":          s.wallet.KeyCount(),
-		"paytxfee":             s.feePerByte.Load(),
-		"hdseedid":             s.wallet.GetDefaultAddress(),
-		"private_keys_enabled": true,
-		"unlocked_until":       0,
-		"encrypted":            s.wallet.IsEncrypted(),
-		"locked":               s.wallet.IsLocked(),
+		"walletname":                            "default",
+		"walletversion":                         1,
+		"balance":                               balance,
+		"balance_" + coinparams.DisplayUnitName: float64(balance) / coinparams.CoinsPerBaseUnit,
+		"unconfirmed_balance":                   unconfirmed - balance,
+		"txcount":                               0,
+		"keypoolsize":                           s.wallet.KeyCount(),
+		"paytxfee":                              s.feePerByte.Load(),
+		"hdseedid":                              s.wallet.GetDefaultAddress(),
+		"private_keys_enabled":                  true,
+		"unlocked_until":                        0,
+		"encrypted":                             s.wallet.IsEncrypted(),
+		"locked":                                s.wallet.IsLocked(),
 	}
 	if s.wallet.IsEncrypted() {
 		if s.wallet.IsLocked() {
@@ -384,14 +386,14 @@ func (s *Server) handleListTransactions(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		results = append(results, map[string]interface{}{
-			"address":                                u.Address,
-			"category":                               category,
-			"amount":                                 u.Value,
-			"amount_" + coinparams.DisplayUnitName:  float64(u.Value) / coinparams.CoinsPerBaseUnit,
-			"confirmations":                          u.Confirmations,
-			"txid":                                   txHashType.ReverseString(),
-			"vout":                                   u.Index,
-			"blockheight":                            u.Height,
+			"address":                              u.Address,
+			"category":                             category,
+			"amount":                               u.Value,
+			"amount_" + coinparams.DisplayUnitName: float64(u.Value) / coinparams.CoinsPerBaseUnit,
+			"confirmations":                        u.Confirmations,
+			"txid":                                 txHashType.ReverseString(),
+			"vout":                                 u.Index,
+			"blockheight":                          u.Height,
 		})
 	}
 
@@ -501,7 +503,7 @@ func (s *Server) handleGetReceivedByAddress(w http.ResponseWriter, r *http.Reque
 	})
 
 	writeJSON(w, map[string]interface{}{
-		"amount":                                total,
+		"amount":                               total,
 		"amount_" + coinparams.DisplayUnitName: float64(total) / coinparams.CoinsPerBaseUnit,
 	})
 }

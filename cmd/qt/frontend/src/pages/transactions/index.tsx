@@ -3,17 +3,19 @@ import { useCoinInfo } from "@/hooks/useCoinInfo";
 import { ListTransactions, GetAddressBook } from "../../../wailsjs/go/main/App";
 import type { WalletTransaction } from "@/lib/types";
 
-type FilterTab = "all" | "immature" | "confirmed";
+type FilterTab = "all" | "immature" | "confirmed" | "sent";
 
 function categoryLabel(cat: string): string {
   if (cat === "generate") return "Mined";
   if (cat === "immature") return "Immature";
+  if (cat === "send") return "Sent";
   return "Received";
 }
 
 function categoryColor(cat: string): string {
   if (cat === "generate") return "var(--color-btc-green)";
   if (cat === "immature") return "var(--color-btc-gold)";
+  if (cat === "send") return "var(--color-btc-red)";
   return "var(--color-btc-blue)";
 }
 
@@ -35,27 +37,45 @@ function CopyIcon({ size = 12 }: { size?: number }) {
   );
 }
 
-function MaturityBar({ progress, confirmations, target }: { progress: number; confirmations: number; target: number }) {
-  const pct = Math.min(progress * 100, 100);
-  const mature = confirmations >= target;
-  return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 flex-1 overflow-hidden rounded-full" style={{ background: "var(--color-btc-deep)", minWidth: 60 }}>
-        <div
-          className="h-full rounded-full transition-all duration-500"
-          style={{
-            width: `${pct}%`,
-            background: mature ? "var(--color-btc-green)" : "linear-gradient(90deg, var(--color-btc-gold) 0%, var(--color-btc-gold-light) 100%)",
-          }}
-        />
-      </div>
+function MaturityBadge({ status, progress, confirmations, target }: {
+  status: string; progress: number; confirmations: number; target: number;
+}) {
+  if (status === "mempool") {
+    return (
       <span
-        className="text-[10px] font-mono tabular-nums"
-        style={{ color: mature ? "var(--color-btc-green)" : "var(--color-btc-text-muted)", minWidth: "4.5ch", textAlign: "right" }}
+        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+        style={{ background: "rgba(247, 147, 26, 0.12)", color: "var(--color-btc-gold)", border: "1px solid rgba(247, 147, 26, 0.25)" }}
       >
-        {confirmations}/{target}
+        <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full" style={{ background: "var(--color-btc-gold)" }} />
+        Mempool
       </span>
-    </div>
+    );
+  }
+
+  if (status === "unverified") {
+    const pct = Math.min(progress * 100, 100);
+    return (
+      <div className="flex items-center gap-2">
+        <div className="h-1.5 flex-1 overflow-hidden rounded-full" style={{ background: "var(--color-btc-deep)", minWidth: 50 }}>
+          <div
+            className="h-full rounded-full transition-all duration-500"
+            style={{ width: `${pct}%`, background: "linear-gradient(90deg, var(--color-btc-gold) 0%, var(--color-btc-gold-light) 100%)" }}
+          />
+        </div>
+        <span className="text-[10px] font-mono tabular-nums" style={{ color: "var(--color-btc-text-muted)", minWidth: "5ch", textAlign: "right" }}>
+          {confirmations}/{target}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <span
+      className="inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+      style={{ background: "rgba(63, 185, 80, 0.12)", color: "var(--color-btc-green)", border: "1px solid rgba(63, 185, 80, 0.25)" }}
+    >
+      Verified
+    </span>
   );
 }
 
@@ -83,6 +103,7 @@ export function Transactions() {
             isCoinbase: !!r.isCoinbase,
             maturityProgress: Number(r.maturityProgress || 0),
             maturityTarget: Number(r.maturityTarget || 0),
+            maturityStatus: (r.maturityStatus as WalletTransaction["maturityStatus"]) || "verified",
           }));
           setTxs(parsed);
           setLoading(false);
@@ -105,7 +126,8 @@ export function Transactions() {
   const byCategory = useMemo(() => {
     if (filter === "all") return txs;
     if (filter === "immature") return txs.filter((t) => t.category === "immature");
-    return txs.filter((t) => t.category !== "immature");
+    if (filter === "sent") return txs.filter((t) => t.category === "send");
+    return txs.filter((t) => t.category !== "immature" && t.category !== "send");
   }, [txs, filter]);
 
   const filtered = useMemo(() => {
@@ -125,10 +147,12 @@ export function Transactions() {
   }, [byCategory, search, labels]);
 
   const immatureCount = useMemo(() => txs.filter((t) => t.category === "immature").length, [txs]);
-  const confirmedCount = useMemo(() => txs.filter((t) => t.category !== "immature").length, [txs]);
+  const sentCount = useMemo(() => txs.filter((t) => t.category === "send").length, [txs]);
+  const confirmedCount = useMemo(() => txs.filter((t) => t.category !== "immature" && t.category !== "send").length, [txs]);
 
   const tabs: { key: FilterTab; label: string; count: number }[] = [
     { key: "all", label: "All", count: txs.length },
+    { key: "sent", label: "Sent", count: sentCount },
     { key: "immature", label: "Immature", count: immatureCount },
     { key: "confirmed", label: "Confirmed", count: confirmedCount },
   ];
@@ -254,8 +278,8 @@ export function Transactions() {
 
                   {/* Amount */}
                   <div className="text-right">
-                    <span className="font-mono text-xs font-bold tabular-nums" style={{ color: "var(--color-btc-text)" }}>
-                      {tx.amount.toFixed(coinInfo.decimals > 4 ? 4 : coinInfo.decimals)}
+                    <span className="font-mono text-xs font-bold tabular-nums" style={{ color: tx.amount < 0 ? "var(--color-btc-red)" : "var(--color-btc-text)" }}>
+                      {tx.amount < 0 ? "" : "+"}{tx.amount.toFixed(coinInfo.decimals > 4 ? 4 : coinInfo.decimals)}
                     </span>
                     <span className="ml-1 text-[10px]" style={{ color: "var(--color-btc-gold)" }}>{coinInfo.ticker}</span>
                   </div>
@@ -273,9 +297,9 @@ export function Transactions() {
                     <span
                       className="inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
                       style={{
-                        background: tx.category === "generate" ? "rgba(63, 185, 80, 0.12)" : tx.category === "immature" ? "rgba(247, 147, 26, 0.12)" : "rgba(88, 166, 255, 0.12)",
+                        background: tx.category === "generate" ? "rgba(63, 185, 80, 0.12)" : tx.category === "immature" ? "rgba(247, 147, 26, 0.12)" : tx.category === "send" ? "rgba(248, 81, 73, 0.12)" : "rgba(88, 166, 255, 0.12)",
                         color: categoryColor(tx.category),
-                        border: `1px solid ${tx.category === "generate" ? "rgba(63, 185, 80, 0.25)" : tx.category === "immature" ? "rgba(247, 147, 26, 0.25)" : "rgba(88, 166, 255, 0.25)"}`,
+                        border: `1px solid ${tx.category === "generate" ? "rgba(63, 185, 80, 0.25)" : tx.category === "immature" ? "rgba(247, 147, 26, 0.25)" : tx.category === "send" ? "rgba(248, 81, 73, 0.25)" : "rgba(88, 166, 255, 0.25)"}`,
                       }}
                     >
                       {categoryLabel(tx.category)}
@@ -284,11 +308,12 @@ export function Transactions() {
 
                   {/* Maturity */}
                   <div>
-                    {tx.isCoinbase ? (
-                      <MaturityBar progress={tx.maturityProgress} confirmations={tx.confirmations} target={tx.maturityTarget} />
-                    ) : (
-                      <span className="text-[10px]" style={{ color: "var(--color-btc-text-dim)" }}>&mdash;</span>
-                    )}
+                    <MaturityBadge
+                      status={tx.maturityStatus}
+                      progress={tx.maturityProgress}
+                      confirmations={tx.confirmations}
+                      target={tx.maturityTarget}
+                    />
                   </div>
                 </div>
               );

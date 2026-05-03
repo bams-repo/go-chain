@@ -48,12 +48,12 @@ type App struct {
 	opts node.Options
 
 	// Cached P2P port probe result, refreshed periodically in the background.
-	probeMu     sync.RWMutex
-	probeOpen   bool
-	probeIP     string
-	probePort   string
-	probeError  string
-	probeReady  bool // true once the first probe has completed
+	probeMu    sync.RWMutex
+	probeOpen  bool
+	probeIP    string
+	probePort  string
+	probeError string
+	probeReady bool // true once the first probe has completed
 
 	// Address book: user-assigned labels for any address (own or external).
 	addrBookMu   sync.RWMutex
@@ -324,9 +324,9 @@ func (a *App) GetBalance() (map[string]interface{}, error) {
 	}, nil
 }
 
-// ListTransactions returns wallet transaction history derived from the UTXO set.
-// Each entry includes category (receive/generate/immature), amount, confirmations,
-// and maturity progress for coinbase outputs.
+// ListTransactions returns wallet transaction history derived from the UTXO set
+// and the mempool. Each entry includes category, amount, confirmations, and
+// maturity status (mempool / unverified / verified).
 func (a *App) ListTransactions() ([]map[string]interface{}, error) {
 	if a.node == nil {
 		return nil, fmt.Errorf("node not initialized")
@@ -335,6 +335,7 @@ func (a *App) ListTransactions() ([]map[string]interface{}, error) {
 	bc := a.node.Chain()
 	_, tipHeight := bc.Tip()
 	cbMaturity := a.node.Params().CoinbaseMaturity
+	addrVer := w.AddressVersion()
 
 	iter := func(fn func(txHash [32]byte, index uint32, value uint64, pkScript []byte, height uint32, isCoinbase bool)) {
 		bc.UtxoSet().ForEach(func(txHash types.Hash, index uint32, entry *utxo.UtxoEntry) {
@@ -349,11 +350,13 @@ func (a *App) ListTransactions() ([]map[string]interface{}, error) {
 		txHash := types.Hash(u.TxHash)
 		category := "receive"
 		maturityProgress := 1.0
+		maturityStatus := "verified"
 		if u.IsCoinbase {
 			if u.Confirmations >= cbMaturity {
 				category = "generate"
 			} else {
 				category = "immature"
+				maturityStatus = "unverified"
 				if cbMaturity > 0 {
 					maturityProgress = float64(u.Confirmations) / float64(cbMaturity)
 				}
@@ -371,14 +374,95 @@ func (a *App) ListTransactions() ([]map[string]interface{}, error) {
 			"isCoinbase":       u.IsCoinbase,
 			"maturityProgress": maturityProgress,
 			"maturityTarget":   cbMaturity,
+			"maturityStatus":   maturityStatus,
 		})
 	}
 
-	// Sort by height descending (newest first), then by vout.
+	// Scan mempool for wallet-related transactions (unconfirmed).
+	mp := a.node.Mempool()
+	for _, entry := range mp.GetAllEntries() {
+		tx := entry.Tx
+		txHashReverse := entry.Hash.ReverseString()
+
+		// Check outputs that pay to our wallet.
+		for outIdx, out := range tx.Outputs {
+			if !w.IsOurScript(out.PkScript) {
+				continue
+			}
+			hashBytes := crypto.ExtractP2PKHHash(out.PkScript)
+			addr := ""
+			if hashBytes != nil {
+				var pkh [crypto.PubKeyHashSize]byte
+				copy(pkh[:], hashBytes)
+				addr = crypto.PubKeyHashToAddress(pkh, addrVer)
+			}
+
+			results = append(results, map[string]interface{}{
+				"txid":             txHashReverse,
+				"vout":             uint32(outIdx),
+				"address":          addr,
+				"category":         "receive",
+				"amount":           float64(out.Value) / float64(coinparams.CoinsPerBaseUnit),
+				"confirmations":    uint32(0),
+				"blockheight":      uint32(0),
+				"isCoinbase":       false,
+				"maturityProgress": 0.0,
+				"maturityTarget":   cbMaturity,
+				"maturityStatus":   "mempool",
+			})
+		}
+
+		// Check inputs that spend our UTXOs — these represent sends.
+		var sendTotal uint64
+		var destAddr string
+		isSend := false
+		for _, in := range tx.Inputs {
+			utxoEntry := bc.UtxoSet().Get(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
+			if utxoEntry != nil && w.IsOurScript(utxoEntry.PkScript) {
+				isSend = true
+			}
+		}
+		if isSend {
+			for _, out := range tx.Outputs {
+				if !w.IsOurScript(out.PkScript) {
+					sendTotal += out.Value
+					hashBytes := crypto.ExtractP2PKHHash(out.PkScript)
+					if hashBytes != nil && destAddr == "" {
+						var pkh [crypto.PubKeyHashSize]byte
+						copy(pkh[:], hashBytes)
+						destAddr = crypto.PubKeyHashToAddress(pkh, addrVer)
+					}
+				}
+			}
+			if sendTotal > 0 {
+				results = append(results, map[string]interface{}{
+					"txid":             txHashReverse,
+					"vout":             uint32(0),
+					"address":          destAddr,
+					"category":         "send",
+					"amount":           -float64(sendTotal) / float64(coinparams.CoinsPerBaseUnit),
+					"confirmations":    uint32(0),
+					"blockheight":      uint32(0),
+					"isCoinbase":       false,
+					"maturityProgress": 0.0,
+					"maturityTarget":   cbMaturity,
+					"maturityStatus":   "mempool",
+				})
+			}
+		}
+	}
+
+	// Sort: mempool (height 0) first, then by height descending, then by vout.
 	sort.Slice(results, func(i, j int) bool {
 		hi := results[i]["blockheight"].(uint32)
 		hj := results[j]["blockheight"].(uint32)
 		if hi != hj {
+			if hi == 0 {
+				return true
+			}
+			if hj == 0 {
+				return false
+			}
 			return hi > hj
 		}
 		return results[i]["vout"].(uint32) < results[j]["vout"].(uint32)
@@ -698,19 +782,19 @@ func (a *App) GetPeerList() ([]map[string]interface{}, error) {
 	result := make([]map[string]interface{}, len(infos))
 	for i, p := range infos {
 		result[i] = map[string]interface{}{
-			"addr":      p.Addr,
-			"addrLocal": p.AddrLocal,
-			"subver":    p.SubVer,
-			"version":   p.Version,
-			"inbound":   p.Inbound,
-			"connTime":  p.ConnTime,
-			"lastSend":  p.LastSend,
-			"lastRecv":  p.LastRecv,
-			"bytesSent": p.BytesSent,
-			"bytesRecv": p.BytesRecv,
-			"pingTime":  p.PingTime,
+			"addr":           p.Addr,
+			"addrLocal":      p.AddrLocal,
+			"subver":         p.SubVer,
+			"version":        p.Version,
+			"inbound":        p.Inbound,
+			"connTime":       p.ConnTime,
+			"lastSend":       p.LastSend,
+			"lastRecv":       p.LastRecv,
+			"bytesSent":      p.BytesSent,
+			"bytesRecv":      p.BytesRecv,
+			"pingTime":       p.PingTime,
 			"startingHeight": p.StartingHeight,
-			"banScore":  p.BanScore,
+			"banScore":       p.BanScore,
 		}
 	}
 	return result, nil
@@ -1496,6 +1580,7 @@ func (a *App) SendToAddress(address string, amountFloat float64) (map[string]int
 		utxos,
 		a.node.Params().CoinbaseMaturity,
 		tipHeight,
+		a.node.Params().MinRelayTxFee,
 	)
 	if err != nil {
 		return nil, err

@@ -36,13 +36,15 @@ type SendRequest struct {
 
 // BuildTransaction creates, signs, and returns a transaction that sends the
 // specified amount to the destination address, with automatic coin selection
-// and change output generation.
+// and change output generation. minRelayFee is the minimum absolute fee
+// required for mempool admission; the computed fee is bumped up if needed.
 func (w *HDWallet) BuildTransaction(
 	req SendRequest,
 	feePerByte uint64,
 	utxos []UnspentOutput,
 	coinbaseMaturity uint32,
 	tipHeight uint32,
+	minRelayFee uint64,
 ) (*types.Transaction, error) {
 	if err := w.RequireUnlocked(); err != nil {
 		return nil, err
@@ -73,7 +75,7 @@ func (w *HDWallet) BuildTransaction(
 	})
 
 	// Estimate fee for a 1-output (no change) transaction, then iterate.
-	selectedInputs, totalIn, err := selectCoins(spendable, req.Amount, feePerByte)
+	selectedInputs, totalIn, err := selectCoins(spendable, req.Amount, feePerByte, minRelayFee)
 	if err != nil {
 		return nil, err
 	}
@@ -103,9 +105,12 @@ func (w *HDWallet) BuildTransaction(
 		PkScript: destScript,
 	})
 
-	// Calculate fee and change.
+	// Calculate fee and change, ensuring we meet the minimum relay fee.
 	estimatedSize := txOverhead + len(selectedInputs)*estimatedInputSize + 1*estimatedOutputSize
 	fee := uint64(estimatedSize) * feePerByte
+	if fee < minRelayFee {
+		fee = minRelayFee
+	}
 	if fee < 1 {
 		fee = 1
 	}
@@ -138,6 +143,9 @@ func (w *HDWallet) BuildTransaction(
 		// Recalculate fee with the change output.
 		estimatedSize = txOverhead + len(selectedInputs)*estimatedInputSize + len(tx.Outputs)*estimatedOutputSize
 		fee = uint64(estimatedSize) * feePerByte
+		if fee < minRelayFee {
+			fee = minRelayFee
+		}
 		if fee < 1 {
 			fee = 1
 		}
@@ -168,7 +176,7 @@ func (w *HDWallet) BuildTransaction(
 
 // selectCoins implements a simple largest-first coin selection algorithm.
 // Returns selected UTXOs, total input value, or error if insufficient funds.
-func selectCoins(utxos []UnspentOutput, targetAmount uint64, feePerByte uint64) ([]UnspentOutput, uint64, error) {
+func selectCoins(utxos []UnspentOutput, targetAmount uint64, feePerByte uint64, minRelayFee uint64) ([]UnspentOutput, uint64, error) {
 	var selected []UnspentOutput
 	var totalIn uint64
 
@@ -179,6 +187,9 @@ func selectCoins(utxos []UnspentOutput, targetAmount uint64, feePerByte uint64) 
 		// Estimate fee with current number of inputs + 2 outputs (dest + change).
 		estimatedSize := txOverhead + len(selected)*estimatedInputSize + 2*estimatedOutputSize
 		fee := uint64(estimatedSize) * feePerByte
+		if fee < minRelayFee {
+			fee = minRelayFee
+		}
 		if fee < 1 {
 			fee = 1
 		}
