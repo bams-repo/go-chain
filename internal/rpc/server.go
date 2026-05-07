@@ -668,6 +668,9 @@ func (s *Server) handleGetConnectionCount(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleAddNode(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) {
+		return
+	}
 	addr := r.URL.Query().Get("node")
 	if addr == "" {
 		writeError(w, http.StatusBadRequest, "missing node parameter")
@@ -681,6 +684,9 @@ func (s *Server) handleAddNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDisconnectNode(w http.ResponseWriter, r *http.Request) {
+	if !requirePOST(w, r) {
+		return
+	}
 	addr := r.URL.Query().Get("address")
 	if addr == "" {
 		writeError(w, http.StatusBadRequest, "missing address parameter")
