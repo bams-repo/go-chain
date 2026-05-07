@@ -23,6 +23,8 @@ import (
 func main() {
 	rpcConnect := flag.String("rpcconnect", "127.0.0.1", "RPC server host")
 	rpcPort := flag.String("rpcport", "19445", "RPC server port")
+	rpcUser := flag.String("rpcuser", "", "RPC username for HTTP Basic Auth")
+	rpcPassword := flag.String("rpcpassword", "", "RPC password for HTTP Basic Auth")
 	printVer := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -47,7 +49,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	resp, err := http.Get(baseURL + endpoint)
+	req, err := http.NewRequest(http.MethodGet, baseURL+endpoint, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if *rpcUser != "" || *rpcPassword != "" {
+		req.SetBasicAuth(*rpcUser, *rpcPassword)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: Could not connect to the server %s\n", baseURL)
 		fmt.Fprintf(os.Stderr, "       Is %s running?\n", coinparams.DaemonName)
@@ -338,6 +349,8 @@ func printUsage() {
 	fmt.Println("Options:")
 	fmt.Println("  -rpcconnect=<ip>    Connect to RPC at <ip> (default: 127.0.0.1)")
 	fmt.Println("  -rpcport=<port>     Connect to RPC on <port> (default: 19445)")
+	fmt.Println("  -rpcuser=<user>     RPC username for HTTP Basic Auth")
+	fmt.Println("  -rpcpassword=<pass> RPC password for HTTP Basic Auth")
 	fmt.Println("  -version            Print version and exit")
 	fmt.Println()
 	fmt.Println("Blockchain commands:")
