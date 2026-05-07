@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -41,13 +42,13 @@ func main() {
 	command := strings.ToLower(args[0])
 	params := args[1:]
 
-	endpoint, err := resolveEndpoint(command, params)
+	reqSpec, err := resolveRequest(command, params)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	resp, err := http.Get(baseURL + endpoint)
+	resp, err := doRequest(baseURL, reqSpec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: Could not connect to the server %s\n", baseURL)
 		fmt.Fprintf(os.Stderr, "       Is %s running?\n", coinparams.DaemonName)
@@ -76,81 +77,94 @@ func main() {
 	formatOutput(body)
 }
 
-func resolveEndpoint(command string, params []string) (string, error) {
+type requestSpec struct {
+	Method   string
+	Endpoint string
+	Form     url.Values
+}
+
+func resolveRequest(command string, params []string) (requestSpec, error) {
+	post := func(endpoint string, form url.Values) (requestSpec, error) {
+		return requestSpec{Method: http.MethodPost, Endpoint: endpoint, Form: form}, nil
+	}
+	get := func(endpoint string) (requestSpec, error) {
+		return requestSpec{Method: http.MethodGet, Endpoint: endpoint}, nil
+	}
+
 	switch command {
 
 	// --- Blockchain ---
 	case "getblockchaininfo":
-		return "/getblockchaininfo", nil
+		return get("/getblockchaininfo")
 	case "getblockcount":
-		return "/getblockcount", nil
+		return get("/getblockcount")
 	case "getbestblockhash":
-		return "/getbestblockhash", nil
+		return get("/getbestblockhash")
 	case "getblockhash":
 		if len(params) < 1 {
-			return "", fmt.Errorf("getblockhash requires <height>")
+			return requestSpec{}, fmt.Errorf("getblockhash requires <height>")
 		}
-		return "/getblockhash?height=" + url.QueryEscape(params[0]), nil
+		return get("/getblockhash?height=" + url.QueryEscape(params[0]))
 	case "getblock":
 		if len(params) < 1 {
-			return "", fmt.Errorf("getblock requires <hash>")
+			return requestSpec{}, fmt.Errorf("getblock requires <hash>")
 		}
-		return "/getblock?hash=" + url.QueryEscape(params[0]), nil
+		return get("/getblock?hash=" + url.QueryEscape(params[0]))
 	case "getblockbyheight":
 		if len(params) < 1 {
-			return "", fmt.Errorf("getblockbyheight requires <height>")
+			return requestSpec{}, fmt.Errorf("getblockbyheight requires <height>")
 		}
-		return "/getblockbyheight?height=" + url.QueryEscape(params[0]), nil
+		return get("/getblockbyheight?height=" + url.QueryEscape(params[0]))
 	case "getdifficulty":
-		return "/getdifficulty", nil
+		return get("/getdifficulty")
 
 	// --- Network ---
 	case "getnetworkinfo":
-		return "/getnetworkinfo", nil
+		return get("/getnetworkinfo")
 	case "getpeerinfo":
-		return "/getpeerinfo", nil
+		return get("/getpeerinfo")
 	case "getconnectioncount":
-		return "/getconnectioncount", nil
+		return get("/getconnectioncount")
 	case "addnode":
 		if len(params) < 1 {
-			return "", fmt.Errorf("addnode requires <ip:port>")
+			return requestSpec{}, fmt.Errorf("addnode requires <ip:port>")
 		}
-		return "/addnode?node=" + url.QueryEscape(params[0]), nil
+		return post("/addnode", url.Values{"node": []string{params[0]}})
 	case "disconnectnode":
 		if len(params) < 1 {
-			return "", fmt.Errorf("disconnectnode requires <address>")
+			return requestSpec{}, fmt.Errorf("disconnectnode requires <address>")
 		}
-		return "/disconnectnode?address=" + url.QueryEscape(params[0]), nil
+		return post("/disconnectnode", url.Values{"address": []string{params[0]}})
 
 	// --- Mempool ---
 	case "getmempoolinfo":
-		return "/getmempoolinfo", nil
+		return get("/getmempoolinfo")
 	case "getrawmempool":
 		verbose := ""
 		if len(params) > 0 && params[0] == "true" {
 			verbose = "?verbose=true"
 		}
-		return "/getrawmempool" + verbose, nil
+		return get("/getrawmempool" + verbose)
 	case "getmempoolentry":
 		if len(params) < 1 {
-			return "", fmt.Errorf("getmempoolentry requires <txid>")
+			return requestSpec{}, fmt.Errorf("getmempoolentry requires <txid>")
 		}
-		return "/getmempoolentry?txid=" + url.QueryEscape(params[0]), nil
+		return get("/getmempoolentry?txid=" + url.QueryEscape(params[0]))
 
 	// --- UTXO ---
 	case "gettxout":
 		if len(params) < 2 {
-			return "", fmt.Errorf("gettxout requires <txid> <n>")
+			return requestSpec{}, fmt.Errorf("gettxout requires <txid> <n>")
 		}
-		return "/gettxout?txid=" + url.QueryEscape(params[0]) + "&n=" + url.QueryEscape(params[1]), nil
+		return get("/gettxout?txid=" + url.QueryEscape(params[0]) + "&n=" + url.QueryEscape(params[1]))
 	case "gettxoutsetinfo":
-		return "/gettxoutsetinfo", nil
+		return get("/gettxoutsetinfo")
 
 	// --- Mining ---
 	case "getblocktemplate":
-		return "/getblocktemplate", nil
+		return get("/getblocktemplate")
 	case "getmininginfo":
-		return "/getmininginfo", nil
+		return get("/getmininginfo")
 	case "getnetworkhashps":
 		q := "/getnetworkhashps"
 		if len(params) > 0 {
@@ -164,148 +178,159 @@ func resolveEndpoint(command string, params []string) (string, error) {
 			}
 			q += "height=" + url.QueryEscape(params[1])
 		}
-		return q, nil
+		return get(q)
 	case "getrawtransaction":
 		if len(params) < 1 {
-			return "", fmt.Errorf("getrawtransaction requires <txid> [verbose]")
+			return requestSpec{}, fmt.Errorf("getrawtransaction requires <txid> [verbose]")
 		}
 		q := "/getrawtransaction?txid=" + url.QueryEscape(params[0])
 		if len(params) > 1 && (params[1] == "true" || params[1] == "1") {
 			q += "&verbose=true"
 		}
-		return q, nil
+		return get(q)
 	case "submitblock":
-		return "", fmt.Errorf("submitblock requires POST — use curl or the RPC directly")
+		return requestSpec{}, fmt.Errorf("submitblock requires POST with raw binary/hex payload — use curl or JSON-RPC")
 
 	// --- Control ---
 	case "getinfo":
-		return "/getinfo", nil
+		return get("/getinfo")
 	case "stop":
-		return "/stop", nil
+		return post("/stop", url.Values{})
 	case "help":
 		printUsage()
 		os.Exit(0)
-		return "", nil
+		return requestSpec{}, nil
 
 	// --- Wallet ---
 	case "getnewaddress":
-		return "/getnewaddress", nil
+		return post("/getnewaddress", url.Values{})
 	case "getbalance":
 		minconf := "1"
 		if len(params) > 0 {
 			minconf = params[0]
 		}
-		return "/getbalance?minconf=" + url.QueryEscape(minconf), nil
+		return post("/getbalance", url.Values{"minconf": []string{minconf}})
 	case "listunspent":
-		q := "/listunspent"
+		form := url.Values{}
 		if len(params) >= 1 {
-			q += "?minconf=" + url.QueryEscape(params[0])
+			form.Set("minconf", params[0])
 		}
 		if len(params) >= 2 {
-			if strings.Contains(q, "?") {
-				q += "&"
-			} else {
-				q += "?"
-			}
-			q += "maxconf=" + url.QueryEscape(params[1])
+			form.Set("maxconf", params[1])
 		}
-		return q, nil
+		return post("/listunspent", form)
 	case "sendtoaddress":
 		if len(params) < 2 {
-			return "", fmt.Errorf("sendtoaddress requires <address> <amount>")
+			return requestSpec{}, fmt.Errorf("sendtoaddress requires <address> <amount>")
 		}
-		return "/sendtoaddress?address=" + url.QueryEscape(params[0]) + "&amount=" + url.QueryEscape(params[1]), nil
+		return post("/sendtoaddress", url.Values{"address": []string{params[0]}, "amount": []string{params[1]}})
 	case "getwalletinfo":
-		return "/getwalletinfo", nil
+		return post("/getwalletinfo", url.Values{})
 	case "dumpprivkey":
 		if len(params) < 1 {
-			return "", fmt.Errorf("dumpprivkey requires <address>")
+			return requestSpec{}, fmt.Errorf("dumpprivkey requires <address>")
 		}
-		return "/dumpprivkey?address=" + url.QueryEscape(params[0]), nil
+		return post("/dumpprivkey", url.Values{"address": []string{params[0]}})
 	case "importprivkey":
 		if len(params) < 1 {
-			return "", fmt.Errorf("importprivkey requires <privkey>")
+			return requestSpec{}, fmt.Errorf("importprivkey requires <privkey>")
 		}
-		return "/importprivkey?privkey=" + url.QueryEscape(params[0]), nil
+		return post("/importprivkey", url.Values{"privkey": []string{params[0]}})
 	case "validateaddress":
 		if len(params) < 1 {
-			return "", fmt.Errorf("validateaddress requires <address>")
+			return requestSpec{}, fmt.Errorf("validateaddress requires <address>")
 		}
-		return "/validateaddress?address=" + url.QueryEscape(params[0]), nil
+		return post("/validateaddress", url.Values{"address": []string{params[0]}})
 	case "getrawchangeaddress":
-		return "/getrawchangeaddress", nil
+		return post("/getrawchangeaddress", url.Values{})
 	case "settxfee":
 		if len(params) < 1 {
-			return "", fmt.Errorf("settxfee requires <amount>")
+			return requestSpec{}, fmt.Errorf("settxfee requires <amount>")
 		}
-		return "/settxfee?amount=" + url.QueryEscape(params[0]), nil
+		return post("/settxfee", url.Values{"amount": []string{params[0]}})
 	case "sendrawtransaction":
 		if len(params) < 1 {
-			return "", fmt.Errorf("sendrawtransaction requires <hexstring>")
+			return requestSpec{}, fmt.Errorf("sendrawtransaction requires <hexstring>")
 		}
-		return "/sendrawtransaction?hexstring=" + url.QueryEscape(params[0]), nil
+		return post("/sendrawtransaction", url.Values{"hexstring": []string{params[0]}})
 	case "dumpwallet":
-		return "/dumpwallet", nil
+		return post("/dumpwallet", url.Values{})
 	case "signrawtransactionwithwallet":
 		if len(params) < 1 {
-			return "", fmt.Errorf("signrawtransactionwithwallet requires <hexstring>")
+			return requestSpec{}, fmt.Errorf("signrawtransactionwithwallet requires <hexstring>")
 		}
-		return "/signrawtransactionwithwallet?hexstring=" + url.QueryEscape(params[0]), nil
+		return post("/signrawtransactionwithwallet", url.Values{"hexstring": []string{params[0]}})
 	case "getreceivedbyaddress":
 		if len(params) < 1 {
-			return "", fmt.Errorf("getreceivedbyaddress requires <address> [minconf]")
+			return requestSpec{}, fmt.Errorf("getreceivedbyaddress requires <address> [minconf]")
 		}
-		q := "/getreceivedbyaddress?address=" + url.QueryEscape(params[0])
+		form := url.Values{"address": []string{params[0]}}
 		if len(params) >= 2 {
-			q += "&minconf=" + url.QueryEscape(params[1])
+			form.Set("minconf", params[1])
 		}
-		return q, nil
+		return post("/getreceivedbyaddress", form)
 	case "listaddressgroupings":
-		return "/listaddressgroupings", nil
+		return post("/listaddressgroupings", url.Values{})
 	case "backupwallet":
 		if len(params) < 1 {
-			return "", fmt.Errorf("backupwallet requires <destination>")
+			return requestSpec{}, fmt.Errorf("backupwallet requires <destination>")
 		}
-		return "/backupwallet?destination=" + url.QueryEscape(params[0]), nil
+		return post("/backupwallet", url.Values{"destination": []string{params[0]}})
 	case "getaddressesbylabel":
-		return "/getaddressesbylabel", nil
+		return post("/getaddressesbylabel", url.Values{})
 	case "listtransactions":
-		q := "/listtransactions"
+		form := url.Values{}
 		if len(params) > 0 {
-			q += "?count=" + url.QueryEscape(params[0])
+			form.Set("count", params[0])
 		}
-		return q, nil
+		return post("/listtransactions", form)
 	case "gettransaction":
 		if len(params) < 1 {
-			return "", fmt.Errorf("gettransaction requires <txid>")
+			return requestSpec{}, fmt.Errorf("gettransaction requires <txid>")
 		}
-		return "/gettransaction?txid=" + url.QueryEscape(params[0]), nil
+		return post("/gettransaction", url.Values{"txid": []string{params[0]}})
 	case "encryptwallet":
 		if len(params) < 1 {
-			return "", fmt.Errorf("encryptwallet requires <passphrase>")
+			return requestSpec{}, fmt.Errorf("encryptwallet requires <passphrase>")
 		}
-		return "/encryptwallet?passphrase=" + url.QueryEscape(params[0]), nil
+		return post("/encryptwallet", url.Values{"passphrase": []string{params[0]}})
 	case "walletpassphrase":
 		if len(params) < 1 {
-			return "", fmt.Errorf("walletpassphrase requires <passphrase> [timeout]")
+			return requestSpec{}, fmt.Errorf("walletpassphrase requires <passphrase> [timeout]")
 		}
-		q := "/walletpassphrase?passphrase=" + url.QueryEscape(params[0])
+		form := url.Values{"passphrase": []string{params[0]}}
 		if len(params) >= 2 {
-			q += "&timeout=" + url.QueryEscape(params[1])
+			form.Set("timeout", params[1])
 		}
-		return q, nil
+		return post("/walletpassphrase", form)
 	case "walletlock":
-		return "/walletlock", nil
+		return post("/walletlock", url.Values{})
 
 	// --- Chain-specific ---
 	case "getchainstatus":
-		return "/getchainstatus", nil
+		return get("/getchainstatus")
 	case "metrics":
-		return "/metrics", nil
+		return get("/metrics")
 
 	default:
-		return "", fmt.Errorf("unknown command: %s\nRun '%s help' for usage", command, coinparams.CLIName)
+		return requestSpec{}, fmt.Errorf("unknown command: %s\nRun '%s help' for usage", command, coinparams.CLIName)
 	}
+}
+
+func doRequest(baseURL string, reqSpec requestSpec) (*http.Response, error) {
+	if reqSpec.Method == http.MethodPost {
+		body := ""
+		if reqSpec.Form != nil {
+			body = reqSpec.Form.Encode()
+		}
+		req, err := http.NewRequest(http.MethodPost, baseURL+reqSpec.Endpoint, bytes.NewBufferString(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return http.DefaultClient.Do(req)
+	}
+	return http.Get(baseURL + reqSpec.Endpoint)
 }
 
 func formatOutput(body []byte) {
