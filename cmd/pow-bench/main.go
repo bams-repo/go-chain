@@ -57,7 +57,8 @@ func main() {
 		Nonce:      0,
 	}
 
-	engine := pow.New(sha256mem.NewChainHasher(mp), lwma.New())
+	activation := mp.ActivationHeights[sha256mem.ActivationKey]
+	engine := pow.New(sha256mem.NewChainHasher(activation), lwma.New())
 	benchHeight := uint32(1)
 	batchSize := uint64(32)
 
