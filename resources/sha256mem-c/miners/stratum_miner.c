@@ -1,15 +1,20 @@
 /*
  * sha256mem Stratum GPU Miner — Fairchain pool mining
  * ====================================================
- * Connects to a Stratum v1 pool (e.g. suprnova.cc) and mines sha256mem
- * using the TMTO checkpoint kernel for maximum throughput.
+ * Connects to Stratum v1 and mines sha256mem v2 with the TMTO OpenCL kernel.
+ *
+ * Default pool is the in-wallet stratum server (Fairchain-Qt: Mining →
+ * start stratum, default port 3333). Override with -o / -u / -p.
  *
  * Build:
  *   make stratum_miner
  *
- * Run:
+ * Run (defaults = local wallet stratum):
+ *   ./stratum_miner
+ *
+ * Run (public pool example):
  *   ./stratum_miner -o stratum+tcp://fair.suprnova.cc:3833 \
- *                   -u 1KEW95MS47FbkgTeWKcQLsPPRJUUoiF2in -p x
+ *                   -u WALLET.worker -p x
  *
  * Copyright (c) 2024-2026 The Fairchain Contributors
  * Distributed under the MIT software license.
@@ -32,7 +37,7 @@
 #include <netdb.h>
 #include <openssl/sha.h>
 #include <jansson.h>
-#include "sha256mem.h"
+#include "sha256mem_v2.h"
 
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
@@ -674,8 +679,8 @@ static int stratum_submit(stratum_ctx *ctx, const char *worker,
 
 int main(int argc, char **argv)
 {
-    const char *pool_url = "stratum+tcp://fair.suprnova.cc:3833";
-    const char *worker_name = "1KEW95MS47FbkgTeWKcQLsPPRJUUoiF2in";
+    const char *pool_url = "stratum+tcp://127.0.0.1:3333";
+    const char *worker_name = "tmto";
     const char *password = "x";
     int num_workers = 0;
 
@@ -689,7 +694,10 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--workers") == 0 && i+1 < argc)
             num_workers = atoi(argv[++i]);
         else {
-            fprintf(stderr, "Usage: %s [-o URL] [-u WALLET] [-p PASS] [--workers N]\n", argv[0]);
+            fprintf(stderr,
+                    "Usage: %s [-o stratum+tcp://HOST:PORT] [-u WORKER] [-p PASS] [--workers N]\n"
+                    "  Defaults: -o stratum+tcp://127.0.0.1:3333 -u tmto -p x (Fairchain-Qt stratum)\n",
+                    argv[0]);
             return 1;
         }
     }
@@ -699,7 +707,8 @@ int main(int argc, char **argv)
 
     /* Parse pool URL: stratum+tcp://host:port */
     char pool_host[256] = {0};
-    int pool_port = 3833;
+    /* Fairchain wallet stratum default; used when URL has no :port */
+    int pool_port = 3333;
     {
         const char *h = pool_url;
         if (strncmp(h, "stratum+tcp://", 14) == 0) h += 14;
@@ -713,6 +722,8 @@ int main(int argc, char **argv)
                 pool_host[hlen] = '\0';
             }
             pool_port = atoi(colon + 1);
+            if (pool_port <= 0)
+                pool_port = 3333;
         } else {
             strncpy(pool_host, h, sizeof(pool_host) - 1);
         }
@@ -785,7 +796,7 @@ int main(int argc, char **argv)
     if (err != CL_SUCCESS) { fprintf(stderr, "create queue: %d\n", err); return 1; }
 
     size_t src_len;
-    char *src = load_kernel_source("sha256mem_v4_tmto_gpu.cl", &src_len);
+    char *src = load_kernel_source("opencl/sha256mem_v2_tmto_gpu.cl", &src_len);
     cl_program prog = clCreateProgramWithSource(ctx_cl, 1, (const char **)&src, &src_len, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "create program: %d\n", err); return 1; }
 
@@ -927,7 +938,7 @@ reconnect:
             /* Debug: compare sha256mem vs sha256d for nonce=0 */
             {
                 uint8_t cpu_hash[32], sha256d_hash[32];
-                sha256mem_hash(header, 80, cpu_hash);
+                sha256mem_v2_hash(header, 80, cpu_hash);
                 double_sha256(header, 80, sha256d_hash);
                 printf("  sha256mem(n=0): ");
                 for (int i = 0; i < 8; i++) printf("%02x", cpu_hash[i]);
@@ -947,6 +958,8 @@ reconnect:
             clock_gettime(CLOCK_MONOTONIC, &job_start);
 
             while (g_running && !found_share) {
+                int restart_job = 0;
+
                 /* Check for new work from pool */
                 int poll_flags = stratum_poll(&sctx);
                 if ((poll_flags & STRATUM_POLL_JOB) && sctx.job.clean) {
@@ -999,7 +1012,7 @@ reconnect:
                     uint8_t submit_header[80], cpu_submit_hash[32];
                     memcpy(submit_header, header, sizeof(submit_header));
                     write_le32(submit_header + 76, winning_nonce);
-                    sha256mem_hash(submit_header, 80, cpu_submit_hash);
+                    sha256mem_v2_hash(submit_header, 80, cpu_submit_hash);
                     printf("  CPU check: nonce_bytes=%02x%02x%02x%02x hash=",
                            submit_header[76], submit_header[77],
                            submit_header[78], submit_header[79]);
@@ -1018,9 +1031,12 @@ reconnect:
 
                             const char *method = json_string_value(json_object_get(resp, "method"));
                             if (method) {
-                                if (strcmp(method, "mining.notify") == 0)
+                                if (strcmp(method, "mining.notify") == 0) {
                                     handle_mining_notify(&sctx, json_object_get(resp, "params"));
-                                else if (strcmp(method, "mining.set_difficulty") == 0) {
+                                    if (sctx.job.clean) {
+                                        restart_job = 1;
+                                    }
+                                } else if (strcmp(method, "mining.set_difficulty") == 0) {
                                     handle_set_difficulty(&sctx, json_object_get(resp, "params"));
                                     cur_job.difficulty = sctx.difficulty;
                                     share_diff = sctx.difficulty;
@@ -1030,6 +1046,7 @@ reconnect:
                                     printf("  Updated target for diff=%g  target[7]=0x%08x\n", share_diff, target[7]);
                                 }
                                 json_decref(resp);
+                                if (restart_job) break;
                                 continue;
                             }
 
@@ -1053,6 +1070,12 @@ reconnect:
                             json_decref(resp);
                             break;
                         }
+                    }
+
+                    if (restart_job) {
+                        printf("  Clean job received; switching from job=%s to job=%s\n",
+                               cur_job.job_id, sctx.job.job_id);
+                        break;
                     }
 
                     found_share = 0;

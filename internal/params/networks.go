@@ -242,6 +242,8 @@ var Testnet = &ChainParams{
 		"locktime":      1,
 		"mindiffblocks": 1,
 		"timewarp":      1,
+		// sha256mem progression-harden variant (same algorithm name on the wire).
+		"sha256mem": 85000,
 	},
 }
 

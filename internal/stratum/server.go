@@ -22,6 +22,7 @@ import (
 
 	"github.com/bams-repo/fairchain/internal/algorithms"
 	"github.com/bams-repo/fairchain/internal/chain"
+	"github.com/bams-repo/fairchain/internal/consensus"
 	"github.com/bams-repo/fairchain/internal/crypto"
 	"github.com/bams-repo/fairchain/internal/logging"
 	"github.com/bams-repo/fairchain/internal/mempool"
@@ -161,6 +162,7 @@ type Server struct {
 	chain        *chain.Chain
 	mempool      *mempool.Mempool
 	params       *params.ChainParams
+	engine       consensus.Engine
 	hasher       algorithms.Hasher
 	rewardScript []byte
 
@@ -190,13 +192,14 @@ type Server struct {
 }
 
 // New creates a new stratum server. onBlock is called when a valid block is mined.
-func New(cfg Config, c *chain.Chain, mp *mempool.Mempool, p *params.ChainParams, hasher algorithms.Hasher, rewardScript []byte, onBlock func(*types.Block)) *Server {
+func New(cfg Config, c *chain.Chain, mp *mempool.Mempool, p *params.ChainParams, engine consensus.Engine, rewardScript []byte, onBlock func(*types.Block)) *Server {
 	return &Server{
 		cfg:          cfg,
 		chain:        c,
 		mempool:      mp,
 		params:       p,
-		hasher:       hasher,
+		engine:       engine,
+		hasher:       engine.Hasher(),
 		rewardScript: rewardScript,
 		onBlock:      onBlock,
 		workers:      make(map[*worker]struct{}),
@@ -563,7 +566,30 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 		return
 	}
 
+	tipHashAtSubmit, tipHeightAtSubmit := s.chain.Tip()
 	isStale := j.id != currentJobID
+	staleReason := ""
+	if isStale {
+		staleReason = "superseded_job"
+	}
+	if tipHashAtSubmit != j.prevBlock {
+		isStale = true
+		staleReason = "tip_changed"
+	}
+	if staleReason == "tip_changed" && currentJobID == j.id {
+		logging.StratumDebug("submit: current job parent is stale; refreshing work",
+			"worker", w.name,
+			"job_id", jobID,
+			"job_height", j.height,
+			"job_prevblock", j.prevBlock.ReverseString(),
+			"tip_hash", tipHashAtSubmit.ReverseString(),
+			"tip_height", tipHeightAtSubmit,
+		)
+		go func() {
+			s.generateJob()
+			s.broadcastJob(true)
+		}()
+	}
 
 	// Decode submitted values
 	extranonce2, err := hex.DecodeString(extranonce2Hex)
@@ -598,6 +624,13 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 		"worker", w.name,
 		"job_id", jobID,
 		"stale", isStale,
+		"stale_reason", staleReason,
+		"job_height", j.height,
+		"job_prevblock", j.prevBlock.ReverseString(),
+		"tip_height", tipHeightAtSubmit,
+		"tip_hash", tipHashAtSubmit.ReverseString(),
+		"job_bits", fmt.Sprintf("0x%08x", j.bits),
+		"job_target", hex.EncodeToString(j.target[:]),
 		"extranonce1", w.subscribedExtranonce,
 		"extranonce2_hex", extranonce2Hex,
 		"ntime_hex", ntimeHex, "ntime_dec", ntime,
@@ -710,6 +743,10 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 		logging.StratumDebug("submit: comparison result",
 			"hash_le_share_target", hashMeetsShareTarget,
 			"hash_le_net_target", hashMeetsNetTarget,
+			"stale", isStale,
+			"stale_reason", staleReason,
+			"job_prevblock", j.prevBlock.ReverseString(),
+			"tip_hash", tipHashAtSubmit.ReverseString(),
 		)
 	}
 
@@ -723,13 +760,22 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 	// Stale shares that meet difficulty are still counted (ckpool behavior)
 	if isStale {
 		logging.StratumDebug("submit: stale share accepted (difficulty met)",
-			"worker", w.name, "job_id", jobID)
+			"worker", w.name,
+			"job_id", jobID,
+			"reason", staleReason,
+			"job_height", j.height,
+			"job_prevblock", j.prevBlock.ReverseString(),
+			"tip_height", tipHeightAtSubmit,
+			"tip_hash", tipHashAtSubmit.ReverseString(),
+			"hash_meets_net_target", hashMeetsNetTarget,
+		)
 	}
 
 	logging.StratumDebug("submit: ACCEPTED — valid share",
 		"worker", w.name,
 		"nonce", fmt.Sprintf("0x%08x", nonce),
 		"stale", isStale,
+		"stale_reason", staleReason,
 	)
 	w.sharesValid.Add(1)
 	now := time.Now()
@@ -774,6 +820,19 @@ func (s *Server) handleSubmit(w *worker, req *stratumRequest) {
 		if s.onBlock != nil {
 			s.onBlock(block)
 		}
+	} else if hashMeetsNetTarget && isStale {
+		blockHash := crypto.HashBlockHeader(&header)
+		logging.StratumDebug("submit: stale block candidate suppressed",
+			"worker", w.name,
+			"job_id", jobID,
+			"reason", staleReason,
+			"candidate_hash", blockHash.ReverseString(),
+			"candidate_height", j.height,
+			"candidate_prevblock", j.prevBlock.ReverseString(),
+			"tip_height", tipHeightAtSubmit,
+			"tip_hash", tipHashAtSubmit.ReverseString(),
+			"bits", fmt.Sprintf("0x%08x", j.bits),
+		)
 	}
 
 	s.sendJSON(w, stratumResponse{ID: req.ID, Result: true})
@@ -847,7 +906,16 @@ func (s *Server) generateJobInternal(clean bool) {
 		ts = tipHeader.Timestamp + 1
 	}
 
-	bits := tipHeader.Bits
+	header := &types.BlockHeader{
+		Version:   1,
+		PrevBlock: tipHash,
+		Timestamp: ts,
+	}
+	if err := s.engine.PrepareHeader(header, tipHeader, tipHeight, s.chain.GetAncestor, s.params); err != nil {
+		logging.L.Warn("stratum failed to prepare job header", "component", "stratum", "height", newHeight, "error", err)
+		return
+	}
+	bits := header.Bits
 	target := crypto.CompactToHash(bits)
 
 	s.jobCounter++

@@ -181,20 +181,20 @@ type Manager struct {
 
 	// Probe mechanism: pending probe requests awaiting a response from a peer.
 	// Keyed by nonce so the response can be routed back to the caller.
-	probeMu       sync.Mutex
-	probeWaiters  map[uint64]chan bool
+	probeMu      sync.Mutex
+	probeWaiters map[uint64]chan bool
 
 	// External address discovery (Bitcoin Core parity: addrlocal).
 	// When listening on 0.0.0.0, the node learns its routable IP from the
 	// AddrRecv field peers send in their version messages. A simple vote
 	// across peers prevents a single liar from poisoning our external addr.
 	externalAddrMu sync.RWMutex
-	externalAddr   string            // best-known routable IP:port
-	addrRecvVotes  map[string]int    // IP -> vote count from peers
+	externalAddr   string         // best-known routable IP:port
+	addrRecvVotes  map[string]int // IP -> vote count from peers
 
 	// Recently-relayed addresses: prevents addr relay amplification loops.
 	// An address relayed in the last 10 minutes is not relayed again.
-	recentRelayMu   sync.Mutex
+	recentRelayMu    sync.Mutex
 	recentRelayAddrs map[string]time.Time
 
 	ctx      context.Context
@@ -407,30 +407,30 @@ func NewManager(p *params.ChainParams, c *chain.Chain, mp *mempool.Mempool, ps s
 	headerIndex := c.NewHeaderIndex()
 
 	mgr := &Manager{
-		params:             p,
-		chain:              c,
-		mempool:            mp,
-		peerStore:          ps,
-		listenAddr:         listenAddr,
-		maxInbound:         maxIn,
-		maxOutbound:        maxOut,
-		seedPeers:          seeds,
-		timeSampler:        ts,
-		peers:              make(map[string]*Peer),
-		localNonce:         nonce,
-		manualPeers:        make(map[string]struct{}),
-		banned:             make(map[string]time.Time),
-		backoff:            make(map[string]time.Time),
-		backoffN:           make(map[string]int),
-		seedRetryNext:      make(map[string]time.Time),
-		seenBlocks:         newBoundedHashSet(maxSeenBlocks),
-		seenTxs:            newBoundedHashSet(maxSeenTxs),
-		lastSyncReqPerPeer: make(map[string]time.Time),
-		addrBudgetPerIP:    make(map[string]*addrBudget),
-		ibdBlockQueue:      make(chan *ibdBlockItem, 1024),
-		ibdQueueDone:       make(chan struct{}),
-		syncState:          SyncStateInitial,
-		headerIndex:        headerIndex,
+		params:                p,
+		chain:                 c,
+		mempool:               mp,
+		peerStore:             ps,
+		listenAddr:            listenAddr,
+		maxInbound:            maxIn,
+		maxOutbound:           maxOut,
+		seedPeers:             seeds,
+		timeSampler:           ts,
+		peers:                 make(map[string]*Peer),
+		localNonce:            nonce,
+		manualPeers:           make(map[string]struct{}),
+		banned:                make(map[string]time.Time),
+		backoff:               make(map[string]time.Time),
+		backoffN:              make(map[string]int),
+		seedRetryNext:         make(map[string]time.Time),
+		seenBlocks:            newBoundedHashSet(maxSeenBlocks),
+		seenTxs:               newBoundedHashSet(maxSeenTxs),
+		lastSyncReqPerPeer:    make(map[string]time.Time),
+		addrBudgetPerIP:       make(map[string]*addrBudget),
+		ibdBlockQueue:         make(chan *ibdBlockItem, 1024),
+		ibdQueueDone:          make(chan struct{}),
+		syncState:             SyncStateInitial,
+		headerIndex:           headerIndex,
 		legacyInFlight:        make(map[types.Hash]time.Time),
 		selfAddrs:             make(map[string]struct{}),
 		headerSyncFailedPeers: make(map[string]time.Time),
@@ -1380,18 +1380,18 @@ func (m *Manager) reconnectLoop(ctx context.Context) {
 						if outCount >= m.maxOutbound {
 							break
 						}
-					m.selfAddrsMu.RLock()
-					_, isSelf := m.selfAddrs[addr]
-					m.selfAddrsMu.RUnlock()
-					if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) && addr != m.listenAddr && !isSelf {
-						go m.connectPeer(ctx, addr)
-						connected[addr] = true
-						outCount++
+						m.selfAddrsMu.RLock()
+						_, isSelf := m.selfAddrs[addr]
+						m.selfAddrsMu.RUnlock()
+						if !connected[addr] && !m.IsBanned(addr) && m.canReconnect(addr) && addr != m.listenAddr && !isSelf {
+							go m.connectPeer(ctx, addr)
+							connected[addr] = true
+							outCount++
+						}
 					}
 				}
+				continue
 			}
-			continue
-		}
 
 			if outCount >= m.maxOutbound {
 				continue
@@ -1878,7 +1878,7 @@ func (m *Manager) sendVersion(peer *Peer) error {
 		Services:    1,
 		Timestamp:   time.Now().Unix(),
 		AddrRecv:    peer.Addr(),
-		AddrFrom:    m.ExternalAddr(),
+		AddrFrom:    m.addrFromForVersion(),
 		Nonce:       m.localNonce,
 		UserAgent:   version.UserAgent(),
 		StartHeight: height,
@@ -2007,6 +2007,17 @@ func (m *Manager) ExternalAddr() string {
 		return ext
 	}
 	return m.listenAddr
+}
+
+// addrFromForVersion returns the address to advertise in version.AddrFrom.
+// It intentionally stays empty until we have a routable public address; sending
+// 0.0.0.0, loopback, private, or ephemeral NAT endpoints pollutes peer stores.
+func (m *Manager) addrFromForVersion() string {
+	addr := m.ExternalAddr()
+	if validateGossipAddress(addr) != nil {
+		return ""
+	}
+	return addr
 }
 
 // checkPeerVersion extracts the semver from a peer's user agent and updates

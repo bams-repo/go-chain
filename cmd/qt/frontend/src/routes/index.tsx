@@ -13,6 +13,7 @@ import { Transactions } from "@/pages/transactions";
 import { ExplorerHome } from "@/pages/explorer/Home";
 import { ExplorerBlockPage } from "@/pages/explorer/BlockPage";
 import { ExplorerTxPage } from "@/pages/explorer/TxPage";
+import { ExplorerAddressPage } from "@/pages/explorer/AddressPage";
 
 export default function AppRoutes() {
   return (
@@ -30,6 +31,7 @@ export default function AppRoutes() {
           <Route path="/explorer" element={<ExplorerHome />} />
           <Route path="/explorer/block/:id" element={<ExplorerBlockPage />} />
           <Route path="/explorer/tx/:txid" element={<ExplorerTxPage />} />
+          <Route path="/explorer/address/:addr" element={<ExplorerAddressPage />} />
           <Route path="*" element={<Coming />} />
         </Route>
       </Route>

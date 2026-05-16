@@ -46,10 +46,10 @@ type Engine interface {
 	// being constructed for mining (e.g., sets bits).
 	PrepareHeader(header *types.BlockHeader, parent *types.BlockHeader, parentHeight uint32, getAncestor func(height uint32) *types.BlockHeader, p *params.ChainParams) error
 
-	// SealHeader attempts to find a valid nonce for the header.
+	// SealHeader attempts to find a valid nonce for the header at the given height.
 	// Returns true if a valid nonce was found within maxIterations.
 	// The header's Nonce field is updated in place.
-	SealHeader(header *types.BlockHeader, target types.Hash, maxIterations uint64) (bool, error)
+	SealHeader(header *types.BlockHeader, target types.Hash, height uint32, p *params.ChainParams, maxIterations uint64) (bool, error)
 
 	// CalcBlockWeight returns the consensus weight contributed by a single block.
 	// For PoW, this is the work implied by the header's difficulty bits.

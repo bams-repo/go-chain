@@ -69,7 +69,7 @@ func TestSealHeader(t *testing.T) {
 	}
 	target := crypto.CompactToHash(header.Bits)
 
-	found, err := engine.SealHeader(&header, target, 1000000)
+	found, err := engine.SealHeader(&header, target, 1, fcparams.Regtest, 1000000)
 	if err != nil {
 		t.Fatalf("SealHeader: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestValidateHeader(t *testing.T) {
 	}
 
 	target := crypto.CompactToHash(child.Bits)
-	found, _ := engine.SealHeader(&child, target, 10000000)
+	found, _ := engine.SealHeader(&child, target, 2, p, 10000000)
 	if !found {
 		t.Fatal("could not mine child block")
 	}
@@ -200,7 +200,7 @@ func TestValidateHeaderWrongBits(t *testing.T) {
 	}
 
 	easyTarget := crypto.CompactToHash(child.Bits)
-	found, _ := engine.SealHeader(&child, easyTarget, 10000000)
+	found, _ := engine.SealHeader(&child, easyTarget, 2, p, 10000000)
 	if !found {
 		t.Fatal("could not mine child with easy bits")
 	}

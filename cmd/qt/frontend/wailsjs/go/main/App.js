@@ -22,6 +22,10 @@ export function ExecuteRPC(arg1, arg2) {
   return window['go']['main']['App']['ExecuteRPC'](arg1, arg2);
 }
 
+export function ExplorerAddressIndex(arg1) {
+  return window['go']['main']['App']['ExplorerAddressIndex'](arg1);
+}
+
 export function ExplorerChainOverview() {
   return window['go']['main']['App']['ExplorerChainOverview']();
 }
@@ -40,6 +44,10 @@ export function ExplorerMempoolSlice(arg1) {
 
 export function ExplorerRecentBlocks(arg1) {
   return window['go']['main']['App']['ExplorerRecentBlocks'](arg1);
+}
+
+export function ExplorerRecentBlocksPage(arg1, arg2) {
+  return window['go']['main']['App']['ExplorerRecentBlocksPage'](arg1, arg2);
 }
 
 export function ExplorerSearch(arg1) {

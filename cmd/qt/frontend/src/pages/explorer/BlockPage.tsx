@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ExplorerGetBlock } from "../../../wailsjs/go/main/App";
 import { cardClass, cardStyle, CopyChip, ExplorerLink, shortHash } from "./shared";
+
+const TX_PAGE_SIZE = 40;
 
 export function ExplorerBlockPage() {
   const { id } = useParams<{ id: string }>();
@@ -9,6 +11,11 @@ export function ExplorerBlockPage() {
   const [block, setBlock] = useState<Record<string, unknown> | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [txPage, setTxPage] = useState(0);
+
+  useEffect(() => {
+    setTxPage(0);
+  }, [rawId]);
 
   useEffect(() => {
     if (!rawId) {
@@ -26,6 +33,22 @@ export function ExplorerBlockPage() {
       })
       .finally(() => setLoading(false));
   }, [rawId]);
+
+  const txids = useMemo(
+    () => (Array.isArray(block?.tx) ? (block!.tx as string[]) : []),
+    [block],
+  );
+
+  const txPageCount = Math.max(1, Math.ceil(txids.length / TX_PAGE_SIZE));
+
+  useEffect(() => {
+    if (txPage > txPageCount - 1) setTxPage(txPageCount - 1);
+  }, [txPage, txPageCount]);
+
+  const txSlice = useMemo(() => {
+    const start = txPage * TX_PAGE_SIZE;
+    return txids.slice(start, start + TX_PAGE_SIZE);
+  }, [txids, txPage]);
 
   if (loading) {
     return (
@@ -52,7 +75,6 @@ export function ExplorerBlockPage() {
   }
 
   const hash = String(block.hash || "");
-  const txids = Array.isArray(block.tx) ? (block.tx as string[]) : [];
   const prev = String(block.previousblockhash || "");
   const next = block.nextblockhash != null ? String(block.nextblockhash) : "";
 
@@ -123,11 +145,40 @@ export function ExplorerBlockPage() {
       </div>
 
       <div className={cardClass()} style={cardStyle()}>
-        <h2 className="mb-3 text-sm font-semibold" style={{ color: "var(--color-btc-text)" }}>
-          Transactions ({txids.length})
-        </h2>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold" style={{ color: "var(--color-btc-text)" }}>
+            Transactions ({txids.length})
+          </h2>
+          {txids.length > TX_PAGE_SIZE && (
+            <span className="text-[10px] uppercase tracking-wide" style={{ color: "var(--color-btc-text-dim)" }}>
+              Page {txPage + 1} / {txPageCount}
+            </span>
+          )}
+        </div>
+        {txids.length > TX_PAGE_SIZE && (
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={txPage <= 0}
+              onClick={() => setTxPage((p) => Math.max(0, p - 1))}
+              className="rounded-md border px-2.5 py-1 text-[11px] font-semibold disabled:opacity-40"
+              style={{ borderColor: "var(--color-btc-border)", color: "var(--color-btc-text)", background: "var(--color-btc-deep)" }}
+            >
+              ← Earlier in block
+            </button>
+            <button
+              type="button"
+              disabled={txPage >= txPageCount - 1}
+              onClick={() => setTxPage((p) => Math.min(txPageCount - 1, p + 1))}
+              className="rounded-md border px-2.5 py-1 text-[11px] font-semibold disabled:opacity-40"
+              style={{ borderColor: "var(--color-btc-border)", color: "var(--color-btc-text)", background: "var(--color-btc-deep)" }}
+            >
+              Later in block →
+            </button>
+          </div>
+        )}
         <ul className="space-y-1.5 font-mono text-xs">
-          {txids.map((txid) => (
+          {txSlice.map((txid) => (
             <li key={txid} className="flex flex-wrap items-center gap-2 break-all">
               <ExplorerLink to={`/explorer/tx/${encodeURIComponent(txid)}`}>{txid}</ExplorerLink>
             </li>

@@ -1,9 +1,8 @@
 /*
- * sha256mem GPU kernel — TMTO (checkpoint) variant, maximum throughput
- * =====================================================================
- * Consensus-equivalent to internal/algorithms/sha256mem/sha256mem.go.
- * Stores only SHA256 anchors every 128 slots (16384 x 32 B = 512 KiB per
- * hash) and recomputes ARX on demand via slot_at().
+ * sha256mem v2 GPU kernel — TMTO (checkpoint) variant
+ * ====================================================
+ * Equivalent to core/sha256mem_v2.c / sha256mem_v2_tmto.c.
+ * Progression harden (threshold 3) between checkpoints; 16384 mix rounds × 2.
  *
  * Key optimisations over the naive TMTO kernel:
  *   - SHA256 W-schedule uses only 16 registers (circular), not 64
@@ -19,7 +18,8 @@
 #define SLOTS           2097152u
 #define SLOTS_MASK      (SLOTS - 1u)
 #define HARDEN_IV       128u
-#define MIX_ROUNDS      32768
+#define MIX_ROUNDS      16384
+#define HARDEN_THRESH   3u
 #define CHECKPOINTS     (SLOTS / HARDEN_IV)
 
 /* ── SHA256 with 16-word circular W schedule ──────────────────────── */
@@ -100,6 +100,30 @@ inline void sha256_32(const uint *in, uint *out)
     for (int i=0;i<8;i++) out[i]=bs(st[i]);
 }
 
+/*
+ * Final PoW digest: SHA256(acc) then reverse all 32 bytes (matches Go
+ * types.Hash.Reversed() in sha256mem.PoWHash and sha256mem.c finalize).
+ */
+inline void sha256mem_powhash_le(const uint *acc, uint *out_le)
+{
+    uint fh_raw[8];
+    sha256_32(acc, fh_raw);
+    uchar fb[32];
+    for (int i = 0; i < 8; i++) {
+        uint w = fh_raw[i];
+        fb[i*4+0] = (uchar)(w & 0xFFu);
+        fb[i*4+1] = (uchar)((w >> 8) & 0xFFu);
+        fb[i*4+2] = (uchar)((w >> 16) & 0xFFu);
+        fb[i*4+3] = (uchar)((w >> 24) & 0xFFu);
+    }
+    uchar cons[32];
+    for (int j = 0; j < 32; j++)
+        cons[j] = fb[31 - j];
+    for (int i = 0; i < 8; i++)
+        out_le[i] = (uint)cons[i*4] | ((uint)cons[i*4+1] << 8) |
+                    ((uint)cons[i*4+2] << 16) | ((uint)cons[i*4+3] << 24);
+}
+
 /* SHA256(64 bytes native LE) -> 32 bytes native LE */
 inline void sha256_64(const uint *in, uint *out)
 {
@@ -149,6 +173,19 @@ inline void arx(uint *dst, const uint *src, uint idx)
     }
 }
 
+inline void progression_harden(uint *slot, uint idx)
+{
+    uint selector = slot[idx & 7u];
+    if (((selector ^ idx) & 255u) < HARDEN_THRESH) {
+        sha256_32(slot, slot);
+    } else {
+        uint next[8];
+        arx(next, slot, idx);
+        #pragma unroll
+        for (int w=0;w<8;w++) slot[w] = next[w];
+    }
+}
+
 /* ── Reconstruct mem[idx] from checkpoint table ───────────────────── */
 inline void slot_at(__global const uint *ck, uint idx, uint *out)
 {
@@ -172,7 +209,9 @@ inline void slot_at(__global const uint *ck, uint idx, uint *out)
         uint prev[8];
         #pragma unroll
         for (int w=0;w<8;w++) prev[w] = cur[w];
-        arx(cur, prev, j);
+        #pragma unroll
+        for (int w=0;w<8;w++) cur[w] = prev[w];
+        progression_harden(cur, j);
     }
     #pragma unroll
     for (int w=0;w<8;w++) out[w] = cur[w];
@@ -180,7 +219,7 @@ inline void slot_at(__global const uint *ck, uint idx, uint *out)
 
 /*
  * Build checkpoint table. Returns last slot (mem[SLOTS-1]) in last_slot.
- * Within each 128-interval only one SHA256 at the boundary, rest are ARX.
+ * SHA256 every 128 slots; progression harden between checkpoints.
  */
 inline void build_ck(__global uint *ck, const uint *seed, uint *last_slot)
 {
@@ -189,16 +228,21 @@ inline void build_ck(__global uint *ck, const uint *seed, uint *last_slot)
     for (int w=0;w<8;w++) { cur[w]=seed[w]; ck[w]=seed[w]; }
 
     for (uint i=1u; i<SLOTS; i++) {
-        uint prev[8];
-        #pragma unroll
-        for (int w=0;w<8;w++) prev[w]=cur[w];
         if ((i & 127u)==0u) {
+            uint prev[8];
+            #pragma unroll
+            for (int w=0;w<8;w++) prev[w]=cur[w];
             sha256_32(prev,cur);
             uint o=(i>>7)*8u;
             #pragma unroll
             for (int w=0;w<8;w++) ck[o+w]=cur[w];
         } else {
-            arx(cur,prev,i);
+            uint prev[8];
+            #pragma unroll
+            for (int w=0;w<8;w++) prev[w]=cur[w];
+            #pragma unroll
+            for (int w=0;w<8;w++) cur[w]=prev[w];
+            progression_harden(cur, i);
         }
     }
     #pragma unroll

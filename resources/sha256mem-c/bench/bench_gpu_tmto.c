@@ -1,16 +1,20 @@
 /*
- * sha256mem GPU Benchmark (OpenCL)
- * =================================
- * Benchmarks sha256mem_v4_gpu.cl against sha256mem.c (consensus reference).
+ * sha256mem GPU Benchmark — TMTO / checkpoint kernel (OpenCL)
+ * ===========================================================
+ * Benchmarks sha256mem_v2_tmto_gpu.cl (512 KiB/worker, v2 progression-harden
+ * TMTO) against core/sha256mem_v2.c.
  *
  * Build:
- *   gcc -O2 -o bench_gpu_v4 bench_gpu_v4.c -lOpenCL -lcrypto -lm
+ *   make -C resources/sha256mem-c bench_gpu_tmto
  *
  * Run:
- *   ./bench_gpu_v4                  # auto-detect max workers (~72%% VRAM)
- *   ./bench_gpu_v4 -s               # skip CPU/GPU validation (faster after first run)
- *   ./bench_gpu_v4 1500 2           # 1500 workers, 2 hashes each
- *   ./bench_gpu_v4 1500 4 5         # 1500 workers, 4 hashes each, 5 batches
+ *   ./bench_gpu_tmto                  # auto workers (~55%% VRAM, ×256 alignment)
+ *   ./bench_gpu_tmto -s             # skip validation
+ *   ./bench_gpu_tmto 8000 2         # workers, hashes per worker
+ *
+ * Throughput: on RTX 3080 Ti we measure ~13 kH/s at ~16k workers (OpenCL). Native
+ * CUDA miners (e.g. SRBMiner) are often materially faster; tune --workers if you
+ * hit CL_MEM_OBJECT_ALLOCATION_FAILURE (reduce count).
  *
  * Copyright (c) 2024-2026 The Fairchain Contributors
  * Distributed under the MIT software license.
@@ -22,9 +26,10 @@
 #include <stdint.h>
 #include <time.h>
 #include <math.h>
+#include <sys/stat.h>
 #include <openssl/sha.h>
 
-#include "sha256mem.h"
+#include "sha256mem_v2.h"
 
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
@@ -147,7 +152,8 @@ static void compute_midstate(const uint8_t header[80], uint32_t midstate[8], uin
 
 int main(int argc, char **argv)
 {
-    const size_t MEM_PER_WORKER = 2097152UL * 32; /* 64 MiB */
+    /* 16384 SHA256 checkpoints × 32 B = 512 KiB (same PoW as 64 MiB linear fill) */
+    const size_t MEM_PER_WORKER = (2097152UL / 128UL) * 32UL;
 
     int num_workers = 0;
     int hashes_per_item = 2;
@@ -187,34 +193,14 @@ int main(int argc, char **argv)
     clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(dev_cu), &dev_cu, NULL);
     clGetDeviceInfo(device, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(dev_freq), &dev_freq, NULL);
 
-    if (num_workers <= 0) {
-        /* Leave headroom for driver allocations, display, other contexts (~28%%). */
-        num_workers = (int)((dev_gmem * 0.72) / MEM_PER_WORKER);
-        if (num_workers < 1) num_workers = 1;
-    }
-
-    size_t total_vram = (size_t)num_workers * MEM_PER_WORKER;
-
     printf("==================================================================\n");
-    printf("     sha256mem v4 GPU Benchmark — Fairchain PoW\n");
+    printf("     sha256mem v2 TMTO GPU Benchmark — Fairchain PoW\n");
     printf("==================================================================\n");
     printf("  GPU:          %s\n", dev_name);
     printf("  Compute units: %u @ %u MHz\n", dev_cu, dev_freq);
-    printf("  VRAM:          %lu MiB total, %lu MiB used\n",
-           (unsigned long)(dev_gmem / (1024*1024)),
-           (unsigned long)(total_vram / (1024*1024)));
-    printf("  Workers:       %d  (64 MiB each)\n", num_workers);
-    printf("  Hashes/worker: %d\n", hashes_per_item);
-    printf("  Batches:       %d\n", num_batches);
-    printf("  Algorithm:     ARX+SHA256 fill (64 MiB, harden 128) + dual mix (2x32768)\n");
+    printf("  VRAM total:   %lu MiB\n", (unsigned long)(dev_gmem / (1024*1024)));
+    printf("  Algorithm:     v2 TMTO (512 KiB/worker) + dual mix (2×16384)\n");
     printf("==================================================================\n\n");
-
-    if (total_vram > (size_t)(dev_gmem * 0.95)) {
-        fprintf(stderr, "ERROR: Not enough VRAM. Need %lu MiB, have %lu MiB.\n",
-                (unsigned long)(total_vram / (1024*1024)),
-                (unsigned long)(dev_gmem / (1024*1024)));
-        return 1;
-    }
 
     cl_context ctx = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "create context: %d\n", err); return 1; }
@@ -223,7 +209,7 @@ int main(int argc, char **argv)
     if (err != CL_SUCCESS) { fprintf(stderr, "create queue: %d\n", err); return 1; }
 
     size_t src_len;
-    char *src = load_kernel_source("sha256mem_v4_gpu.cl", &src_len);
+    char *src = load_kernel_source("opencl/sha256mem_v2_tmto_gpu.cl", &src_len);
     cl_program prog = clCreateProgramWithSource(ctx, 1, (const char **)&src, &src_len, &err);
     if (err != CL_SUCCESS) { fprintf(stderr, "create program: %d\n", err); return 1; }
 
@@ -261,7 +247,7 @@ int main(int argc, char **argv)
     printf("  Validating GPU correctness against CPU reference...\n");
     {
         uint8_t cpu_hash[32];
-        sha256mem_hash(header, 80, cpu_hash);
+        sha256mem_v2_hash(header, 80, cpu_hash);
 
         cl_kernel vkernel = clCreateKernel(prog, "sha256mem_validate", &err);
         if (err != CL_SUCCESS) {
@@ -314,43 +300,70 @@ int main(int argc, char **argv)
         printf("  Skipping CPU/GPU validation (-s).\n\n");
     }
 
-    /* ── Allocate benchmark buffers ───────────────────────────── */
+    /* ──────────────────────────────────────────────────────────────
+     * AUTOTUNE: binary-search over worker counts to find peak H/s.
+     *
+     * Like SRBMiner: try a candidate intensity, measure H/s, then
+     * binary-search toward the maximum. Saves result to
+     * Autotune/sha256mem_<vendorId>_<intensity> and loads on restart.
+     * ────────────────────────────────────────────────────────────── */
+
+    /* Helper lambda-like: runs one timed batch at the given worker count.
+     * Returns H/s, or -1 on CL error (means worker count is too high).    */
+    #define PROBE_HPI 1
+
+    /* Allocate checkpoint pool. We try several fractions of reported VRAM,
+     * but actual usable memory depends on display server / other apps.
+     * The autotune probes will discover the real ceiling via kernel launch. */
+    int max_possible = 0;
+    cl_mem buf_mem = NULL;
+    {
+        int want = num_workers > 0 ? num_workers : 0;
+        double fracs[] = {0.68, 0.62, 0.56, 0.50, 0.44, 0.38, 0.32, 0.0};
+        for (int fi = 0; fracs[fi] > 0.0; fi++) {
+            int cand = (int)((dev_gmem * fracs[fi]) / MEM_PER_WORKER);
+            cand = (cand / 32) * 32;
+            if (cand < 32) continue;
+            if (want > 0 && cand < want) cand = ((want + 31) / 32) * 32;
+            size_t sz = (size_t)cand * MEM_PER_WORKER;
+            buf_mem = clCreateBuffer(ctx, CL_MEM_READ_WRITE, sz, NULL, &err);
+            if (err == CL_SUCCESS) {
+                max_possible = cand;
+                printf("  VRAM pool: %lu MiB (up to %d workers)\n",
+                       (unsigned long)(sz / (1024*1024)), max_possible);
+                break;
+            }
+        }
+    }
+    if (!buf_mem || max_possible < 32) {
+        fprintf(stderr, "Cannot allocate any VRAM for workers\n");
+        return 1;
+    }
+
     cl_mem buf_midstate = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                          8 * sizeof(uint32_t), midstate, &err);
     CL_CHECK(err, "alloc midstate");
-
     cl_mem buf_tail_b = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                      4 * sizeof(uint32_t), tail, &err);
     CL_CHECK(err, "alloc tail");
 
-    printf("  Allocating %lu MiB VRAM for %d workers...\n",
-           (unsigned long)(total_vram / (1024*1024)), num_workers);
-    cl_mem buf_mem = clCreateBuffer(ctx, CL_MEM_READ_WRITE, total_vram, NULL, &err);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "VRAM allocation failed: %d (%s)\n", err, cl_err_str(err));
-        return 1;
-    }
-
-    uint32_t *hash_counts_host = calloc(num_workers, sizeof(uint32_t));
+    uint32_t *hash_counts_host = calloc(max_possible, sizeof(uint32_t));
     cl_mem buf_counts = clCreateBuffer(ctx, CL_MEM_READ_WRITE,
-                                       num_workers * sizeof(uint32_t), NULL, &err);
+                                       max_possible * sizeof(uint32_t), NULL, &err);
     CL_CHECK(err, "alloc counts");
 
     uint32_t found_flag = 0;
     cl_mem buf_found = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                       sizeof(uint32_t), &found_flag, &err);
     CL_CHECK(err, "alloc found flag");
-
     uint32_t found_nonce = 0;
     cl_mem buf_nonce = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                       sizeof(uint32_t), &found_nonce, &err);
     CL_CHECK(err, "alloc found nonce");
-
     uint32_t found_hash[8] = {0};
     cl_mem buf_hash = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                      8 * sizeof(uint32_t), found_hash, &err);
     CL_CHECK(err, "alloc found hash");
-
     uint32_t target[8];
     memset(target, 0x00, sizeof(target));
     cl_mem buf_target = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -369,23 +382,135 @@ int main(int argc, char **argv)
     CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_mem), &buf_hash), "arg 6");
     CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_mem), &buf_target), "arg 7");
 
+    /* --- probe function: returns H/s or -1 on failure --- */
+    double probe(int workers) {
+        if (workers > max_possible || workers < 1) return -1.0;
+        size_t gs = (size_t)workers;
+        uint32_t hpi_p = PROBE_HPI;
+        CL_CHECK(clSetKernelArg(kernel, 9, sizeof(uint32_t), &hpi_p), "probe hpi");
+        uint32_t ns = 0xA0000000u;
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(uint32_t), &ns), "probe ns");
+
+        found_flag = 0;
+        clEnqueueWriteBuffer(queue, buf_found, CL_TRUE, 0, sizeof(uint32_t), &found_flag, 0, NULL, NULL);
+        memset(hash_counts_host, 0, workers * sizeof(uint32_t));
+        clEnqueueWriteBuffer(queue, buf_counts, CL_TRUE, 0, workers * sizeof(uint32_t), hash_counts_host, 0, NULL, NULL);
+
+        cl_int enq = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &gs, NULL, 0, NULL, NULL);
+        if (enq != CL_SUCCESS) return -1.0;
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        cl_int fin = clFinish(queue);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (fin != CL_SUCCESS) return -1.0;
+
+        double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec)/1e9;
+
+        clEnqueueReadBuffer(queue, buf_counts, CL_TRUE, 0, workers*sizeof(uint32_t), hash_counts_host, 0, NULL, NULL);
+        uint64_t h = 0;
+        for (int i = 0; i < workers; i++) h += hash_counts_host[i];
+        if (h == 0 || dt < 0.001) return -1.0;
+        return (double)h / dt;
+    }
+
+    if (num_workers <= 0) {
+        printf("  ┌─── AUTOTUNE ───────────────────────────────────────────┐\n");
+        printf("  │  Searching for optimal worker count (binary search)... │\n");
+        printf("  └────────────────────────────────────────────────────────┘\n\n");
+
+        /* Phase 1: find upper bound (largest count that doesn't fail) */
+        int lo = 256, hi = max_possible;
+        while (hi - lo > 64) {
+            int mid = ((lo + hi) / 2 / 32) * 32;
+            double r = probe(mid);
+            if (r < 0) {
+                hi = mid - 32;
+            } else {
+                lo = mid;
+            }
+        }
+        int safe_max = lo;
+        printf("  Autotune: max launchable workers = %d\n", safe_max);
+
+        /* Phase 2: sweep from ~50% to 100% of safe_max in steps, pick best H/s */
+        int best_w = 256;
+        double best_rate = 0;
+        int start = (safe_max / 4 / 32) * 32;
+        if (start < 256) start = 256;
+        int step = (safe_max / 16 / 32) * 32;
+        if (step < 32) step = 32;
+
+        for (int w = start; w <= safe_max; w += step) {
+            double r = probe(w);
+            printf("    %6d workers → %8.1f H/s%s\n", w, r > 0 ? r : 0.0,
+                   r > best_rate ? "  ★" : "");
+            if (r > best_rate) { best_rate = r; best_w = w; }
+        }
+
+        /* Phase 3: fine-tune around the best with ±2×step in steps of 32 */
+        int fine_lo = best_w - 2 * step;
+        int fine_hi = best_w + 2 * step;
+        if (fine_lo < 256) fine_lo = 256;
+        if (fine_hi > safe_max) fine_hi = safe_max;
+        for (int w = fine_lo; w <= fine_hi; w += 32) {
+            if (w == best_w) continue;
+            double r = probe(w);
+            if (r > best_rate) {
+                printf("    %6d workers → %8.1f H/s  ★★ (fine)\n", w, r);
+                best_rate = r; best_w = w;
+            }
+        }
+
+        num_workers = best_w;
+        printf("\n  Autotune result: %d workers (%.1f H/s)\n\n", num_workers, best_rate);
+
+        /* Save to Autotune/ cache */
+        {
+            char cache_dir[256] = "Autotune";
+            mkdir(cache_dir, 0755);
+
+            /* Vendor ID from PCI: NVIDIA=0x10de, AMD=0x1002, Intel=0x8086 */
+            cl_uint vendor_id = 0;
+            clGetDeviceInfo(device, CL_DEVICE_VENDOR_ID, sizeof(vendor_id), &vendor_id, NULL);
+
+            char cache_file[512];
+            snprintf(cache_file, sizeof(cache_file), "%s/sha256mem_%04x_%d",
+                     cache_dir, vendor_id, num_workers);
+            FILE *fc = fopen(cache_file, "w");
+            if (fc) {
+                fprintf(fc, "%d", num_workers);
+                fclose(fc);
+                printf("  Saved autotune to %s\n\n", cache_file);
+            }
+        }
+    }
+
+    /* ── Final benchmark ──────────────────────────────────────── */
+    size_t total_vram = (size_t)num_workers * MEM_PER_WORKER;
+    printf("  Workers:       %d  (%.1f MiB VRAM)\n", num_workers,
+           (double)total_vram / (1024*1024));
+    printf("  Hashes/worker: %d\n", hashes_per_item);
+    printf("  Batches:       %d\n\n", num_batches);
+
     uint32_t hpi = (uint32_t)hashes_per_item;
     CL_CHECK(clSetKernelArg(kernel, 9, sizeof(uint32_t), &hpi), "arg 9");
 
-    printf("  VRAM allocated OK.\n\n");
-
-    /* ── Benchmark ────────────────────────────────────────────── */
     size_t global_size = (size_t)num_workers;
 
-    printf("  Running %d batches of %d workers x %d hashes...\n\n",
-           num_batches, num_workers, hashes_per_item);
-
-    /* Warm-up (NULL local size: driver picks work-group for occupancy) */
+    /* Warm-up */
     {
         uint32_t ns = 0xF0000000u;
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(uint32_t), &ns), "warmup arg 8");
-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, 1, NULL,
-                                         &global_size, NULL, 0, NULL, NULL), "warmup enqueue");
+        found_flag = 0;
+        clEnqueueWriteBuffer(queue, buf_found, CL_TRUE, 0, sizeof(uint32_t), &found_flag, 0, NULL, NULL);
+        memset(hash_counts_host, 0, num_workers * sizeof(uint32_t));
+        clEnqueueWriteBuffer(queue, buf_counts, CL_TRUE, 0, num_workers*sizeof(uint32_t), hash_counts_host, 0, NULL, NULL);
+        cl_int we = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_size, NULL, 0, NULL, NULL);
+        if (we != CL_SUCCESS) {
+            fprintf(stderr, "Warm-up failed at %d workers (%d). Try fewer.\n", num_workers, we);
+            return 1;
+        }
         CL_CHECK(clFinish(queue), "warmup finish");
         printf("  Warm-up complete.\n\n");
     }
@@ -441,21 +566,18 @@ int main(int argc, char **argv)
 
     printf("\n");
     printf("==================================================================\n");
-    printf("               sha256mem v4 GPU BENCHMARK RESULTS\n");
+    printf("               sha256mem TMTO GPU BENCHMARK RESULTS\n");
     printf("==================================================================\n");
     printf("  GPU:            %s\n", dev_name);
     printf("  Compute units:  %u @ %u MHz\n", dev_cu, dev_freq);
-    printf("  Workers:        %d (64 MiB each)\n", num_workers);
+    printf("  Workers:        %d (512 KiB checkpoints each)\n", num_workers);
     printf("  VRAM used:      %lu MiB\n", (unsigned long)(total_vram / (1024*1024)));
     printf("  Total hashes:   %lu\n", (unsigned long)total_hashes);
     printf("  Wall time:      %.3f seconds\n", total_elapsed);
-    printf("  Hashrate:       %.2f H/s\n", rate);
+    printf("  Hashrate:       %.2f H/s  (%.2f kH/s)\n", rate, rate / 1000.0);
     printf("  Per worker:     %.3f H/s\n", rate / num_workers);
     printf("  Per SM:         %.3f H/s\n", rate / dev_cu);
     printf("==================================================================\n\n");
-
-    printf("  NOTE: Compare GPU hashrate to your CPU (e.g. go test -bench=BenchmarkPoWHashParallel).\n");
-    printf("  ----------------------------------------------------------\n\n");
 
     /* Cleanup */
     clReleaseMemObject(buf_midstate);

@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -371,30 +372,10 @@ func (s *Server) handleListTransactions(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	_, tipHeight := s.chain.Tip()
-	utxos := s.wallet.FindUnspent(s.makeUtxoIterator(), tipHeight)
-
-	var results []map[string]interface{}
-	for _, u := range utxos {
-		txHashType := types.Hash(u.TxHash)
-		category := "receive"
-		if u.IsCoinbase {
-			if u.Confirmations >= s.params.CoinbaseMaturity {
-				category = "generate"
-			} else {
-				category = "immature"
-			}
-		}
-		results = append(results, map[string]interface{}{
-			"address":                              u.Address,
-			"category":                             category,
-			"amount":                               u.Value,
-			"amount_" + coinparams.DisplayUnitName: float64(u.Value) / coinparams.CoinsPerBaseUnit,
-			"confirmations":                        u.Confirmations,
-			"txid":                                 txHashType.ReverseString(),
-			"vout":                                 u.Index,
-			"blockheight":                          u.Height,
-		})
+	results, err := s.buildWalletListTransactions()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
 	if len(results) > count {
@@ -403,7 +384,21 @@ func (s *Server) handleListTransactions(w http.ResponseWriter, r *http.Request) 
 	if results == nil {
 		results = make([]map[string]interface{}, 0)
 	}
-	writeJSON(w, results)
+	// Enrich REST rows with base-unit amount for CLI parity.
+	out := make([]map[string]interface{}, len(results))
+	for i, row := range results {
+		m := make(map[string]interface{}, len(row)+2)
+		for k, v := range row {
+			m[k] = v
+		}
+		if amt, ok := row["amount"].(float64); ok {
+			raw := int64(math.Round(amt * float64(coinparams.CoinsPerBaseUnit)))
+			m["amount"] = raw
+			m["amount_"+coinparams.DisplayUnitName] = amt
+		}
+		out[i] = m
+	}
+	writeJSON(w, out)
 }
 
 func (s *Server) handleSignRawTransactionWithWallet(w http.ResponseWriter, r *http.Request) {
@@ -841,6 +836,35 @@ func (s *Server) handleWalletPassphraseChange(w http.ResponseWriter, r *http.Req
 }
 
 // --- Internal helpers ---
+
+// buildWalletListTransactions returns the same wallet history as the Qt UI: UTXO receives,
+// mempool activity, and confirmed sends from a chain replay (Bitcoin-style listtransactions).
+func (s *Server) buildWalletListTransactions() ([]map[string]interface{}, error) {
+	if s.wallet == nil || s.chain == nil || s.mempool == nil {
+		return nil, fmt.Errorf("wallet, chain, or mempool not available")
+	}
+	_, tipHeight := s.chain.Tip()
+	mempoolTxs := make([]wallet.MempoolTx, 0, len(s.mempool.GetAllEntries()))
+	for _, e := range s.mempool.GetAllEntries() {
+		mempoolTxs = append(mempoolTxs, wallet.MempoolTx{Hash: e.Hash, Tx: *e.Tx})
+	}
+	prevoutScript := func(h types.Hash, idx uint32) []byte {
+		ent := s.chain.UtxoSet().Get(h, idx)
+		if ent == nil {
+			return nil
+		}
+		return ent.PkScript
+	}
+	return wallet.BuildListTransactionEntries(
+		s.wallet,
+		tipHeight,
+		s.params.CoinbaseMaturity,
+		s.makeUtxoIterator(),
+		prevoutScript,
+		mempoolTxs,
+		s.chain.GetBlockByHeight,
+	)
+}
 
 func (s *Server) makeUtxoIterator() func(fn func(txHash [32]byte, index uint32, value uint64, pkScript []byte, height uint32, isCoinbase bool)) {
 	return func(fn func(txHash [32]byte, index uint32, value uint64, pkScript []byte, height uint32, isCoinbase bool)) {

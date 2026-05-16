@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   ExplorerChainOverview,
   ExplorerMempoolSlice,
-  ExplorerRecentBlocks,
+  ExplorerRecentBlocksPage,
   ExplorerSearch,
 } from "../../../wailsjs/go/main/App";
 import { Button } from "@/components/ui/button";
@@ -14,10 +14,18 @@ type Overview = Record<string, unknown>;
 type BlockRow = Record<string, unknown>;
 type MempoolRow = Record<string, unknown>;
 
+const BLOCKS_PAGE_SIZE = 25;
+
 export function ExplorerHome() {
   const navigate = useNavigate();
   const [overview, setOverview] = useState<Overview | null>(null);
   const [blocks, setBlocks] = useState<BlockRow[]>([]);
+  const [blocksPage, setBlocksPage] = useState(0);
+  const [blocksMeta, setBlocksMeta] = useState<{ hasMoreOlder: boolean; hasNewer: boolean; tip: number }>({
+    hasMoreOlder: false,
+    hasNewer: false,
+    tip: 0,
+  });
   const [mempool, setMempool] = useState<MempoolRow[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [searchQ, setSearchQ] = useState("");
@@ -29,16 +37,23 @@ export function ExplorerHome() {
     setErr(null);
     Promise.all([
       ExplorerChainOverview(),
-      ExplorerRecentBlocks(30),
+      ExplorerRecentBlocksPage(blocksPage, BLOCKS_PAGE_SIZE),
       ExplorerMempoolSlice(40),
     ])
-      .then(([o, b, m]) => {
+      .then(([o, pageRes, m]) => {
         setOverview((o as Overview) || null);
-        setBlocks(Array.isArray(b) ? (b as BlockRow[]) : []);
+        const pr = (pageRes as Record<string, unknown>) || {};
+        const list = Array.isArray(pr.blocks) ? (pr.blocks as BlockRow[]) : [];
+        setBlocks(list);
+        setBlocksMeta({
+          hasMoreOlder: !!pr.has_more_older,
+          hasNewer: !!pr.has_newer,
+          tip: Number(pr.tip_height ?? 0),
+        });
         setMempool(Array.isArray(m) ? (m as MempoolRow[]) : []);
       })
       .catch((e: Error) => setErr(e.message || String(e)));
-  }, []);
+  }, [blocksPage]);
 
   useEffect(() => {
     load();
@@ -68,6 +83,9 @@ export function ExplorerHome() {
           const tx = res.transaction as Record<string, unknown> | undefined;
           const idTx = String(tx?.txid || q);
           navigate(`/explorer/tx/${encodeURIComponent(idTx)}`);
+        } else if (kind === "address") {
+          const a = String(res.address || q);
+          navigate(`/explorer/address/${encodeURIComponent(a)}`);
         }
       })
       .catch((e: Error) => setErr(e.message || String(e)))
@@ -80,7 +98,7 @@ export function ExplorerHome() {
         <Input
           value={searchQ}
           onChange={(ev) => setSearchQ(ev.target.value)}
-          placeholder="Block height, block hash, or transaction id…"
+          placeholder="Block height, hash, txid, or wallet address…"
           className="font-mono text-sm"
           style={{ borderColor: "var(--color-btc-border)", background: "var(--color-btc-deep)" }}
         />
@@ -149,12 +167,35 @@ export function ExplorerHome() {
 
       <div className="grid gap-6 lg:grid-cols-2">
         <div className={cardClass()} style={cardStyle()}>
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold" style={{ color: "var(--color-btc-text)" }}>
-              Recent blocks
+              Blocks
             </h2>
             <span className="text-[10px] uppercase tracking-wide" style={{ color: "var(--color-btc-text-dim)" }}>
-              Newest first
+              Tip {blocksMeta.tip} · page {blocksPage + 1}
+            </span>
+          </div>
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={!blocksMeta.hasNewer}
+              onClick={() => setBlocksPage((p) => Math.max(0, p - 1))}
+              className="rounded-md border px-2.5 py-1 text-[11px] font-semibold disabled:opacity-40"
+              style={{ borderColor: "var(--color-btc-border)", color: "var(--color-btc-text)", background: "var(--color-btc-deep)" }}
+            >
+              ← Newer
+            </button>
+            <button
+              type="button"
+              disabled={!blocksMeta.hasMoreOlder}
+              onClick={() => setBlocksPage((p) => p + 1)}
+              className="rounded-md border px-2.5 py-1 text-[11px] font-semibold disabled:opacity-40"
+              style={{ borderColor: "var(--color-btc-border)", color: "var(--color-btc-text)", background: "var(--color-btc-deep)" }}
+            >
+              Older →
+            </button>
+            <span className="text-[10px]" style={{ color: "var(--color-btc-text-muted)" }}>
+              {BLOCKS_PAGE_SIZE} per page toward genesis
             </span>
           </div>
           <div className="overflow-x-auto">

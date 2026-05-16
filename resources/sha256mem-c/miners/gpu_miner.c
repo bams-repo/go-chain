@@ -1,7 +1,7 @@
 /*
  * sha256mem GPU Miner — submits blocks to a Fairchain daemon
  * ============================================================
- * Uses sha256mem_v4_gpu.cl (linear 64 MiB) or sha256mem_v4_tmto_gpu.cl (--tmto,
+ * Uses opencl/sha256mem_v4_gpu.cl (linear 64 MiB) or opencl/sha256mem_v4_tmto_gpu.cl (--tmto,
  * consensus-equivalent time–memory tradeoff) to mine blocks
  * via the REST /submitblock endpoint.
  *
@@ -410,7 +410,7 @@ int main(int argc, char **argv)
 
     /* Linear: 64 MiB; TMTO: 16k checkpoints × 32 B = 512 KiB (same PoW) */
     const size_t MEM_PER_WORKER = use_tmto ? ((2097152UL / 128UL) * 32UL) : (2097152UL * 32);
-    const char *kernel_path = use_tmto ? "sha256mem_v4_tmto_gpu.cl" : "sha256mem_v4_gpu.cl";
+    const char *kernel_path = use_tmto ? "opencl/sha256mem_v4_tmto_gpu.cl" : "opencl/sha256mem_v4_gpu.cl";
 
     /* ── OpenCL setup ─────────────────────────────────────────── */
     cl_platform_id platform;

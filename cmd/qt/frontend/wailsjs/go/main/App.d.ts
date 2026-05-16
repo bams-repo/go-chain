@@ -11,6 +11,8 @@ export function CreateWallet():Promise<Record<string, any>>;
 
 export function ExecuteRPC(arg1:string,arg2:string):Promise<Record<string, any>>;
 
+export function ExplorerAddressIndex(arg1:string):Promise<Record<string, any>>;
+
 export function ExplorerChainOverview():Promise<Record<string, any>>;
 
 export function ExplorerGetBlock(arg1:string):Promise<Record<string, any>>;
@@ -20,6 +22,8 @@ export function ExplorerGetTransaction(arg1:string):Promise<Record<string, any>>
 export function ExplorerMempoolSlice(arg1:number):Promise<Array<Record<string, any>>>;
 
 export function ExplorerRecentBlocks(arg1:number):Promise<Array<Record<string, any>>>;
+
+export function ExplorerRecentBlocksPage(arg1:number,arg2:number):Promise<Record<string, any>>;
 
 export function ExplorerSearch(arg1:string):Promise<Record<string, any>>;
 

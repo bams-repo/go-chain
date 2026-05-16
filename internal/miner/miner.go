@@ -37,7 +37,7 @@ func (localClock) Now() int64 { return time.Now().Unix() }
 
 // countedSealer is implemented by engines that report actual hash counts.
 type countedSealer interface {
-	SealHeaderCounted(header *types.BlockHeader, target types.Hash, maxIterations uint64) (found bool, hashes uint64, err error)
+	SealHeaderCounted(header *types.BlockHeader, target types.Hash, height uint32, p *params.ChainParams, maxIterations uint64) (found bool, hashes uint64, err error)
 }
 
 // Miner builds block templates and searches for valid PoW solutions.
@@ -358,7 +358,7 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 
 		target := crypto.CompactToHash(header.Bits)
 
-		block, found := m.searchNonceSpace(ctx, header, target, txs, tipHash)
+		block, found := m.searchNonceSpace(ctx, header, target, txs, tipHash, newHeight)
 		if found {
 			return block, nil
 		}
@@ -370,7 +370,7 @@ func (m *Miner) MineOne(ctx context.Context) (*types.Block, error) {
 
 // searchNonceSpace splits the 32-bit nonce space across all workers and
 // returns the solved block if any worker finds a valid nonce.
-func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, target types.Hash, txs []types.Transaction, tipHash types.Hash) (*types.Block, bool) {
+func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, target types.Hash, txs []types.Transaction, tipHash types.Hash, height uint32) (*types.Block, bool) {
 	numWorkers := m.workers
 	rangeSize := uint64(0x100000000) / uint64(numWorkers)
 	// PoW hashes per SealHeader call before re-checking the chain tip.
@@ -423,7 +423,7 @@ func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, 
 				batchStart := time.Now()
 
 				if hasCountedSealer {
-					found, hashes, sealErr := cs.SealHeaderCounted(&wHeader, target, batch)
+					found, hashes, sealErr := cs.SealHeaderCounted(&wHeader, target, height, m.params, batch)
 					m.hashCount.Add(hashes)
 					if sealErr != nil {
 						return
@@ -437,7 +437,7 @@ func (m *Miner) searchNonceSpace(ctx context.Context, header types.BlockHeader, 
 						return
 					}
 				} else {
-					found, sealErr := m.engine.SealHeader(&wHeader, target, batch)
+					found, sealErr := m.engine.SealHeader(&wHeader, target, height, m.params, batch)
 					m.hashCount.Add(batch)
 					if sealErr != nil {
 						return

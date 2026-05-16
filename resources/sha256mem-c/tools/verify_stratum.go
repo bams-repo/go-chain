@@ -15,7 +15,7 @@ func doubleSHA256(data []byte) [32]byte {
 }
 
 func main() {
-	if len(os.Args) < 7 {
+	if len(os.Args) < 9 {
 		fmt.Fprintf(os.Stderr, "Usage: %s <prevhash_hex> <cb1_hex> <cb2_hex> <en1_hex> <en2_hex> <version_hex> <bits_hex> <ntime_hex>\n", os.Args[0])
 		os.Exit(1)
 	}

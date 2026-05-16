@@ -142,7 +142,7 @@ func mineBlockOnParentWithValue(t *testing.T, parentHash types.Hash, parentHeade
 
 	target := crypto.CompactToHash(header.Bits)
 	engine := pow.New(sha256d.New(), bitcoindiff.New())
-	found, _ := engine.SealHeader(&header, target, 10_000_000)
+	found, _ := engine.SealHeader(&header, target, 1, p, 10_000_000)
 	if !found {
 		t.Fatalf("could not mine block (tag=%s)", tag)
 	}

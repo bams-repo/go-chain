@@ -689,7 +689,7 @@ func (s *Server) rpcGetRawTransaction(params []json.RawMessage) (interface{}, *j
 		return s.buildVerboseTx(entry.Tx, txHash, hexData, 0, types.ZeroHash), nil
 	}
 
-	// Scan UTXO set for the block height containing this transaction.
+	// Fast path: if any output of this tx is still in the UTXO set, we get its confirmation height.
 	utxoSet := s.chain.UtxoSet()
 	blockHeight := uint32(0)
 	found := false
@@ -700,32 +700,69 @@ func (s *Server) rpcGetRawTransaction(params []json.RawMessage) (interface{}, *j
 		}
 	})
 
-	if !found {
-		return nil, newRPCError(rpcErrMisc, "No such mempool or blockchain transaction")
-	}
+	var confirmedTx *types.Transaction
+	var confirmedHeight uint32
+	var confirmedBlockHash types.Hash
 
-	block, _, err := s.chain.GetBlockByHeight(blockHeight)
-	if err != nil {
-		return nil, newRPCError(rpcErrInternal, "get block: "+err.Error())
-	}
-
-	for i := range block.Transactions {
-		h, _ := crypto.HashTransaction(&block.Transactions[i])
-		if h == txHash {
-			txBytes, serErr := block.Transactions[i].SerializeToBytes()
-			if serErr != nil {
-				return nil, newRPCError(rpcErrInternal, "serialize tx: "+serErr.Error())
+	if found {
+		block, _, err := s.chain.GetBlockByHeight(blockHeight)
+		if err != nil {
+			return nil, newRPCError(rpcErrInternal, "get block: "+err.Error())
+		}
+		for i := range block.Transactions {
+			h, _ := crypto.HashTransaction(&block.Transactions[i])
+			if h == txHash {
+				confirmedTx = &block.Transactions[i]
+				confirmedHeight = blockHeight
+				confirmedBlockHash = crypto.HashBlockHeader(&block.Header)
+				break
 			}
-			hexData := hex.EncodeToString(txBytes)
-			if !verbose {
-				return hexData, nil
-			}
-			blockHash := crypto.HashBlockHeader(&block.Header)
-			return s.buildVerboseTx(&block.Transactions[i], txHash, hexData, blockHeight, blockHash), nil
 		}
 	}
 
-	return nil, newRPCError(rpcErrMisc, "No such mempool or blockchain transaction")
+	// Fully-spent txs leave no UTXO footprint; scan the main chain (newest first).
+	if confirmedTx == nil {
+		_, tip := s.chain.Tip()
+		for h := tip; ; {
+			block, _, err := s.chain.GetBlockByHeight(h)
+			if err != nil {
+				break
+			}
+			for i := range block.Transactions {
+				th, err := crypto.HashTransaction(&block.Transactions[i])
+				if err != nil {
+					continue
+				}
+				if th == txHash {
+					confirmedTx = &block.Transactions[i]
+					confirmedHeight = h
+					confirmedBlockHash = crypto.HashBlockHeader(&block.Header)
+					break
+				}
+			}
+			if confirmedTx != nil {
+				break
+			}
+			if h == 0 {
+				break
+			}
+			h--
+		}
+	}
+
+	if confirmedTx == nil {
+		return nil, newRPCError(rpcErrMisc, "No such mempool or blockchain transaction")
+	}
+
+	txBytes, serErr := confirmedTx.SerializeToBytes()
+	if serErr != nil {
+		return nil, newRPCError(rpcErrInternal, "serialize tx: "+serErr.Error())
+	}
+	hexData := hex.EncodeToString(txBytes)
+	if !verbose {
+		return hexData, nil
+	}
+	return s.buildVerboseTx(confirmedTx, txHash, hexData, confirmedHeight, confirmedBlockHash), nil
 }
 
 func (s *Server) buildVerboseTx(tx *types.Transaction, txHash types.Hash, hexData string, blockHeight uint32, blockHash types.Hash) map[string]interface{} {
@@ -779,6 +816,7 @@ func (s *Server) buildVerboseTx(tx *types.Transaction, txHash types.Hash, hexDat
 		result["blockhash"] = blockHash.ReverseString()
 		result["blockheight"] = blockHeight
 	}
+	s.enrichVerboseTxIO(tx, result, blockHeight, blockHash)
 	return result
 }
 
@@ -1490,29 +1528,9 @@ func (s *Server) rpcListTransactions(params []json.RawMessage) (interface{}, *js
 		}
 	}
 
-	_, tipHeight := s.chain.Tip()
-	utxos := s.wallet.FindUnspent(s.makeUtxoIterator(), tipHeight)
-
-	var results []map[string]interface{}
-	for _, u := range utxos {
-		txHashType := types.Hash(u.TxHash)
-		category := "receive"
-		if u.IsCoinbase {
-			if u.Confirmations >= s.params.CoinbaseMaturity {
-				category = "generate"
-			} else {
-				category = "immature"
-			}
-		}
-		results = append(results, map[string]interface{}{
-			"address":       u.Address,
-			"category":      category,
-			"amount":        u.Value,
-			"confirmations": u.Confirmations,
-			"txid":          txHashType.ReverseString(),
-			"vout":          u.Index,
-			"blockheight":   u.Height,
-		})
+	results, err := s.buildWalletListTransactions()
+	if err != nil {
+		return nil, newRPCError(rpcErrInternal, err.Error())
 	}
 
 	if skip < len(results) {

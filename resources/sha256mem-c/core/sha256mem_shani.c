@@ -3,6 +3,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* PoWHash matches Go: SHA256(acc) then reverse all 32 bytes (types.Hash.Reversed). */
+static void finalize_pow_hash(const uint8_t acc[32], uint8_t out[32])
+{
+	uint8_t raw[32];
+	sha256_shani(acc, 32, raw);
+	for (int i = 0; i < 32; i++)
+		out[i] = raw[31 - i];
+}
+
 static uint32_t le32_load(const uint8_t *p) {
 	uint32_t v;
 	memcpy(&v, p, 4);
@@ -21,12 +30,9 @@ static void arx_fill(uint8_t dst[32], const uint8_t src[32], uint32_t index) {
 	}
 }
 
-void sha256mem_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
-	uint8_t (*mem)[32] = malloc((size_t)SHA256MEM_SLOTS * 32);
-	if (!mem) {
-		memset(out, 0, 32);
-		return;
-	}
+void sha256mem_hash_with_scratch(const uint8_t *data, size_t len, uint8_t out[32], void *scratch)
+{
+	uint8_t (*mem)[32] = (uint8_t (*)[32])scratch;
 
 	sha256_shani(data, len, mem[0]);
 
@@ -58,6 +64,16 @@ void sha256mem_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
 		sha256_shani(buf, 64, acc);
 	}
 
-	sha256_shani(acc, 32, out);
+	finalize_pow_hash(acc, out);
+}
+
+void sha256mem_hash(const uint8_t *data, size_t len, uint8_t out[32]) {
+	uint8_t (*mem)[32] = malloc((size_t)SHA256MEM_SLOTS * 32);
+	if (!mem) {
+		memset(out, 0, 32);
+		return;
+	}
+
+	sha256mem_hash_with_scratch(data, len, out, mem);
 	free(mem);
 }

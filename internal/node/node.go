@@ -38,14 +38,14 @@ import (
 // Options controls optional node behaviour. Callers (daemon, GUI) set these
 // based on their own CLI flags or UI state.
 type Options struct {
-	MiningEnabled   bool
-	MiningThreads   int // 0 = all CPUs
+	MiningEnabled    bool
+	MiningThreads    int // 0 = all CPUs
 	MiningPowerLimit int // 1–100, 0 = default (100)
-	NoRPCAuth       bool
-	NoSeedNodes     bool
-	ConnectOnly     []string
-	RPCTLSCert      string
-	RPCTLSKey       string
+	NoRPCAuth        bool
+	NoSeedNodes      bool
+	ConnectOnly      []string
+	RPCTLSCert       string
+	RPCTLSKey        string
 }
 
 // Node encapsulates the full node lifecycle: stores, chain, mempool, P2P,
@@ -62,11 +62,11 @@ type Node struct {
 	peerStore  *store.BoltStore
 	lockFile   *os.File
 
-	chain   *chain.Chain
-	mempool *mempool.Mempool
-	p2p     *p2p.Manager
-	wallet  *wallet.HDWallet
-	rpc     *rpc.Server
+	chain       *chain.Chain
+	mempool     *mempool.Mempool
+	p2p         *p2p.Manager
+	wallet      *wallet.HDWallet
+	rpc         *rpc.Server
 	miner       *miner.Miner
 	minerCancel context.CancelFunc
 	stratum     *stratum.Server
@@ -87,7 +87,7 @@ func New(cfg *config.Config, opts Options) (*Node, error) {
 	cfg.DataDirName = p.DataDirName
 
 	// Resolve PoW hasher.
-	hasher, err := algorithms.GetHasher(coinparams.Algorithm)
+	hasher, err := algorithms.GetHasherForChain(coinparams.Algorithm, p)
 	if err != nil {
 		return nil, fmt.Errorf("unsupported PoW algorithm %q: %w", coinparams.Algorithm, err)
 	}
@@ -426,10 +426,29 @@ func (n *Node) StartStratum(ctx context.Context, listenAddr string) error {
 	cfg := stratum.DefaultConfig()
 	cfg.ListenAddr = listenAddr
 
-	srv := stratum.New(cfg, bc, mp, n.params, n.engine.Hasher(), rewardScript, func(block *types.Block) {
+	srv := stratum.New(cfg, bc, mp, n.params, n.engine, rewardScript, func(block *types.Block) {
+		blockHash := crypto.HashBlockHeader(&block.Header)
+		tipHash, tipHeight := bc.Tip()
+		logging.StratumDebug("stratum candidate submitted to chain",
+			"hash", blockHash.ReverseString(),
+			"height", tipHeight+1,
+			"prevblock", block.Header.PrevBlock.ReverseString(),
+			"tip_hash", tipHash.ReverseString(),
+			"tip_height", tipHeight,
+			"bits", fmt.Sprintf("0x%08x", block.Header.Bits),
+			"tx_count", len(block.Transactions),
+		)
 		height, err := bc.ProcessBlock(block)
 		if err != nil {
-			logging.L.Warn("stratum block rejected", "error", err)
+			logging.L.Warn("stratum block rejected", "hash", blockHash.ReverseString(), "error", err)
+			logging.StratumDebug("stratum candidate rejected by chain",
+				"hash", blockHash.ReverseString(),
+				"prevblock", block.Header.PrevBlock.ReverseString(),
+				"tip_hash_at_submit", tipHash.ReverseString(),
+				"tip_height_at_submit", tipHeight,
+				"bits", fmt.Sprintf("0x%08x", block.Header.Bits),
+				"error", err,
+			)
 			return
 		}
 		p2pMgr.NotifyBlockAccepted(&block.Header)
@@ -441,9 +460,13 @@ func (n *Node) StartStratum(ctx context.Context, listenAddr string) error {
 			}
 		}
 		mp.RemoveTxs(confirmedHashes)
-		blockHash := crypto.HashBlockHeader(&block.Header)
 		metrics.Global.BlocksMined.Add(1)
 		logging.L.Info("stratum block accepted", "hash", blockHash.ReverseString(), "height", height)
+		logging.StratumDebug("stratum candidate accepted by chain",
+			"hash", blockHash.ReverseString(),
+			"height", height,
+			"bits", fmt.Sprintf("0x%08x", block.Header.Bits),
+		)
 		p2pMgr.BroadcastBlock(blockHash, block)
 	})
 
@@ -536,14 +559,14 @@ func (n *Node) Stop() error {
 
 // --- Accessors for the GUI binding layer and RPC wiring ---
 
-func (n *Node) Chain() *chain.Chain          { return n.chain }
-func (n *Node) Wallet() *wallet.HDWallet     { return n.wallet }
-func (n *Node) Mempool() *mempool.Mempool    { return n.mempool }
-func (n *Node) P2PMgr() *p2p.Manager         { return n.p2p }
-func (n *Node) Params() *params.ChainParams  { return n.params }
-func (n *Node) Config() *config.Config       { return n.cfg }
-func (n *Node) RPCServer() *rpc.Server       { return n.rpc }
-func (n *Node) Engine() consensus.Engine      { return n.engine }
+func (n *Node) Chain() *chain.Chain         { return n.chain }
+func (n *Node) Wallet() *wallet.HDWallet    { return n.wallet }
+func (n *Node) Mempool() *mempool.Mempool   { return n.mempool }
+func (n *Node) P2PMgr() *p2p.Manager        { return n.p2p }
+func (n *Node) Params() *params.ChainParams { return n.params }
+func (n *Node) Config() *config.Config      { return n.cfg }
+func (n *Node) RPCServer() *rpc.Server      { return n.rpc }
+func (n *Node) Engine() consensus.Engine    { return n.engine }
 
 // SetShutdownFunc wires the RPC "stop" command to trigger a graceful shutdown.
 func (n *Node) SetShutdownFunc(fn func()) {

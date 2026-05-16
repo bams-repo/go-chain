@@ -37,6 +37,13 @@ func (e *Engine) Name() string { return "pow" }
 
 func (e *Engine) Hasher() algorithms.Hasher { return e.hasher }
 
+func (e *Engine) powHashAt(data []byte, height uint32, p *params.ChainParams) types.Hash {
+	if hh, ok := e.hasher.(algorithms.HeightHasher); ok {
+		return hh.PoWHashAtHeight(data, height)
+	}
+	return e.hasher.PoWHash(data)
+}
+
 func (e *Engine) CalcBlockWeight(header *types.BlockHeader) *big.Int {
 	return crypto.CalcWork(header.Bits)
 }
@@ -63,7 +70,7 @@ func (e *Engine) ValidateHeader(header *types.BlockHeader, parent *types.BlockHe
 
 	var powBuf [types.BlockHeaderSize]byte
 	header.SerializeInto(powBuf[:])
-	powHash := e.hasher.PoWHash(powBuf[:])
+	powHash := e.powHashAt(powBuf[:], height, p)
 	if err := crypto.ValidateProofOfWork(powHash, header.Bits); err != nil {
 		return fmt.Errorf("PoW validation failed at height %d: %w", height, err)
 	}
@@ -153,11 +160,11 @@ func (e *Engine) PrepareHeader(header *types.BlockHeader, parent *types.BlockHea
 
 // SealHeader iterates the nonce to find a valid PoW solution.
 // Returns true if found within maxIterations.
-func (e *Engine) SealHeader(header *types.BlockHeader, target types.Hash, maxIterations uint64) (bool, error) {
+func (e *Engine) SealHeader(header *types.BlockHeader, target types.Hash, height uint32, p *params.ChainParams, maxIterations uint64) (bool, error) {
 	var hdrBuf [types.BlockHeaderSize]byte
 	for i := uint64(0); i < maxIterations; i++ {
 		header.SerializeInto(hdrBuf[:])
-		hash := e.hasher.PoWHash(hdrBuf[:])
+		hash := e.powHashAt(hdrBuf[:], height, p)
 		if hash.LessOrEqual(target) {
 			return true, nil
 		}
@@ -171,11 +178,11 @@ func (e *Engine) SealHeader(header *types.BlockHeader, target types.Hash, maxIte
 
 // SealHeaderCounted is like SealHeader but also returns the number of hashes
 // actually computed, for accurate hashrate measurement.
-func (e *Engine) SealHeaderCounted(header *types.BlockHeader, target types.Hash, maxIterations uint64) (found bool, hashes uint64, err error) {
+func (e *Engine) SealHeaderCounted(header *types.BlockHeader, target types.Hash, height uint32, p *params.ChainParams, maxIterations uint64) (found bool, hashes uint64, err error) {
 	var hdrBuf [types.BlockHeaderSize]byte
 	for i := uint64(0); i < maxIterations; i++ {
 		header.SerializeInto(hdrBuf[:])
-		hash := e.hasher.PoWHash(hdrBuf[:])
+		hash := e.powHashAt(hdrBuf[:], height, p)
 		if hash.LessOrEqual(target) {
 			return true, i + 1, nil
 		}
@@ -201,7 +208,7 @@ func (e *Engine) MineGenesis(block *types.Block) error {
 	var hdrBuf [types.BlockHeaderSize]byte
 	for {
 		block.Header.SerializeInto(hdrBuf[:])
-		hash := e.hasher.PoWHash(hdrBuf[:])
+		hash := e.powHashAt(hdrBuf[:], 0, nil)
 		if hash.LessOrEqual(target) {
 			return nil
 		}

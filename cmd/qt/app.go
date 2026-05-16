@@ -93,6 +93,7 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	if netParams := params.NetworkByName(cfg.Network); netParams != nil {
+		cfg.DataDirName = netParams.DataDirName
 		cfg.ListenAddr = fmt.Sprintf("0.0.0.0:%d", netParams.DefaultPort)
 		cfg.RPCAddr = fmt.Sprintf("127.0.0.1:%d", netParams.DefaultPort+1)
 	}
@@ -272,6 +273,10 @@ func (a *App) shutdown(ctx context.Context) {
 // CoinInfo returns branding constants for the frontend. This is the ONLY
 // source of truth for names, ticker, and units in the UI.
 func (a *App) CoinInfo() map[string]interface{} {
+	network := networkForBuild()
+	if a.cfg != nil {
+		network = a.cfg.Network
+	}
 	return map[string]interface{}{
 		"name":            coinparams.Name,
 		"nameLower":       coinparams.NameLower,
@@ -281,7 +286,7 @@ func (a *App) CoinInfo() map[string]interface{} {
 		"displayUnitName": coinparams.DisplayUnitName,
 		"version":         version.String(),
 		"copyright":       coinparams.CopyrightHolder,
-		"network":         networkForBuild(),
+		"network":         network,
 	}
 }
 
@@ -324,9 +329,8 @@ func (a *App) GetBalance() (map[string]interface{}, error) {
 	}, nil
 }
 
-// ListTransactions returns wallet transaction history derived from the UTXO set
-// and the mempool. Each entry includes category, amount, confirmations, and
-// maturity status (mempool / unverified / verified).
+// ListTransactions returns wallet transaction history derived from the UTXO set,
+// the mempool, and a main-chain replay for confirmed sends (Bitcoin-style listtransactions).
 func (a *App) ListTransactions() ([]map[string]interface{}, error) {
 	if a.node == nil {
 		return nil, fmt.Errorf("node not initialized")
@@ -335,140 +339,32 @@ func (a *App) ListTransactions() ([]map[string]interface{}, error) {
 	bc := a.node.Chain()
 	_, tipHeight := bc.Tip()
 	cbMaturity := a.node.Params().CoinbaseMaturity
-	addrVer := w.AddressVersion()
 
 	iter := func(fn func(txHash [32]byte, index uint32, value uint64, pkScript []byte, height uint32, isCoinbase bool)) {
 		bc.UtxoSet().ForEach(func(txHash types.Hash, index uint32, entry *utxo.UtxoEntry) {
 			fn(txHash, index, entry.Value, entry.PkScript, entry.Height, entry.IsCoinbase)
 		})
 	}
-
-	utxos := w.FindUnspent(iter, tipHeight)
-	results := make([]map[string]interface{}, 0, len(utxos))
-
-	for _, u := range utxos {
-		txHash := types.Hash(u.TxHash)
-		category := "receive"
-		maturityProgress := 1.0
-		maturityStatus := "verified"
-		if u.IsCoinbase {
-			if u.Confirmations >= cbMaturity {
-				category = "generate"
-			} else {
-				category = "immature"
-				maturityStatus = "unverified"
-				if cbMaturity > 0 {
-					maturityProgress = float64(u.Confirmations) / float64(cbMaturity)
-				}
-			}
+	prevoutScript := func(h types.Hash, idx uint32) []byte {
+		ent := bc.UtxoSet().Get(h, idx)
+		if ent == nil {
+			return nil
 		}
-
-		results = append(results, map[string]interface{}{
-			"txid":             txHash.ReverseString(),
-			"vout":             u.Index,
-			"address":          u.Address,
-			"category":         category,
-			"amount":           float64(u.Value) / float64(coinparams.CoinsPerBaseUnit),
-			"confirmations":    u.Confirmations,
-			"blockheight":      u.Height,
-			"isCoinbase":       u.IsCoinbase,
-			"maturityProgress": maturityProgress,
-			"maturityTarget":   cbMaturity,
-			"maturityStatus":   maturityStatus,
-		})
+		return ent.PkScript
 	}
-
-	// Scan mempool for wallet-related transactions (unconfirmed).
-	mp := a.node.Mempool()
-	for _, entry := range mp.GetAllEntries() {
-		tx := entry.Tx
-		txHashReverse := entry.Hash.ReverseString()
-
-		// Check outputs that pay to our wallet.
-		for outIdx, out := range tx.Outputs {
-			if !w.IsOurScript(out.PkScript) {
-				continue
-			}
-			hashBytes := crypto.ExtractP2PKHHash(out.PkScript)
-			addr := ""
-			if hashBytes != nil {
-				var pkh [crypto.PubKeyHashSize]byte
-				copy(pkh[:], hashBytes)
-				addr = crypto.PubKeyHashToAddress(pkh, addrVer)
-			}
-
-			results = append(results, map[string]interface{}{
-				"txid":             txHashReverse,
-				"vout":             uint32(outIdx),
-				"address":          addr,
-				"category":         "receive",
-				"amount":           float64(out.Value) / float64(coinparams.CoinsPerBaseUnit),
-				"confirmations":    uint32(0),
-				"blockheight":      uint32(0),
-				"isCoinbase":       false,
-				"maturityProgress": 0.0,
-				"maturityTarget":   cbMaturity,
-				"maturityStatus":   "mempool",
-			})
-		}
-
-		// Check inputs that spend our UTXOs — these represent sends.
-		var sendTotal uint64
-		var destAddr string
-		isSend := false
-		for _, in := range tx.Inputs {
-			utxoEntry := bc.UtxoSet().Get(in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
-			if utxoEntry != nil && w.IsOurScript(utxoEntry.PkScript) {
-				isSend = true
-			}
-		}
-		if isSend {
-			for _, out := range tx.Outputs {
-				if !w.IsOurScript(out.PkScript) {
-					sendTotal += out.Value
-					hashBytes := crypto.ExtractP2PKHHash(out.PkScript)
-					if hashBytes != nil && destAddr == "" {
-						var pkh [crypto.PubKeyHashSize]byte
-						copy(pkh[:], hashBytes)
-						destAddr = crypto.PubKeyHashToAddress(pkh, addrVer)
-					}
-				}
-			}
-			if sendTotal > 0 {
-				results = append(results, map[string]interface{}{
-					"txid":             txHashReverse,
-					"vout":             uint32(0),
-					"address":          destAddr,
-					"category":         "send",
-					"amount":           -float64(sendTotal) / float64(coinparams.CoinsPerBaseUnit),
-					"confirmations":    uint32(0),
-					"blockheight":      uint32(0),
-					"isCoinbase":       false,
-					"maturityProgress": 0.0,
-					"maturityTarget":   cbMaturity,
-					"maturityStatus":   "mempool",
-				})
-			}
-		}
+	mempoolTxs := make([]wallet.MempoolTx, 0)
+	for _, e := range a.node.Mempool().GetAllEntries() {
+		mempoolTxs = append(mempoolTxs, wallet.MempoolTx{Hash: e.Hash, Tx: *e.Tx})
 	}
-
-	// Sort: mempool (height 0) first, then by height descending, then by vout.
-	sort.Slice(results, func(i, j int) bool {
-		hi := results[i]["blockheight"].(uint32)
-		hj := results[j]["blockheight"].(uint32)
-		if hi != hj {
-			if hi == 0 {
-				return true
-			}
-			if hj == 0 {
-				return false
-			}
-			return hi > hj
-		}
-		return results[i]["vout"].(uint32) < results[j]["vout"].(uint32)
-	})
-
-	return results, nil
+	return wallet.BuildListTransactionEntries(
+		w,
+		tipHeight,
+		cbMaturity,
+		iter,
+		prevoutScript,
+		mempoolTxs,
+		bc.GetBlockByHeight,
+	)
 }
 
 // GetPeerCount returns the number of connected peers.
@@ -1631,9 +1527,13 @@ func (a *App) ValidateAddress(address string) map[string]interface{} {
 // GetMainnetLaunchInfo returns the mainnet mining start epoch and the current
 // network name so the UI can display a countdown.
 func (a *App) GetMainnetLaunchInfo() map[string]interface{} {
+	network := networkForBuild()
+	if a.cfg != nil {
+		network = a.cfg.Network
+	}
 	return map[string]interface{}{
 		"miningStartTime": params.Mainnet.MiningStartTime,
-		"network":         networkForBuild(),
+		"network":         network,
 	}
 }
 

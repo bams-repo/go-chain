@@ -13,6 +13,51 @@ import (
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
+func TestAddrFromForVersionOnlyAdvertisesPublicAddress(t *testing.T) {
+	tests := []struct {
+		name       string
+		listenAddr string
+		external   string
+		want       string
+	}{
+		{
+			name:       "unspecified listen address is not advertised",
+			listenAddr: "0.0.0.0:19333",
+		},
+		{
+			name:       "private listen address is not advertised",
+			listenAddr: "192.168.0.52:19333",
+		},
+		{
+			name:       "loopback listen address is not advertised",
+			listenAddr: "127.0.0.1:19333",
+		},
+		{
+			name:       "learned public address is advertised",
+			listenAddr: "0.0.0.0:19333",
+			external:   "8.8.8.8:19333",
+			want:       "8.8.8.8:19333",
+		},
+		{
+			name:       "private learned address is not advertised",
+			listenAddr: "0.0.0.0:19333",
+			external:   "10.0.0.7:19333",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Manager{listenAddr: tt.listenAddr}
+			if tt.external != "" {
+				m.externalAddr = tt.external
+			}
+			if got := m.addrFromForVersion(); got != tt.want {
+				t.Fatalf("addrFromForVersion() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestSeenBlocksEviction verifies that the seenBlocks bounded hash set
 // correctly removes entries, allowing previously-rejected blocks to be
 // re-processed. This is the core mechanism behind the TASK-02 fix:

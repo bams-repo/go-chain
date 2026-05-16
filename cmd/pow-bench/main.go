@@ -57,7 +57,8 @@ func main() {
 		Nonce:      0,
 	}
 
-	engine := pow.New(sha256mem.New(), lwma.New())
+	engine := pow.New(sha256mem.NewChainHasher(mp), lwma.New())
+	benchHeight := uint32(1)
 	batchSize := uint64(32)
 
 	ctx := context.Background()
@@ -97,7 +98,7 @@ func main() {
 		}
 	}()
 
-	found := runWorkers(ctx, *workers, hdr, target, batchSize, engine, &totalHashes)
+	found := runWorkers(ctx, *workers, hdr, target, benchHeight, mp, batchSize, engine, &totalHashes)
 	cancel()
 
 	elapsed := time.Since(start)
@@ -116,6 +117,8 @@ func runWorkers(
 	numWorkers int,
 	base types.BlockHeader,
 	target types.Hash,
+	height uint32,
+	p *params.ChainParams,
 	batchSize uint64,
 	engine *pow.Engine,
 	totalHashes *atomic.Uint64,
@@ -156,7 +159,7 @@ func runWorkers(
 				if remaining < batch {
 					batch = remaining
 				}
-				found, hashes, err := engine.SealHeaderCounted(&h, target, batch)
+				found, hashes, err := engine.SealHeaderCounted(&h, target, height, p, batch)
 				totalHashes.Add(hashes)
 				if err != nil {
 					return

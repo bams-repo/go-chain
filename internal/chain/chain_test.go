@@ -109,7 +109,7 @@ func mineBlock(t *testing.T, c *Chain, p *fcparams.ChainParams) *types.Block {
 
 	target := crypto.CompactToHash(header.Bits)
 	engine := pow.New(sha256d.New(), bitcoindiff.New())
-	found, _ := engine.SealHeader(&header, target, 10000000)
+	found, _ := engine.SealHeader(&header, target, newHeight, p, 10000000)
 	if !found {
 		t.Fatal("could not mine block")
 	}
@@ -176,7 +176,7 @@ func mineBlockOnParent(t *testing.T, parentHash types.Hash, parentHeader *types.
 
 	target := crypto.CompactToHash(header.Bits)
 	engine := pow.New(sha256d.New(), bitcoindiff.New())
-	found, _ := engine.SealHeader(&header, target, 10000000)
+	found, _ := engine.SealHeader(&header, target, newHeight, p, 10000000)
 	if !found {
 		t.Fatal("could not mine block on parent")
 	}
@@ -278,7 +278,7 @@ func TestChainOrphan(t *testing.T) {
 	}
 	target := crypto.CompactToHash(header2.Bits)
 	engine := pow.New(sha256d.New(), bitcoindiff.New())
-	engine.SealHeader(&header2, target, 10000000)
+	engine.SealHeader(&header2, target, 2, p, 10000000)
 	block2 := &types.Block{Header: header2, Transactions: []types.Transaction{coinbase2}}
 
 	// Submit block 2 first — should be orphaned.
@@ -530,7 +530,7 @@ func mineBlockWithTimestamp(t *testing.T, parentHash types.Hash, parentHeader *t
 	}
 
 	target := crypto.CompactToHash(header.Bits)
-	found, _ := engine.SealHeader(&header, target, 100_000_000)
+	found, _ := engine.SealHeader(&header, target, newHeight, p, 100_000_000)
 	if !found {
 		t.Fatalf("could not mine block at height %d (tag=%s)", newHeight, tag)
 	}

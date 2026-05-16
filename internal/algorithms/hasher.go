@@ -13,6 +13,7 @@ import (
 	"github.com/bams-repo/fairchain/internal/algorithms/scrypt"
 	"github.com/bams-repo/fairchain/internal/algorithms/sha256d"
 	"github.com/bams-repo/fairchain/internal/algorithms/sha256mem"
+	"github.com/bams-repo/fairchain/internal/params"
 	"github.com/bams-repo/fairchain/internal/types"
 )
 
@@ -29,8 +30,13 @@ type Hasher interface {
 }
 
 // GetHasher returns a Hasher for the named algorithm.
-// Adding a new algorithm requires a new sub-package and a new case here.
+// For sha256mem, pass chain params via GetHasherForChain so height-gated variants work.
 func GetHasher(name string) (Hasher, error) {
+	return GetHasherForChain(name, nil)
+}
+
+// GetHasherForChain returns a Hasher, binding chain params when the algorithm supports forks.
+func GetHasherForChain(name string, p *params.ChainParams) (Hasher, error) {
 	switch name {
 	case "sha256d":
 		return sha256d.New(), nil
@@ -39,7 +45,11 @@ func GetHasher(name string) (Hasher, error) {
 	case "scrypt":
 		return scrypt.New(), nil
 	case "sha256mem":
-		return sha256mem.New(), nil
+		var act uint32
+		if p != nil {
+			act = p.ActivationHeights[sha256mem.ActivationKey]
+		}
+		return sha256mem.NewChainHasher(act), nil
 	default:
 		return nil, fmt.Errorf("unknown PoW algorithm: %q", name)
 	}
